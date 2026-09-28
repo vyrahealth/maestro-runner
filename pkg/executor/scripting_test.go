@@ -648,20 +648,6 @@ func TestExecuteRepeat_InvalidTimes(t *testing.T) {
 	}
 }
 
-func TestExecuteRetry_InvalidMaxRetries(t *testing.T) {
-	se := NewScriptEngine()
-	defer se.Close()
-	fr := &FlowRunner{ctx: context.Background(), driver: &mockDriver{}, script: se}
-
-	result := fr.executeRetry(&flow.RetryStep{MaxRetries: "five"})
-	if result.Success {
-		t.Error("expected failure for non-numeric maxRetries, got success")
-	}
-	if !strings.Contains(result.Message, "invalid 'maxRetries'") {
-		t.Errorf("message = %q, want it to mention invalid 'maxRetries'", result.Message)
-	}
-}
-
 func TestScriptEngine_withEnvVars(t *testing.T) {
 	se := NewScriptEngine()
 	defer se.Close()

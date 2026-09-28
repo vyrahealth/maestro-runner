@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1077,16 +1078,53 @@ func (fr *FlowRunner) executeRepeat(step *flow.RepeatStep) *core.CommandResult {
 	}
 }
 
-// executeRetry handles retry step execution.
-func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
-	maxRetries, err := fr.script.ParseIntStrict(step.MaxRetries, 3)
-	if err != nil {
-		return &core.CommandResult{
-			Success: false,
-			Error:   err,
-			Message: fmt.Sprintf("retry: invalid 'maxRetries' value: %v", err),
+// maxRetriesAllowed caps retry's maxRetries, as Maestro's MAX_RETRIES_ALLOWED
+// does (Orchestra.kt:1844).
+const maxRetriesAllowed = 3
+
+// retryAttempts is how many times a retry runs its commands: the first run
+// plus one per retry. maxRetries is read as Maestro reads it (Orchestra.kt:934
+// and 939-955): unset or not an integer is 1, more than 3 is 3, and a negative
+// value runs nothing, because Maestro's `while (attempt <= maxRetries)` never
+// starts.
+func (fr *FlowRunner) retryAttempts(raw string) int {
+	maxRetries := 1
+	if expanded := fr.script.ExpandVariables(raw); expanded != "" {
+		if n, err := strconv.Atoi(expanded); err == nil {
+			maxRetries = n
+		} else {
+			logger.Warn("retry: maxRetries %q is not an integer, so it is 1, as in Maestro", expanded)
 		}
 	}
+	if maxRetries > maxRetriesAllowed {
+		maxRetries = maxRetriesAllowed
+	}
+	if maxRetries < 0 {
+		return 0
+	}
+	return maxRetries + 1
+}
+
+// retryExhausted is the result of a retry that ran out of attempts. With no
+// attempt at all (a negative maxRetries) Maestro's command completes without
+// running anything, so that one passes.
+func retryExhausted(lastErr error, attempts int) *core.CommandResult {
+	if attempts == 0 {
+		return &core.CommandResult{
+			Success: true,
+			Message: "Retry ran no attempts (maxRetries is negative)",
+		}
+	}
+	return &core.CommandResult{
+		Success: false,
+		Error:   lastErr,
+		Message: fmt.Sprintf("Retry failed after %d attempts", attempts),
+	}
+}
+
+// executeRetry handles retry step execution.
+func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
+	attempts := fr.retryAttempts(step.MaxRetries)
 
 	// Apply env variables with restore
 	defer fr.script.withEnvVars(step.Env)()
@@ -1102,12 +1140,12 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 				Message: fmt.Sprintf("Failed to parse flow file: %s", filePath),
 			}
 		}
-		return fr.executeSubFlowWithRetry(*subFlow, maxRetries)
+		return fr.executeSubFlowWithRetry(*subFlow, attempts)
 	}
 
 	// Execute inline steps with retry
 	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		if fr.ctx.Err() != nil {
 			return &core.CommandResult{
 				Success: false,
@@ -1134,11 +1172,7 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 		}
 	}
 
-	return &core.CommandResult{
-		Success: false,
-		Error:   lastErr,
-		Message: fmt.Sprintf("Retry failed after %d attempts", maxRetries),
-	}
+	return retryExhausted(lastErr, attempts)
 }
 
 // executeRunFlow handles runFlow step execution.
@@ -1705,11 +1739,11 @@ func (fr *FlowRunner) executeSubFlow(subFlow flow.Flow) *core.CommandResult {
 	}
 }
 
-// executeSubFlowWithRetry executes a sub-flow with retry logic.
-func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, maxRetries int) *core.CommandResult {
+// executeSubFlowWithRetry runs a sub-flow up to attempts times, until it passes.
+func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, attempts int) *core.CommandResult {
 	var lastErr error
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		if fr.ctx.Err() != nil {
 			return &core.CommandResult{
 				Success: false,
@@ -1728,11 +1762,7 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, maxRetries int)
 		lastErr = result.Error
 	}
 
-	return &core.CommandResult{
-		Success: false,
-		Error:   lastErr,
-		Message: fmt.Sprintf("Retry failed after %d attempts", maxRetries),
-	}
+	return retryExhausted(lastErr, attempts)
 }
 
 // captureArtifacts captures the step screenshot and, when captureHierarchy is
