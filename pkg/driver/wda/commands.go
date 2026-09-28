@@ -89,7 +89,9 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// Strategy: a coordinate tap at the element's on-screen centre, as Maestro
 	// taps on iOS; WDA's element click is the fallback. The element click
 	// reported success for taps that did nothing — a menu item, a sheet
-	// button, a settings row — where a touch at the same spot works.
+	// button, a settings row — where a touch at the same spot works. With
+	// MAESTRO_WDA_COORDINATE_TAP the touch is Maestro's 100 ms one, with no
+	// focus check and no click (see coordinateTapOn).
 	x, y, onScreen := d.tapPoint(info.Bounds)
 	if !onScreen {
 		// Off screen usually means the element went stale: during a push the
@@ -102,12 +104,13 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	}
 
 	tapped := false
+	var tapErr error
 	if onScreen {
-		if err := d.client.Tap(x, y); err == nil {
+		if tapErr = d.tapAt(x, y); tapErr == nil {
 			tapped = true
 			// A text field must end up focused; if the touch missed it,
 			// let the element click try.
-			if isTextField {
+			if isTextField && !coordinateTapOn() {
 				time.Sleep(100 * time.Millisecond)
 				if _, err := d.client.GetActiveElement(); err != nil {
 					tapped = false
@@ -115,7 +118,7 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 			}
 		}
 	}
-	if !tapped && info.ID != "" {
+	if !tapped && info.ID != "" && !coordinateTapOn() {
 		if err := d.client.ElementClick(info.ID); err == nil {
 			tapped = true
 		}
@@ -126,10 +129,35 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 				info.Bounds.X, info.Bounds.Y, info.Bounds.Width, info.Bounds.Height),
 				fmt.Sprintf("Element not on screen: %s", selectorDesc(step.Selector)))
 		}
+		if coordinateTapOn() && tapErr != nil {
+			// The touch is the only try, so its own error (a lost session,
+			// an app that died) is the step's.
+			return errorResult(tapErr, "Tap failed")
+		}
 		return errorResult(fmt.Errorf("tap at (%.0f, %.0f) failed", x, y), "Tap failed")
 	}
 
 	return successResult("Tapped element", info)
+}
+
+// coordinateTapOn reports whether MAESTRO_WDA_COORDINATE_TAP is set. An element
+// tap is then what Maestro's is: a touch at the centre of the element's bounds,
+// with no XCUITest element logic (Maestro.kt:244-255, IOSDriver.kt:152-156,
+// TouchRouteHandler.swift:34-41). The click is XCUIElement's tap, which works
+// out its own hit point and can scroll the view first, even for an element
+// kept only because its bounds are on screen. The touch goes to the centre of
+// the part of the bounds that is on screen (tapPoint), as the fallback's has.
+func coordinateTapOn() bool {
+	return os.Getenv("MAESTRO_WDA_COORDINATE_TAP") != ""
+}
+
+// tapAt taps a point: with MAESTRO_WDA_COORDINATE_TAP set, Maestro's 100 ms
+// touch (TouchTap), else WDA's coordinate tap.
+func (d *Driver) tapAt(x, y float64) error {
+	if coordinateTapOn() {
+		return d.client.TouchTap(x, y)
+	}
+	return d.client.Tap(x, y)
 }
 
 const (
