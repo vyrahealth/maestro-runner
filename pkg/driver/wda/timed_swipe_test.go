@@ -17,6 +17,7 @@ type gestureLog struct {
 	paths  []string
 	body   map[string]interface{}
 	source string // the page source the fake WDA serves
+	after  string // when set, the page source once a gesture has come in
 }
 
 func swipeServer(t *testing.T, log *gestureLog) *httptest.Server {
@@ -35,6 +36,9 @@ func swipeServer(t *testing.T, log *gestureLog) *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/actions"), strings.HasSuffix(r.URL.Path, "/wda/dragfromtoforduration"):
 			log.paths = append(log.paths, r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
 			_ = json.NewDecoder(r.Body).Decode(&log.body)
+			if log.after != "" {
+				log.source = log.after
+			}
 		}
 		jsonResponse(w, map[string]interface{}{"value": nil})
 	}))
@@ -199,5 +203,48 @@ func TestTimedScrollIsMaestrosSwipeFromTheMiddle(t *testing.T) {
 	defer server.Close()
 	if result := createTestDriver(server).scroll(&flow.ScrollStep{Direction: "sideways"}); result.Success {
 		t.Error("an unknown direction must fail")
+	}
+}
+
+// With the switch, each of scrollUntilVisible's scrolls is Maestro's
+// (Orchestra.kt:825-829): the swipe from the middle, 40% of the screen, taking
+// the step's speed as Maestro converts it (Commands.kt:151-156): 601 ms at the
+// default speed 40, 1 ms at 100, and Maestro's fallback of 40 ms above 100.
+// It was the runner's 1/3-screen drag after a 0.3 s hold.
+func TestTimedScrollUntilVisibleScrollsLikeMaestro(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_TIMED_SWIPE", "1")
+	cases := []struct {
+		direction string
+		speed     int
+		want      [4]float64
+		ms        float64
+	}{
+		{"down", 0, [4]float64{195, 422, 195, 84}, 601},
+		{"up", 0, [4]float64{195, 422, 195, 759}, 601},
+		{"right", 0, [4]float64{195, 422, 39, 422}, 601},
+		{"down", 100, [4]float64{195, 422, 195, 84}, 1},
+		{"down", 90, [4]float64{195, 422, 195, 84}, 101},
+		{"down", 150, [4]float64{195, 422, 195, 84}, 40},
+	}
+	for _, c := range cases {
+		// Half the target is on screen until the first scroll, all of it after.
+		log := &gestureLog{source: fmt.Sprintf(cardSource, 644), after: fmt.Sprintf(cardSource, 200)}
+		server := swipeServer(t, log)
+		result := createTestDriver(server).scrollUntilVisible(&flow.ScrollUntilVisibleStep{
+			Element: flow.Selector{Text: "Card"}, Direction: c.direction, Speed: c.speed,
+		})
+		server.Close()
+		if !result.Success {
+			t.Fatalf("%s at speed %d: step failed: %s", c.direction, c.speed, result.Message)
+		}
+		if strings.Join(log.paths, ",") != "actions" {
+			t.Fatalf("%s: gesture endpoints %v, want one W3C gesture", c.direction, log.paths)
+		}
+		if got := gesturePoints(t, log.body); got != c.want {
+			t.Errorf("%s: scroll %v, want %v", c.direction, got, c.want)
+		}
+		if got := moveDuration(t, log.body); got != c.ms {
+			t.Errorf("%s at speed %d: took %v ms, want %v", c.direction, c.speed, got, c.ms)
+		}
 	}
 }
