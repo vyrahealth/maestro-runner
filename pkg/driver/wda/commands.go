@@ -1215,9 +1215,12 @@ func (d *Driver) launchApp(step *flow.LaunchAppStep) *core.CommandResult {
 		return successResult(fmt.Sprintf("Launched app: %s", bundleID), nil)
 	}
 
-	// Terminate the app first so WDA calls launch (not activate),
-	// which is required for arguments/environment to take effect
-	if hasArgs {
+	// Terminate the app first so WDA calls launch (not activate). Arguments and
+	// environment only take effect on a real launch, and Maestro stops the app
+	// before launching it unless the flow says `stopApp: false`. Without the stop,
+	// a relaunch only brought a running app to the front, still where it was, so
+	// a flow checking what survives a restart tested nothing.
+	if hasArgs || step.StopApp == nil || *step.StopApp {
 		_ = d.client.TerminateApp(bundleID)
 	}
 
