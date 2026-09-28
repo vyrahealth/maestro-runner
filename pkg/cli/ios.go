@@ -68,7 +68,7 @@ func CreateIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 
 	// Check if device port is already in use (another instance using this device)
 	port := wdadriver.PortFromUDID(udid)
-	if isPortInUse(port) {
+	if !wdadriver.ExternalForward() && isPortInUse(port) {
 		return nil, nil, fmt.Errorf("device %s is in use (port %d already bound)\n"+
 			"Another maestro-runner instance may be using this device.\n"+
 			"Hint: Wait for it to finish or use a different device with --device <UDID>", udid, port)
