@@ -240,7 +240,11 @@ func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
 
 	// ID matching (accessibility identifier, supports regex)
 	if sel.ID != "" {
-		if !matchesID(sel.ID, elem.Name) {
+		if strictSelectors() {
+			if !maestroIDMatches(sel.ID, elementIdentifier(elem)) {
+				return false
+			}
+		} else if !matchesID(sel.ID, elem.Name) {
 			return false
 		}
 	}

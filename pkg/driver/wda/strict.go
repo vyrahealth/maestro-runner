@@ -71,6 +71,34 @@ func maestroTextMatches(pattern string, texts ...string) bool {
 	return false
 }
 
+// maestroIDMatches is Maestro's id match (Filters.idMatches,
+// Filters.kt:110-132): the regex matches the whole identifier, or the part
+// of it after the last '/'.
+func maestroIDMatches(pattern, identifier string) bool {
+	re := maestroRegex(pattern)
+	if re.MatchString(identifier) {
+		return true
+	}
+	if i := strings.LastIndex(identifier, "/"); i >= 0 {
+		return re.MatchString(identifier[i+1:])
+	}
+	return false
+}
+
+// elementIdentifier is the accessibility identifier behind an element's
+// name in the page source. Maestro matches ids against the identifier alone
+// (IOSDriver.kt:217), but WDA reports the label as the name of an element
+// that has no identifier (XCUIElement+FBWebDriverAttributes.m:118-126), and
+// the source has no other trace of it. So a name equal to the label counts
+// as no identifier. The cost: an identifier that is exactly its element's
+// label is missed.
+func elementIdentifier(e *ParsedElement) string {
+	if e.Name == e.Label {
+		return ""
+	}
+	return e.Name
+}
+
 // meansItself reports whether s, read as Maestro reads a selector, matches
 // the literal string s. Then an exact, case-insensitive WDA comparison
 // finds only elements Maestro's regex also matches: a plain literal, or one
@@ -115,4 +143,22 @@ func (d *Driver) strictTextByWDA(sel flow.Selector, stateFilter string) (*core.E
 		return nil, fmt.Errorf("element not found via WDA")
 	}
 	return d.getElementInfo(elemID)
+}
+
+// strictIDByWDA is findElementByWDA's id query with MAESTRO_STRICT_SELECTORS
+// set: a name equal to the id, ignoring case, that is not the label standing
+// in for a missing identifier (see elementIdentifier). There is no CONTAINS
+// fallback: Maestro's id matches the whole identifier, and `id: row` must
+// not find "row-delete". An id that does not mean itself as a regex is
+// matched in the page source.
+func (d *Driver) strictIDByWDA(sel flow.Selector, stateFilter string) (*core.ElementInfo, error) {
+	lit, ok := predicateLiteral(sel.ID)
+	if !ok || !strictQueryable(sel) || !meansItself(sel.ID) {
+		return nil, fmt.Errorf("id %q is matched in the page source", sel.ID)
+	}
+	query := fmt.Sprintf("**/XCUIElementTypeAny[`name ==[c] %s AND name != label%s`]", lit, stateFilter)
+	if info, err, found := d.findByIDQuery(query); found {
+		return info, err
+	}
+	return nil, fmt.Errorf("element not found via WDA")
 }

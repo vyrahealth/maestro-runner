@@ -921,6 +921,9 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 
 	// Try class chain for accessibility ID
 	if sel.ID != "" {
+		if strictSelectors() {
+			return d.strictIDByWDA(sel, stateFilter)
+		}
 		if looksLikeRegex(sel.ID) {
 			// Regex id: match against name via MATCHES.
 			query := fmt.Sprintf("**/XCUIElementTypeAny[`name MATCHES '%s'%s`]", sel.ID, stateFilter)
