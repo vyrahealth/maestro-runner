@@ -54,6 +54,10 @@ type Driver struct {
 	// The element the last step tapped, while the next step may still need
 	// to wait for that tap's UI to settle
 	lastTapID string
+
+	// A swipe or scroll has run since the last tap, so with MAESTRO_WDA_SETTLE
+	// the next element tap waits for the element to stop moving (settle.go)
+	recentScroll bool
 }
 
 // Crash-loop detection thresholds.
@@ -227,11 +231,13 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 	// An action right after a tap waits for that tap's UI to settle. WDA's
 	// own wait for quiescence is off (it crashed XCTest), so a second tap
 	// went out tens of milliseconds after the first, before the push the
-	// first one started, and landed on the screen being left (#179).
-	if d.lastTapID != "" && actsOnScreen(step) {
+	// first one started, and landed on the screen being left (#179). With
+	// MAESTRO_WDA_SETTLE the screen settle after every step does this.
+	if !settleOn() && d.lastTapID != "" && actsOnScreen(step) {
 		d.settleAfterTap()
 	}
 	d.lastTapID = ""
+	d.settleBefore(step)
 
 	var result *core.CommandResult
 	switch s := step.(type) {
@@ -353,6 +359,7 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 		}
 	}
 
+	d.settleAfter(step, result)
 	result.Duration = time.Since(start)
 	d.trackCrashLoop(result)
 	return result

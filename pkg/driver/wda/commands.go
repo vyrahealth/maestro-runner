@@ -66,6 +66,8 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 		return successResult(fmt.Sprintf("Tapped at relative point (%.0f, %.0f) on element", x, y), info)
 	}
 
+	info = d.settleBeforeTap(step.Selector, info)
+
 	// If duration is set (or longPress: true), hold the press for that long.
 	if step.DurationMs > 0 || step.LongPress {
 		durationSec := float64(step.DurationMs) / 1000.0
@@ -235,6 +237,9 @@ func (d *Driver) doubleTapOn(step *flow.DoubleTapOnStep) *core.CommandResult {
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Element not found: %s", selectorDesc(step.Selector)))
 	}
+	if step.Selector.Point == "" {
+		info = d.settleBeforeTap(step.Selector, info)
+	}
 
 	px, py, perr := core.PointInBounds(step.Selector.Point, info.Bounds)
 	if perr != nil {
@@ -253,6 +258,9 @@ func (d *Driver) longPressOn(step *flow.LongPressOnStep) *core.CommandResult {
 	info, err := d.findElementForTap(step.Selector, false, step.TimeoutMs)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Element not found: %s", selectorDesc(step.Selector)))
+	}
+	if step.Selector.Point == "" {
+		info = d.settleBeforeTap(step.Selector, info)
 	}
 
 	px, py, perr := core.PointInBounds(step.Selector.Point, info.Bounds)
