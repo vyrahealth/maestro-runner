@@ -338,6 +338,14 @@ func isIOSSimulator(udid string) bool {
 func getPhysicalDeviceInfo(udid string) (*iosDeviceInfo, error) {
 	entry, err := goios.GetDevice(udid)
 	if err != nil {
+		// go-ios sees only devices on this machine's own usbmuxd. A paired device that Xcode
+		// reaches over the network (for example, one plugged into another host) is still
+		// visible to devicectl.
+		info, dcErr := getPhysicalDeviceInfoViaDevicectl(udid)
+		if dcErr == nil {
+			return info, nil
+		}
+		logger.Debug("devicectl fallback for %s failed: %v", udid, dcErr)
 		return nil, fmt.Errorf("device %s not found: %w (is the device connected and trusted?)", udid, err)
 	}
 
@@ -359,6 +367,54 @@ func getPhysicalDeviceInfo(udid string) (*iosDeviceInfo, error) {
 		OSVersion:   values.Value.ProductVersion,
 		IsSimulator: false,
 	}, nil
+}
+
+// getPhysicalDeviceInfoViaDevicectl reads a physical device's name and iOS version from
+// `xcrun devicectl device info details`, which also covers devices connected over the network.
+func getPhysicalDeviceInfoViaDevicectl(udid string) (*iosDeviceInfo, error) {
+	if !devicectlAvailable() {
+		return nil, fmt.Errorf("devicectl not available")
+	}
+	tmp, err := os.CreateTemp("", "devicectl-info-*.json")
+	if err != nil {
+		return nil, err
+	}
+	path := tmp.Name()
+	_ = tmp.Close()
+	defer os.Remove(path)
+	cmd := exec.Command("xcrun", "devicectl", "device", "info", "details", "--device", udid, "--json-output", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("devicectl device info details: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Result struct {
+			DeviceProperties struct {
+				Name            string `json:"name"`
+				OSVersionNumber string `json:"osVersionNumber"`
+			} `json:"deviceProperties"`
+			HardwareProperties struct {
+				ProductType string `json:"productType"`
+			} `json:"hardwareProperties"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse devicectl output: %w", err)
+	}
+	if resp.Result.DeviceProperties.OSVersionNumber == "" {
+		return nil, fmt.Errorf("devicectl reported no iOS version for %s", udid)
+	}
+	name := resp.Result.DeviceProperties.Name
+	if name == "" {
+		name = resp.Result.HardwareProperties.ProductType
+	}
+	if name == "" {
+		name = "iOS Device"
+	}
+	return &iosDeviceInfo{Name: name, OSVersion: resp.Result.DeviceProperties.OSVersionNumber, IsSimulator: false}, nil
 }
 
 // getIOSDeviceInfo gets information about an iOS device (simulator or physical).
