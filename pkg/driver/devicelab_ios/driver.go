@@ -2,6 +2,9 @@ package devicelab_ios
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
@@ -55,6 +58,15 @@ type Driver struct {
 	// step so the cache never lags real screen state.
 	snapshotCache     []SnapshotNode
 	snapshotCacheTime time.Time
+	// lastSnapshotAppState is the target app's state from the most recent
+	// snapshot reply, including a SNAPSHOT_FAILED one, which carries it.
+	lastSnapshotAppState string
+
+	// runnerTimeouts counts steps in a row whose runner call waited out its
+	// deadline; see noteRunnerTimeout.
+	runnerTimeouts int
+	// wedgeStderr receives the relaunch notice; nil means os.Stderr.
+	wedgeStderr *os.File
 
 	// Runtime — owned by setup.go; the Driver only reads it for orderly
 	// shutdown.
@@ -92,7 +104,52 @@ func (d *Driver) Close() error {
 
 // Execute dispatches a flow step. The actual handlers live in commands.go.
 func (d *Driver) Execute(step flow.Step) *core.CommandResult {
-	return d.executeStep(step)
+	start := time.Now()
+	res := d.executeStep(step)
+	d.noteRunnerTimeout(res, time.Since(start))
+	return res
+}
+
+// wedgedRunnerSteps is how many steps in a row must time out on the runner
+// before the driver treats it as wedged and relaunches it.
+const wedgedRunnerSteps = 3
+
+// minWedgedWait is how long a timed-out step must have waited to count. A
+// runner that is connected but hung makes a call wait out its whole deadline
+// (10s or more); a timeout that comes back sooner is the flow's own context
+// ending — a runFlow timeout, say — not the runner.
+const minWedgedWait = 5 * time.Second
+
+// noteRunnerTimeout relaunches a runner that is connected but no longer
+// answering. The client deliberately never relaunches on a timeout: a slow
+// runner is alive, and an embedder that shares it (DeviceDeck) must not have
+// it killed under another caller. The test runner has one caller and no
+// other way out, though: a hung runner used to fail every remaining step of
+// the suite. So the decision is made here, in the CLI's driver, and only
+// after several steps in a row have each waited out their deadline. Any step
+// the runner answered — pass or fail — resets the count.
+func (d *Driver) noteRunnerTimeout(res *core.CommandResult, waited time.Duration) {
+	if res == nil || res.Error == nil || waited < minWedgedWait || !isRunnerTimeout(res.Error) {
+		d.runnerTimeouts = 0
+		return
+	}
+	d.runnerTimeouts++
+	if d.runnerTimeouts < wedgedRunnerSteps || d.client == nil || d.client.reviver == nil {
+		return
+	}
+	d.runnerTimeouts = 0
+	out := d.wedgeStderr
+	if out == nil {
+		out = os.Stderr
+	}
+	_, _ = fmt.Fprintf(out, "  ⚠ devicelab runner has not answered %d steps in a row — relaunching it\n", wedgedRunnerSteps)
+	d.invalidateSnapshotCache()
+	d.client.revive(context.Background(), d.client.Port())
+}
+
+// isRunnerTimeout reports whether err is a runner call that ran out of time.
+func isRunnerTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrCallTimeout)
 }
 
 // Screenshot returns inline PNG bytes via host-side simctl capture.

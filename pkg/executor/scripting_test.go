@@ -2567,3 +2567,24 @@ func TestScriptEngine_ExpandStep_DeviceControlFields(t *testing.T) {
 		t.Errorf("setClipboard not expanded: %q", clip.Text)
 	}
 }
+
+// TestScriptEngine_RunScript_Require verifies a runScript can require a helper
+// module that lives beside the flow, resolved via SetFlowDir.
+func TestScriptEngine_RunScript_Require(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "math.js"),
+		[]byte(`module.exports = { add: function(a, b){ return a + b; } };`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	se := NewScriptEngine()
+	defer se.Close()
+	se.SetFlowDir(dir)
+
+	if err := se.RunScript(`var m = require('./math.js'); output.sum = m.add(2, 40)`, nil); err != nil {
+		t.Fatalf("RunScript with require failed: %v", err)
+	}
+	if got := se.GetVariable("sum"); got != "42" {
+		t.Errorf("sum = %q, want %q", got, "42")
+	}
+}

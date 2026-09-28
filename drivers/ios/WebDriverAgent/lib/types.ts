@@ -1,3 +1,5 @@
+import {type HTTPHeaders} from '@appium/types';
+
 // WebDriverAgentLib/Utilities/FBSettings.h
 export interface WDASettings {
   elementResponseAttribute?: string;
@@ -11,17 +13,27 @@ export interface WDASettings {
   keyboardAutocorrection?: boolean;
   keyboardPrediction?: boolean;
   customSnapshotTimeout?: number;
+  accessibilityDeadline?: number;
+  enforceCustomSnapshots?: boolean;
+  limitXPathContextScope?: boolean;
+  includeHittableInPageSource?: boolean;
+  includeNativeFrameInPageSource?: boolean;
+  includeNativeAccessibilityElementInPageSource?: boolean;
+  includeMinMaxValueInPageSource?: boolean;
+  includeCustomActionsInPageSource?: boolean;
+  respectSystemAlerts?: boolean;
+  autoClickAlertSelector?: string;
   snapshotMaxDepth?: number;
+  snapshotMaxChildren?: number;
   useFirstMatch?: boolean;
   boundElementsByIndex?: boolean;
   reduceMotion?: boolean;
   defaultActiveApplication?: string;
   activeAppDetectionPoint?: string;
-  includeNonModalElements?: boolean;
   defaultAlertAction?: 'accept' | 'dismiss';
   acceptAlertButtonSelector?: string;
   dismissAlertButtonSelector?: string;
-  screenshotOrientation?: 'auto' | 'portrait' | 'portraitUpsideDown' | 'landscapeRight' | 'landscapeLeft'
+  screenshotOrientation?: 'auto' | 'portrait' | 'portraitUpsideDown' | 'landscapeRight' | 'landscapeLeft';
   waitForIdleTimeout?: number;
   animationCoolOffTimeout?: number;
   maxTypingFrequency?: number;
@@ -36,7 +48,6 @@ export interface WDACapabilities {
   environment?: Record<string, string>;
   eventloopIdleDelaySec?: number;
   shouldWaitForQuiescence?: boolean;
-  shouldUseTestManagerForVisibilityDetection?: boolean;
   maxTypingFrequency?: number;
   shouldUseSingletonTestManager?: boolean;
   waitForIdleTimeout?: number;
@@ -49,6 +60,7 @@ export interface WDACapabilities {
   forceSimulatorSoftwareKeyboardPresence?: boolean;
   defaultAlertAction?: 'accept' | 'dismiss';
   appLaunchStateTimeoutSec?: number;
+  accessibilityDeadline?: number;
 }
 
 export interface WebDriverAgentArgs {
@@ -72,6 +84,7 @@ export interface WebDriverAgentArgs {
   usePrebuiltWDA?: boolean;
   derivedDataPath?: string;
   mjpegServerPort?: number;
+  maxHttpRequestBodySize?: number;
   updatedWDABundleId?: string;
   wdaLaunchTimeout?: number;
   usePreinstalledWDA?: boolean;
@@ -88,15 +101,69 @@ export interface WebDriverAgentArgs {
   resultBundleVersion?: string;
   reqBasePath?: string;
   launchTimeout?: number;
+  extraRequestHeaders?: HTTPHeaders;
+  hostOps?: WdaHostOps;
 }
 
 export interface AppleDevice {
   udid: string;
-  simctl?: any;
-  devicectl?: any;
-  /** @deprecated We'll stop supporting idb */
-  idb?: any;
-  [key: string]: any;
+}
+
+export type WdaStartupStrategyName =
+  | 'existing-url'
+  | 'simulator'
+  | 'real-device-xcodebuild'
+  | 'real-device-preinstalled';
+
+export type WdaLaunchEnvironment = Record<string, string | number>;
+
+export interface WdaLaunchOptions {
+  udid: string;
+  bundleId: string;
+  env: WdaLaunchEnvironment;
+  wdaLocalPort?: number;
+  wdaRemotePort: number;
+  platformName?: string;
+  platformVersion?: string;
+  timeoutMs: number;
+}
+
+export interface WdaTerminateOptions {
+  udid: string;
+  bundleId: string;
+}
+
+export interface WdaResetTestProcessesOptions {
+  udid: string;
+  isSimulator: boolean;
+}
+
+export interface WdaCleanupObsoleteProcessesOptions {
+  udid: string;
+  port: string;
+  commandLineIncludes: string;
+}
+
+export interface SimulatorHostOps {
+  launchPreinstalled(opts: WdaLaunchOptions): Promise<void>;
+  terminate(opts: WdaTerminateOptions): Promise<void>;
+  resetTestProcesses?(opts: WdaResetTestProcessesOptions): Promise<void>;
+}
+
+export interface RealDevicePreinstalledHostOps {
+  launchPreinstalled(opts: WdaLaunchOptions): Promise<void>;
+  terminate(opts: WdaTerminateOptions): Promise<void>;
+}
+
+export interface RealDeviceXcodebuildHostOps {
+  resetTestProcesses?(opts: WdaResetTestProcessesOptions): Promise<void>;
+  cleanupObsoleteProcesses?(opts: WdaCleanupObsoleteProcessesOptions): Promise<void>;
+}
+
+export interface WdaHostOps {
+  simulator?: SimulatorHostOps;
+  realDevicePreinstalled?: RealDevicePreinstalledHostOps;
+  realDeviceXcodebuild?: RealDeviceXcodebuildHostOps;
 }
 
 /**
@@ -107,6 +174,37 @@ export interface DeviceInfo {
   udid: string;
   platformVersion: string;
   platformName: string;
+}
+
+/** Xcode build setting key/value pairs from `xcodebuild -showBuildSettings -json`. */
+export type XcodeBuildSettings = Record<string, string>;
+
+/** A single target entry returned by `xcodebuild -showBuildSettings -json`. */
+export interface XcodeShowBuildSettingsEntry {
+  action: string;
+  buildSettings: XcodeBuildSettings;
+  target: string;
+}
+
+export type WdaScheme =
+  | 'WebDriverAgentRunner'
+  | 'WebDriverAgentLib'
+  | 'WebDriverAgentRunner_tvOS'
+  | 'WebDriverAgentLib_tvOS'
+  | 'WebDriverAgentRunner_watchOS'
+  | 'WebDriverAgentLib_watchOS';
+
+export type WdaSdk = 'iphonesimulator' | 'iphoneos' | 'appletvsimulator' | 'appletvos' | 'watchsimulator';
+
+export type WdaBuildConfiguration = 'Debug' | 'Release';
+
+/** Options passed to {@link XcodeBuild.retrieveBuildSettings}. */
+export interface RetrieveBuildSettingsOptions {
+  scheme?: WdaScheme;
+  sdk?: WdaSdk;
+  configuration?: WdaBuildConfiguration;
+  /** `-destination` value (e.g. `id=<udid>` or a full destination specifier). */
+  destination?: string;
 }
 
 export interface XcodeBuildArgs {
@@ -132,8 +230,10 @@ export interface XcodeBuildArgs {
   updatedWDABundleId?: string;
   derivedDataPath?: string;
   mjpegServerPort?: number;
+  maxHttpRequestBodySize?: number;
   prebuildDelay?: number;
   allowProvisioningDeviceRegistration?: boolean;
   resultBundlePath?: string;
   resultBundleVersion?: string;
+  extraRequestHeaders?: HTTPHeaders;
 }

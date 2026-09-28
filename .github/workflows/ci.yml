@@ -20,7 +20,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.6'
+          go-version-file: go.mod
           cache: true
 
       - name: Download dependencies
@@ -46,22 +46,21 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.6'
+          go-version-file: go.mod
           cache: true
 
       - name: Check formatting
         run: make fmt-check
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v4
+        uses: golangci/golangci-lint-action@v9
         with:
           # Pinned deliberately. `latest` resolves at run time, so the same
-          # commit can pass today and fail tomorrow. golangci-lint v2 enables
-          # staticcheck's QF category and drops v1's default exclusions, which
-          # surfaces 61 pre-existing findings here (43 errcheck, 18
-          # staticcheck) — a migration to do on purpose, not by surprise.
-          # Moving off action@v4 requires that migration: v7+ needs v2.
-          version: v1.64.8
+          # commit can pass today and fail tomorrow. v1.64.8 was built with
+          # go1.24 and refuses to load a module whose go.mod pins toolchain
+          # go1.26.7; v2 releases are built with a new enough Go. The rules are
+          # kept at v1's baseline in .golangci.yml.
+          version: v2.13.2
 
   build:
     name: Build
@@ -74,7 +73,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.6'
+          go-version-file: go.mod
           cache: true
 
       - name: Build
@@ -94,7 +93,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.6'
+          go-version-file: go.mod
           cache: true
 
       - name: Run GoReleaser

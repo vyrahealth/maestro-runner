@@ -4099,15 +4099,11 @@ func TestLaunchAppViaShellAmStartErrorWithArgs(t *testing.T) {
 
 func TestScrollUntilVisibleRespectsMaxScrolls(t *testing.T) {
 	scrollCount := 0
+	captures := 0
 	client := &MockUIA2Client{
 		sourceFunc: func() (string, error) {
 			// Element never found
-			return `<?xml version="1.0" encoding="UTF-8"?>
-<hierarchy rotation="0">
-  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
-    <android.widget.TextView text="Other" bounds="[100,100][300,150]"/>
-  </android.widget.FrameLayout>
-</hierarchy>`, nil
+			return movingList(&captures), nil
 		},
 		scrollErr: nil,
 	}
@@ -4170,14 +4166,10 @@ func TestScrollUntilVisibleRespectsTimeout(t *testing.T) {
 }
 
 func TestScrollUntilVisibleDefaultMaxScrolls(t *testing.T) {
+	captures := 0
 	client := &MockUIA2Client{
 		sourceFunc: func() (string, error) {
-			return `<?xml version="1.0" encoding="UTF-8"?>
-<hierarchy rotation="0">
-  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
-    <android.widget.TextView text="Other" bounds="[100,100][300,150]"/>
-  </android.widget.FrameLayout>
-</hierarchy>`, nil
+			return movingList(&captures), nil
 		},
 	}
 
@@ -4513,5 +4505,51 @@ func TestAddMediaDocumentGoesToDownloads(t *testing.T) {
 	}
 	if !strings.HasPrefix(mock.pushes[1][1], "/sdcard/Pictures/MaestroRunner/") {
 		t.Errorf("photo pushed to %q, want the images dir", mock.pushes[1][1])
+	}
+}
+
+// movingList is a page source whose one row shifts up on every capture — a
+// list that keeps advancing — so a test about maxScrolls or timeouts is not
+// cut short by the no-progress stop.
+func movingList(captures *int) string {
+	*captures++
+	y := 100 + *captures
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
+    <android.widget.TextView text="Other" bounds="[100,%d][300,%d]"/>
+  </android.widget.FrameLayout>
+</hierarchy>`, y, y+50)
+}
+
+func TestScrollUntilVisibleStopsWhenScreenStopsMoving(t *testing.T) {
+	// The same capture on every read: a list at its end. Two scrolls that
+	// change nothing are proof enough — the loop must not spend the other 18.
+	client := &MockUIA2Client{
+		sourceFunc: func() (string, error) {
+			return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
+    <android.widget.TextView text="Last row" bounds="[100,2300][300,2350]"/>
+  </android.widget.FrameLayout>
+</hierarchy>`, nil
+		},
+	}
+	driver := New(client, &core.PlatformInfo{ScreenWidth: 1080, ScreenHeight: 2400}, nil)
+
+	result := driver.scrollUntilVisible(&flow.ScrollUntilVisibleStep{
+		Element:   flow.Selector{Text: "NonExistent"},
+		Direction: "down",
+		BaseStep:  flow.BaseStep{TimeoutMs: 60000},
+	})
+
+	if result.Success {
+		t.Fatal("expected failure when the element is not in the list")
+	}
+	if got := len(client.scrollCalls); got != 2 {
+		t.Errorf("expected 2 scrolls before the no-progress stop, got %d", got)
+	}
+	if !strings.Contains(result.Message, "made no progress") {
+		t.Errorf("message should name the reason, got %q", result.Message)
 	}
 }

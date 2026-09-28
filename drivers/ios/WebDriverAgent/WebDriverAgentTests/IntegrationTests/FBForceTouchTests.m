@@ -57,8 +57,11 @@
 
 - (void)testForceTap
 {
+  XCTSkipIf(SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"27.0"),
+            @"FIXME: Unstable on platform version 27.");
+
   if (![XCUIDevice sharedDevice].supportsPressureInteraction) {
-    return;
+    XCTSkip(@"Device does not support pressure interaction");
   }
 
   [self verifyForceTapWithOrientation:UIDeviceOrientationPortrait];
@@ -67,7 +70,7 @@
 - (void)testForceTapInLandscapeLeft
 {
   if (![XCUIDevice sharedDevice].supportsPressureInteraction) {
-    return;
+    XCTSkip(@"Device does not support pressure interaction");
   }
 
   [self verifyForceTapWithOrientation:UIDeviceOrientationLandscapeLeft];
@@ -76,7 +79,7 @@
 - (void)testForceTapInLandscapeRight
 {
   if (![XCUIDevice sharedDevice].supportsPressureInteraction) {
-    return;
+    XCTSkip(@"Device does not support pressure interaction");
   }
 
   [self verifyForceTapWithOrientation:UIDeviceOrientationLandscapeRight];

@@ -122,10 +122,15 @@ extension RunnerTests {
 
   private func executeOnMain(command: Command) throws -> Response {
     var activeApp = currentApp ?? app
-    if !isRunnerLifecycleCommand(command.command) {
-      let normalizedBundleId = command.appBundleId?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-      let requestedBundleId = (normalizedBundleId?.isEmpty == true) ? nil : normalizedBundleId
+    if isPassiveReadCommand(command.command) {
+      switch passiveReadTarget(requestedBundleId: normalizedBundleId(command)) {
+      case .app(let target):
+        activeApp = target
+      case .refused(let response):
+        return response
+      }
+    } else if !isRunnerLifecycleCommand(command.command) {
+      let requestedBundleId = normalizedBundleId(command)
       if let bundleId = requestedBundleId {
         if currentBundleId != bundleId || currentApp == nil {
           _ = activateTarget(bundleId: bundleId, reason: "bundle_changed")
@@ -445,6 +450,12 @@ extension RunnerTests {
       let y = Double(matched.frame.midY)
       let touchFrame = resolvedTouchVisualizationFrame(app: activeApp, x: x, y: y)
       var outcome = RunnerInteractionOutcome.performed
+      // A no-op recovery guard: capture the screen just before the tap so we
+      // can tell, after, whether the tap actually did anything. Only when the
+      // activation-retry path is enabled (default off; opt in with
+      // DEVICELAB_ENABLE_TAP_ACTIVATION_RETRY=1) — otherwise we pay nothing.
+      let beforeTap: RunnerImage? = tapActivationRetryEnabled
+        ? XCUIScreen.main.screenshot().image : nil
       let timing = measureGesture {
         withTemporaryScrollIdleTimeoutIfSupported(activeApp) {
           outcome = tapAt(app: activeApp, x: x, y: y)
@@ -452,6 +463,26 @@ extension RunnerTests {
       }
       if let response = unsupportedResponse(for: outcome) {
         return response
+      }
+      // A coordinate tap on some React Native controls reports success but
+      // never fires the control's handler — the navigation simply does not
+      // happen (observed on native-stack "Pop to top" after a deep push; WDA
+      // passes the same flow). Detect that exact no-op — the screen did not
+      // change AND the same element is still on screen and hittable — and
+      // re-tap through the element's activation point, which resolves the
+      // handler the way WDA's element.tap() does. Gated on a proven no-op, so
+      // a normal tap costs one screenshot and no extra tap. The primary tap
+      // and its returned x/y are unchanged, so inputText's tapped-coordinate
+      // coupling still holds.
+      if let before = beforeTap {
+        Thread.sleep(forTimeInterval: 0.3)
+        let after = XCUIScreen.main.screenshot().image
+        if computePixelDiffFraction(before, after) < tapNoOpDiffThreshold,
+           let live = liveElementForSnapshot(activeApp, matched),
+           live.exists, live.isHittable {
+          NSLog("DL_TAP_ACTIVATION_RETRY selector=%@", selectorValue)
+          live.tap()
+        }
       }
       // Note: response returns the raw element-relative x/y, not
       // touchFrame.x/y. touchFrame applies the appFrame origin (screen-
@@ -765,20 +796,26 @@ extension RunnerTests {
         return Response(ok: false, error: ErrorPayload(message: "readText did not resolve text"))
       }
       return Response(ok: true, data: DataPayload(text: text))
+    case .idle:
+      return executeIdle(app: activeApp, command: command)
     case .snapshot:
+      if let refused = unreadableSnapshotTarget(activeApp) {
+        return refused
+      }
       let options = SnapshotOptions(
         interactiveOnly: command.interactiveOnly ?? false,
         compact: command.compact ?? false,
         depth: command.depth,
         scope: command.scope,
-        raw: command.raw ?? false
+        raw: command.raw ?? false,
+        followsScreen: (command.appBundleId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
       )
-      if options.raw {
-        needsPostSnapshotInteractionDelay = true
-        return Response(ok: true, data: snapshotRaw(app: activeApp, options: options))
+      let target = activeApp
+      return withSnapshotRequestTimeout {
+        options.raw
+          ? snapshotRaw(app: target, options: options)
+          : snapshotFast(app: target, options: options)
       }
-      needsPostSnapshotInteractionDelay = true
-      return Response(ok: true, data: snapshotFast(app: activeApp, options: options))
     case .screenshot:
       let screenshot: XCUIScreenshot
 #if os(macOS)
@@ -935,7 +972,12 @@ extension RunnerTests {
           (command.x != nil && command.y != nil)
           ? "no text input found at the provided coordinates to clear"
           : "no focused text input to clear"
-        return Response(ok: false, error: ErrorPayload(message: message))
+        return Response(ok: false, error: ErrorPayload(code: "NO_TEXT_INPUT", message: message))
+      }
+      if text.isEmpty, let count = command.deleteCount, count > 0,
+        let erased = eraseTrailingCharacters(app: activeApp, target: target, count: count)
+      {
+        return erased
       }
     }
     let textResult = typeTextReliably(
@@ -945,17 +987,23 @@ extension RunnerTests {
       delaySeconds: delaySeconds,
       repairMode: textEntryMode
     )
+    let outcome = DataPayload(
+      message: textResult.repaired ? "typed after repair" : "typed",
+      verified: textResult.verified,
+      repaired: textResult.repaired
+    )
     if textResult.verified == false {
       let expected = textResult.expectedText ?? ""
       let observed = textResult.observedText ?? ""
       return Response(
         ok: false,
+        data: outcome,
         error: ErrorPayload(
           code: "TEXT_ENTRY_MISMATCH",
           message: "text entry verification failed: expected \"\(expected)\", observed \"\(observed)\""
         )
       )
     }
-    return Response(ok: true, data: DataPayload(message: textResult.repaired ? "typed after repair" : "typed"))
+    return Response(ok: true, data: outcome)
   }
 }

@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
 
 // TextEntryVerdict is what a read-back of a text field after typing tells us.
 type TextEntryVerdict int
@@ -87,6 +90,20 @@ func VerifyTypedText(typed, before, after string, readOK bool) TextEntryVerdict 
 	return TextEntryTransformed
 }
 
+// keptBeforeTyping is the part of the field that was there before typing and
+// must survive a clear-and-retype. before is only real text when the partial
+// value still starts with it: typing appends, so a real value stays in front,
+// while a hint an empty field reported is replaced by the first keystroke.
+// Nothing is kept when that cannot be told apart — the typed text itself
+// starts with before — or when before is masked, since bullets are not the
+// characters behind them.
+func keptBeforeTyping(typed, before, after string) string {
+	if before == "" || isMasked(before) || strings.HasPrefix(typed, before) || !strings.HasPrefix(after, before) {
+		return ""
+	}
+	return before
+}
+
 // maskCharacters are what the platforms substitute for a secure field's real
 // value: the bullet iOS and Android report, and the asterisk some custom
 // controls use.
@@ -148,7 +165,8 @@ func ConfirmTypedText(field TextField, typed, before string, warn func(format st
 	}
 
 	after, err := field.Text()
-	if VerifyTypedText(typed, before, after, err == nil) != TextEntryDropped {
+	verdict := VerifyTypedText(typed, before, after, err == nil)
+	if !worthRetyping(verdict) {
 		return ""
 	}
 
@@ -160,13 +178,43 @@ func ConfirmTypedText(field TextField, typed, before string, warn func(format st
 		// leave the field worse than it started.
 		return " (warning: characters were dropped and the field could not be cleared to retry)"
 	}
-	if inputErr := field.Input(typed); inputErr != nil {
+	// The clear takes the whole field, including anything it held before
+	// this step typed into it, so that goes back in with the retype.
+	if inputErr := field.Input(keptBeforeTyping(typed, before, after) + typed); inputErr != nil {
 		return " (warning: characters were dropped and retyping failed)"
 	}
 
 	retyped, retypedErr := field.Text()
-	if VerifyTypedText(typed, before, retyped, retypedErr == nil) == TextEntryDropped {
+	again := VerifyTypedText(typed, before, retyped, retypedErr == nil)
+	if again == TextEntryDropped {
 		return " (warning: characters are still missing after retyping)"
 	}
+	if verdict == TextEntryTransformed {
+		if again == TextEntryTransformed {
+			// Retyping reproduced it, so the app rewrites this field: left as it is.
+			return " (warning: the field still differs from what was typed after retyping)"
+		}
+		return " (retyped: the field held more than was typed)"
+	}
 	return " (retyped after dropped characters)"
+}
+
+// worthRetyping reports whether a read-back verdict calls for one clear and
+// retype. A loss always does. A field that holds more than, or something other
+// than, what was typed is left alone, because that is what a formatter, a mask
+// or an autocomplete does, unless MAESTRO_STRICT_TYPING is set: then it is
+// retyped once, and a field the app really rewrites comes back the same and is
+// reported, not failed. For suites whose fields hold exactly what is typed. On a
+// real iPhone the XCUITest keyboard now and then adds a character (measured: a
+// second "@" after a typed email, about one sign-in in eight), which reads as
+// rewritten.
+func worthRetyping(v TextEntryVerdict) bool {
+	switch v {
+	case TextEntryDropped:
+		return true
+	case TextEntryTransformed:
+		return os.Getenv("MAESTRO_STRICT_TYPING") != ""
+	default:
+		return false
+	}
 }

@@ -84,6 +84,9 @@ Unknown fields are ignored. Missing required fields produce `INVALID_ARGUMENT`.
 | `ALERT_PRESENT` | A system alert blocked the operation |
 | `TIMEOUT` | Server-side 30s ceiling exceeded |
 | `XCUI_EXCEPTION` | Underlying XCUITest threw an ObjC exception (retried once before this) |
+| `SNAPSHOT_FAILED` | No accessibility tree could be read (query failed or timed out); `data.appState` says why, usually a suspended app |
+| `NO_TARGET_APP` | A read-only command named no app and the frontmost app could not be resolved |
+| `NO_TEXT_INPUT` | A replace-mode `type` (a clear, or `eraseText`) found no text input at the coordinates, or none focused |
 | `RUNNER_INTERNAL` | Bug in the runner |
 
 ## Versioning
@@ -113,8 +116,15 @@ Unknown fields are ignored. Missing required fields produce `INVALID_ARGUMENT`.
 |---|---|---|
 | `snapshot` | `appBundleId?` | `{ nodes: [SnapshotNode] }` |
 | `screenSize` | `appBundleId?` | `{ width, height, scale }` |
+| `idle` | `appBundleId?`, `timeoutMs?` (default 1000, max 10000, `0` = do not wait) | `{ idle, waitedMs, appState, message }` |
 
-`snapshot` always returns the full tree. If `appBundleId` is omitted, snapshots the currently foregrounded app via `XCUIApplication()`. **No filtering, no caps, no occlusion computation.**
+`snapshot` always returns the full tree. If `appBundleId` is omitted, snapshots the frontmost app; if that cannot be resolved the call fails with `NO_TARGET_APP` rather than launching the runner's host app. **No filtering, no caps, no occlusion computation.**
+
+`idle` waits, capped by `timeoutMs`, for the app to go quiescent including animations — XCTest's `waitForQuiescenceIncludingAnimationsIdle:isPreEvent:`, bounded by setting XCTest's application-state timeout for the call (WebDriverAgent's approach). `idle` is `true` only when the app's `eventLoopHasIdled` and `animationsHaveFinished` flags are both set afterwards; it is `false` when the cap passed first, the app is not in the foreground (XCTest skips the check for it), `timeoutMs` was 0, or the private API is missing. `waitedMs` is the real time spent and can exceed the cap if XCTest spindumps an app that never idled. Like `snapshot`, it never activates the app.
+
+`snapshot` is read-only: it never activates, launches or waits for the app. A named app that is backgrounded is read as it is; one that is suspended or not running is not queried at all (`SNAPSHOT_FAILED` with its `appState`), since it cannot answer.
+
+`snapshot` data also carries `appState` (the target's `XCUIApplication.state`) and `source`: `"xctest"` for XCTest's public snapshot, `"privateAX"` when the tree came from the private accessibility fallback (the public path failed or returned only the root). When no tree can be read at all the response is `ok: false` with `SNAPSHOT_FAILED`, and `data.appState` is still set — an unreadable screen is never reported as an empty one.
 
 #### SnapshotNode
 
@@ -186,6 +196,8 @@ All gestures accept `appBundleId` so the runner can target the right `XCUIApplic
 
 `type` sends keys to the currently focused element (caller is responsible for tapping to focus first — same as WDA today).
 
+`type` reports its read-back: `verified` is `true` when the field read back as typed, `false` on a mismatch (the response is then `ok: false` with `TEXT_ENTRY_MISMATCH`, and `data` still carries `verified`/`repaired`), and absent when the value could not be read (secure fields) — unchecked typing is never reported as verified. `repaired: true` means the first attempt read back wrong and the runner cleared the field and typed again.
+
 ### Alerts
 
 | Command | Inputs | Returns |
@@ -256,3 +268,5 @@ This split mirrors how the current `pkg/driver/wda/` and `pkg/driver/devicelab/`
 - **`displayed` semantics.** WDA's `isDisplayed` differs from XCUI's `isHittable`. We compute `displayed` as "rect intersects screen bounds AND parent clip path", `hittable` as raw `.isHittable`. Validate with TestHive flows.
 - **Predicate string compatibility.** WDA supports a specific NSPredicate dialect via Appium. We should support the same dialect so existing flow selectors keep working — verify against `pkg/driver/wda/driver.go:findElementByWDA`.
 - **`scroll` vs `swipe` duration defaults.** WDA scrolls slower than it swipes. Per react-navigation PR #13027, swipe duration tuning is touchy. Pick defaults that match upstream Maestro out of the gate.
+
+`type` with `text: ""` and `textEntryMode: "replace"` clears the resolved input. An optional `deleteCount` (local extension, used by `eraseText`) deletes that many characters from the end instead; a count of at least the field's length clears the whole field through the same verified path.

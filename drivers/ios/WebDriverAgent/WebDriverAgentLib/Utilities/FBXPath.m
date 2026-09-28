@@ -14,6 +14,7 @@
 #import "FBLogger.h"
 #import "FBMacros.h"
 #import "FBXMLGenerationOptions.h"
+#import "FBXPathExtensions.h"
 #import "FBXCElementSnapshotWrapper+Helpers.h"
 #import "NSString+FBXMLSafeString.h"
 #import "XCUIApplication.h"
@@ -119,6 +120,10 @@
 
 @end
 
+@interface FBNativeAccessibilityElementAttribute : FBElementAttribute
+
+@end
+
 @interface FBTraitsAttribute : FBElementAttribute
 
 @end
@@ -152,7 +157,17 @@ static NSString *const topNodeIndexPath = @"top";
 
 + (id)throwException:(NSString *)name forQuery:(NSString *)xpathQuery
 {
-  NSString *reason = [NSString stringWithFormat:@"Cannot evaluate results for XPath expression \"%@\"", xpathQuery];
+  return [self throwException:name forQuery:xpathQuery detail:nil];
+}
+
++ (id)throwException:(NSString *)name forQuery:(NSString *)xpathQuery detail:(nullable NSString *)detail
+{
+  NSString *reason;
+  if (nil != detail) {
+    reason = [NSString stringWithFormat:@"Cannot evaluate results for XPath expression \"%@\": %@", xpathQuery, detail];
+  } else {
+    reason = [NSString stringWithFormat:@"Cannot evaluate results for XPath expression \"%@\"", xpathQuery];
+  }
   @throw [NSException exceptionWithName:name reason:reason userInfo:@{}];
   return nil;
 }
@@ -180,7 +195,7 @@ static NSString *const topNodeIndexPath = @"top";
       // If 'includeHittableInPageSource' setting is enabled, then use native snapshots
       // to calculate a more accurate value for the 'hittable' attribute.
       rc = [self xmlRepresentationWithRootElement:[self snapshotWithRoot:root
-                                                        useNative:FBConfiguration.includeHittableInPageSource]
+                                                        useNative:FBConfiguration.sharedInstance.includeHittableInPageSource]
                                            writer:writer
                                      elementStore:nil
                                             query:nil
@@ -237,16 +252,17 @@ static NSString *const topNodeIndexPath = @"top";
     [FBLogger logFmt:@"Failed to invoke libxml2>xmlTextWriterStartDocument. Error code: %d", rc];
   } else {
     [self waitUntilStableWithElement:root];
-    if (FBConfiguration.limitXpathContextScope) {
+    if (FBConfiguration.sharedInstance.limitXpathContextScope) {
       lookupScopeSnapshot = [self snapshotWithRoot:root useNative:useNativeSnapshot];
     } else {
       if ([root isKindOfClass:XCUIElement.class]) {
         lookupScopeSnapshot = [self snapshotWithRoot:[(XCUIElement *)root application]
                                            useNative:useNativeSnapshot];
+        // root.lastSnapshot may be stale leftover from an unrelated earlier command.
         contextRootSnapshot = [root isKindOfClass:XCUIApplication.class]
           ? nil
-          : ([(XCUIElement *)root lastSnapshot] ?: [self snapshotWithRoot:(XCUIElement *)root
-                                                                useNative:useNativeSnapshot]);
+          : ([(XCUIElement *)root fb_cachedSnapshot] ?: [self snapshotWithRoot:(XCUIElement *)root
+                                                                     useNative:useNativeSnapshot]);
       } else {
         lookupScopeSnapshot = (id<FBXCElementSnapshot>)root;
         contextRootSnapshot = nil == lookupScopeSnapshot.parent ? nil : (id<FBXCElementSnapshot>)root;
@@ -284,16 +300,18 @@ static NSString *const topNodeIndexPath = @"top";
       contextNode = nodeSet->nodeTab[0];
     }
   }
+  NSString *evaluationError = nil;
   xmlXPathObjectPtr queryResult = [self evaluate:xpathQuery
                                         document:doc
-                                     contextNode:contextNode];
+                                     contextNode:contextNode
+                                    errorMessage:&evaluationError];
   if (NULL != contextNodeQueryResult) {
     xmlXPathFreeObject(contextNodeQueryResult);
   }
   if (NULL == queryResult) {
     xmlFreeTextWriter(writer);
     xmlFreeDoc(doc);
-    return [self throwException:FBInvalidXPathException forQuery:xpathQuery];
+    return [self throwException:FBInvalidXPathException forQuery:xpathQuery detail:evaluationError];
   }
 
   NSArray *matchingSnapshots = [self collectMatchingSnapshots:queryResult->nodesetval
@@ -387,21 +405,25 @@ static NSString *const topNodeIndexPath = @"top";
   NSMutableSet<Class> *includedAttributes;
   if (nil == query) {
     includedAttributes = [NSMutableSet setWithArray:FBElementAttribute.supportedAttributes];
-    if (!FBConfiguration.includeHittableInPageSource) {
+    if (!FBConfiguration.sharedInstance.includeHittableInPageSource) {
       // The hittable attribute is expensive to calculate for each snapshot item
       // thus we only include it when requested explicitly
       [includedAttributes removeObject:FBHittableAttribute.class];
     }
-    if (!FBConfiguration.includeNativeFrameInPageSource) {
+    if (!FBConfiguration.sharedInstance.includeNativeFrameInPageSource) {
       // Include nativeFrame only when requested
       [includedAttributes removeObject:FBNativeFrameAttribute.class];
     }
-    if (!FBConfiguration.includeMinMaxValueInPageSource) {
+    if (!FBConfiguration.sharedInstance.includeNativeAccessibilityElementInPageSource) {
+      // Include the raw native accessibility flag only when requested
+      [includedAttributes removeObject:FBNativeAccessibilityElementAttribute.class];
+    }
+    if (!FBConfiguration.sharedInstance.includeMinMaxValueInPageSource) {
       // minValue/maxValue are retrieved from private APIs and may be slow on deep trees
       [includedAttributes removeObject:FBMinValueAttribute.class];
       [includedAttributes removeObject:FBMaxValueAttribute.class];
     }
-    if (!FBConfiguration.includeCustomActionsInPageSource) {
+    if (!FBConfiguration.sharedInstance.includeCustomActionsInPageSource) {
       // customActions are retrieved from accessibility attributes and may be slow on deep trees
       [includedAttributes removeObject:FBCustomActionsAttribute.class];
     }
@@ -436,6 +458,14 @@ static NSString *const topNodeIndexPath = @"top";
                      document:(xmlDocPtr)doc
                   contextNode:(nullable xmlNodePtr)contextNode
 {
+  return [self evaluate:xpathQuery document:doc contextNode:contextNode errorMessage:nil];
+}
+
++ (xmlXPathObjectPtr)evaluate:(NSString *)xpathQuery
+                     document:(xmlDocPtr)doc
+                  contextNode:(nullable xmlNodePtr)contextNode
+                 errorMessage:(NSString * _Nullable * _Nullable)errorMessage
+{
   xmlXPathContextPtr xpathCtx = xmlXPathNewContext(doc);
   if (NULL == xpathCtx) {
     [FBLogger logFmt:@"Failed to invoke libxml2>xmlXPathNewContext for XPath query \"%@\"", xpathQuery];
@@ -443,10 +473,21 @@ static NSString *const topNodeIndexPath = @"top";
   }
   xpathCtx->node = NULL == contextNode ? doc->children : contextNode;
 
+  FBXPathExtensions *extensions = [FBXPathExtensions new];
+  [extensions registerFunctionsWithContext:xpathCtx];
+
   xmlXPathObjectPtr xpathObj = xmlXPathEvalExpression((const xmlChar *)[xpathQuery UTF8String], xpathCtx);
   if (NULL == xpathObj) {
+    NSString *detail = extensions.lastEvaluationError;
+    if (NULL != errorMessage) {
+      *errorMessage = detail;
+    }
+    if (nil != detail) {
+      [FBLogger logFmt:@"Failed to evaluate XPath query \"%@\": %@", xpathQuery, detail];
+    } else {
+      [FBLogger logFmt:@"Failed to invoke libxml2>xmlXPathEvalExpression for XPath query \"%@\"", xpathQuery];
+    }
     xmlXPathFreeContext(xpathCtx);
-    [FBLogger logFmt:@"Failed to invoke libxml2>xmlXPathEvalExpression for XPath query \"%@\"", xpathQuery];
     return NULL;
   }
   xmlXPathFreeContext(xpathCtx);
@@ -580,7 +621,7 @@ static NSString *const topNodeIndexPath = @"top";
     return [(XCUIElement *)root fb_nativeSnapshot];
   }
   // https://github.com/appium/WebDriverAgent/issues/1085
-  return [root isKindOfClass:XCUIApplication.class] && !FBConfiguration.enforceCustomSnapshots
+  return [root isKindOfClass:XCUIApplication.class] && !FBConfiguration.sharedInstance.enforceCustomSnapshots
     ? [(XCUIElement *)root fb_standardSnapshot]
     : [(XCUIElement *)root fb_customSnapshot];
 }
@@ -590,7 +631,7 @@ static NSString *const topNodeIndexPath = @"top";
   if ([root isKindOfClass:XCUIElement.class]) {
     // If the app is not idle state while we retrieve the visiblity state
     // then the snapshot retrieval operation might freeze and time out
-    [[(XCUIElement *)root application] fb_waitUntilStableWithTimeout:FBConfiguration.animationCoolOffTimeout];
+    [[(XCUIElement *)root application] fb_waitUntilStableWithTimeout:FBConfiguration.sharedInstance.animationCoolOffTimeout];
   }
 }
 
@@ -654,6 +695,7 @@ static NSString *const FBAbstractMethodInvocationException = @"AbstractMethodInv
            FBEnabledAttribute.class,
            FBVisibleAttribute.class,
            FBAccessibleAttribute.class,
+           FBNativeAccessibilityElementAttribute.class,
 #if TARGET_OS_TV
            FBFocusedAttribute.class,
 #endif
@@ -919,6 +961,19 @@ static NSString *const FBAbstractMethodInvocationException = @"AbstractMethodInv
 + (NSString *)valueForElement:(id<FBElement>)element
 {
   return NSStringFromCGRect(element.wdNativeFrame);
+}
+@end
+
+@implementation FBNativeAccessibilityElementAttribute
+
++ (NSString *)name
+{
+  return @"nativeAccessibilityElement";
+}
+
++ (NSString *)valueForElement:(id<FBElement>)element
+{
+  return FBBoolToString(element.wdNativeAccessibilityElement);
 }
 @end
 

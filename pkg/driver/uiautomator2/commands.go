@@ -401,7 +401,7 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 		// Resolve and read the focused field first: after typing, "unchanged"
 		// is the only thing that separates a hint from a lost keystroke.
 		target, before := d.focusedFieldBefore()
-		if err := d.client.SendKeyActions(text); err != nil {
+		if err := d.client.SendKeyActionsWithDelay(text, d.typingDelayMs); err != nil {
 			return errorResult(err, "Failed to input text via key press")
 		}
 		// Per-character key events are the path that loses characters when the
@@ -698,6 +698,10 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	// Height of a flush candidate awaiting confirmation, or -1 for none.
 	pendingHeight := -1
 
+	// Stop early when the surface stops moving — a target that is not in the
+	// list should not cost every scroll the step allows.
+	var progress core.ScrollProgress
+
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		// Try to find element (short timeout - includes page source fallback)
 		_, info, err := d.findElement(step.Element, true, 1000)
@@ -726,6 +730,10 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			return errorResult(err, "Failed to find element")
 		}
 
+		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+			return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found: scrolling %s made no progress after %d scrolls (end of content?)", direction, i))
+		}
+
 		scrollErr := error(nil)
 		if container != nil {
 			scrollErr = d.performScrollInRect(direction, *container, step.Engine, 0.3, scrollMs)
@@ -740,6 +748,17 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	}
 
 	return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found after %d scrolls", maxScrolls))
+}
+
+// scrollSurfaceSignature reduces the current page source to a key for
+// core.ScrollProgress. A capture that cannot be read reports ok=false and is
+// not observed, so a hiccup never passes for the end of the content.
+func (d *Driver) scrollSurfaceSignature() (string, bool) {
+	source, err := d.client.Source()
+	if err != nil || source == "" {
+		return "", false
+	}
+	return core.ScrollSignature(source), true
 }
 
 // scrollDurationMs is the swipe duration (in ms) used for adb input swipe.

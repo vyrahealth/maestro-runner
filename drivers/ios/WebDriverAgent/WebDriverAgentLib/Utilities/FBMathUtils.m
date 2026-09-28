@@ -8,7 +8,11 @@
 
 #import "FBMathUtils.h"
 
+#import "FBErrorBuilder.h"
 #import "FBMacros.h"
+#import "XCUICoordinate.h"
+#import "XCUIElement.h"
+#import "XCUIElement+FBWebDriverAttributes.h"
 
 CGFloat FBDefaultFrameFuzzyThreshold = 2.0;
 
@@ -44,14 +48,14 @@ BOOL FBRectFuzzyEqualToRect(CGRect rect1, CGRect rect2, CGFloat threshold)
   FBSizeFuzzyEqualToSize(rect1.size, rect2.size, threshold);
 }
 
-#if !TARGET_OS_TV
+#if !TARGET_OS_TV && !TARGET_OS_WATCH
 
 CGSize FBAdjustDimensionsForApplication(CGSize actualSize, UIInterfaceOrientation orientation)
 {
   if (orientation == UIInterfaceOrientationLandscapeLeft || orientation == UIInterfaceOrientationLandscapeRight) {
     /*
      There is an XCTest bug that application.frame property returns exchanged dimensions for landscape mode.
-     This verification is just to make sure the bug is still there (since height is never greater than width in landscape) 
+     This verification is just to make sure the bug is still there (since height is never greater than width in landscape)
      and to make it still working properly after XCTest itself starts to respect landscape mode.
      */
     if (actualSize.height > actualSize.width) {
@@ -61,3 +65,45 @@ CGSize FBAdjustDimensionsForApplication(CGSize actualSize, UIInterfaceOrientatio
   return actualSize;
 }
 #endif
+
+#if !TARGET_OS_TV
+XCUICoordinate *FBCoordinateWithAnchorOffset(XCUIElement *element,
+                                              CGVector anchorOffset,
+                                              CGVector pointsOffset,
+                                              NSError **error)
+{
+  // wdFrame matches the coordinate space pointsOffset was measured in; element.frame alone
+  // can already be pre-scaled for a compatibility-mode window mismatch, double-applying it.
+  CGRect frame = element.wdFrame;
+  if (CGRectIsEmpty(frame)) {
+    [[[FBErrorBuilder builder]
+      withDescriptionFormat:@"The element '%@' is not visible on the screen and thus is not interactable", element.description]
+     buildError:error];
+    return nil;
+  }
+  CGVector normalizedOffset = CGVectorMake(anchorOffset.dx + pointsOffset.dx / frame.size.width,
+                                           anchorOffset.dy + pointsOffset.dy / frame.size.height);
+  return [element coordinateWithNormalizedOffset:normalizedOffset];
+}
+#endif
+
+BOOL FBScrollGestureOffsets(CGRect scrollingFrame,
+                            CGRect anchorFrame,
+                            CGVector proportion,
+                            CGVector vector,
+                            CGVector *startOffset,
+                            CGVector *endOffset)
+{
+  if (CGRectIsEmpty(scrollingFrame) || CGRectIsEmpty(anchorFrame)) {
+    return NO;
+  }
+
+  CGPoint startPoint = CGPointMake((CGFloat)floor(scrollingFrame.origin.x + scrollingFrame.size.width * proportion.dx),
+                                   (CGFloat)floor(scrollingFrame.origin.y + scrollingFrame.size.height * proportion.dy));
+  CGPoint endPoint = CGPointMake((CGFloat)floor(startPoint.x + vector.dx), (CGFloat)floor(startPoint.y + vector.dy));
+  *startOffset = CGVectorMake((startPoint.x - anchorFrame.origin.x) / anchorFrame.size.width,
+                              (startPoint.y - anchorFrame.origin.y) / anchorFrame.size.height);
+  *endOffset = CGVectorMake((endPoint.x - anchorFrame.origin.x) / anchorFrame.size.width,
+                            (endPoint.y - anchorFrame.origin.y) / anchorFrame.size.height);
+  return YES;
+}

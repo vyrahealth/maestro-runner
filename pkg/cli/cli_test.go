@@ -1135,7 +1135,7 @@ func TestResolveDriverName(t *testing.T) {
 		platform string
 		expected string
 	}{
-		{"default android", "", "android", "uiautomator2"},
+		{"default android", "", "android", "devicelab"},
 		{"default ios", "", "ios", "wda"},
 		{"explicit uiautomator2 android", "uiautomator2", "android", "uiautomator2"},
 		{"explicit uiautomator2 ios overrides to wda", "uiautomator2", "ios", "wda"},
@@ -1147,7 +1147,7 @@ func TestResolveDriverName(t *testing.T) {
 		{"case insensitive web", "", "Web", "cdp"},
 		{"case insensitive ios", "", "iOS", "wda"},
 		{"case insensitive appium", "Appium", "android", "appium"},
-		{"empty both", "", "", "uiautomator2"},
+		{"empty both", "", "", "devicelab"},
 	}
 
 	for _, tt := range tests {
@@ -2473,5 +2473,32 @@ func TestBuildParallelDeviceError_AndroidKeepsAVDHints(t *testing.T) {
 	}
 	if !strings.Contains(msg, "AVD") {
 		t.Errorf("Android hint should mention AVDs, got:\n%s", msg)
+	}
+}
+
+// TestFirstDeclaredAppID verifies the run's appId is taken from the first flow
+// that declares one, not flows[0] alone (upstream #1692).
+func TestFirstDeclaredAppID(t *testing.T) {
+	mk := func(appID, url string) flow.Flow {
+		return flow.Flow{Config: flow.Config{AppID: appID, URL: url}}
+	}
+	tests := []struct {
+		name  string
+		flows []flow.Flow
+		want  string
+	}{
+		{"none", nil, ""},
+		{"empty slice", []flow.Flow{}, ""},
+		{"first has it", []flow.Flow{mk("com.a", ""), mk("com.b", "")}, "com.a"},
+		{"first is empty, second has it", []flow.Flow{mk("", ""), mk("com.b", "")}, "com.b"},
+		{"only a url", []flow.Flow{mk("", ""), mk("", "https://example.com")}, "https://example.com"},
+		{"all empty", []flow.Flow{mk("", ""), mk("", "")}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstDeclaredAppID(tt.flows); got != tt.want {
+				t.Errorf("firstDeclaredAppID = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

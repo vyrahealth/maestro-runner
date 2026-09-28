@@ -136,6 +136,65 @@ extension RunnerTests {
     currentBundleId = nil
   }
 
+  /// The app to snapshot when the caller named none: `target` while it is
+  /// still in front, otherwise whatever is in front now. The target was
+  /// chosen when the command arrived; an app that has since left the screen
+  /// (Home, the app switcher, a crash) stops answering accessibility
+  /// queries, and XCTest then waits 30s to find it, and retries twice,
+  /// holding every later command behind it.
+  func foregroundTarget(_ target: XCUIApplication) -> XCUIApplication {
+    if target.state == .runningForeground {
+      return target
+    }
+    guard let front = frontmostApplication() else {
+      return target
+    }
+    NSLog("AGENT_DEVICE_RUNNER_RETARGET from_state=%d", target.state.rawValue)
+    currentApp = front
+    return front
+  }
+
+  /// The command's appBundleId, trimmed; nil when absent or blank.
+  func normalizedBundleId(_ command: Command) -> String? {
+    let trimmed = command.appBundleId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (trimmed?.isEmpty ?? true) ? nil : trimmed
+  }
+
+  /// Where a read-only command (see isPassiveReadCommand) reads from.
+  enum PassiveReadTarget {
+    case app(XCUIApplication)
+    /// No app could be named without launching one; this is the reply.
+    case refused(Response)
+  }
+
+  /// Resolves the app a read-only command reads without activating,
+  /// launching or waiting for anything. A named app is read in whatever
+  /// state it is in — the command reports that state rather than changing
+  /// it; bringing it forward would make every settle poll yank a
+  /// backgrounded app back on screen. With no name, the frontmost app is
+  /// read. If that cannot be resolved the command fails: the old fallback,
+  /// launching the placeholder host app, would cover the real screen.
+  func passiveReadTarget(requestedBundleId: String?) -> PassiveReadTarget {
+    if let bundleId = requestedBundleId {
+      if currentBundleId == bundleId, let current = currentApp {
+        return .app(current)
+      }
+      return .app(XCUIApplication(bundleIdentifier: bundleId))
+    }
+    if let front = frontmostApplication() {
+      return .app(front)
+    }
+    return .refused(
+      Response(
+        ok: false,
+        error: ErrorPayload(
+          code: "NO_TARGET_APP",
+          message: "no appBundleId given and the frontmost app could not be resolved"
+        )
+      )
+    )
+  }
+
   func targetNeedsActivation(_ target: XCUIApplication) -> Bool {
     let state = target.state
 #if os(macOS)
@@ -266,7 +325,7 @@ extension RunnerTests {
 
   func isReadOnlyCommand(_ command: Command) -> Bool {
     switch command.command {
-    case .interactionFrame, .findText, .readText, .snapshot, .screenshot:
+    case .interactionFrame, .findText, .readText, .snapshot, .screenshot, .idle:
       return true
     case .alert:
       let action = (command.action ?? "get").lowercased()
@@ -280,6 +339,14 @@ extension RunnerTests {
     guard response.ok == false else { return false }
     guard let message = response.error?.message.lowercased() else { return false }
     return message.contains("is not available")
+  }
+
+  /// Commands that only observe the target app. They never activate or
+  /// launch it (see passiveReadTarget): a caller polls them many times a
+  /// second while a screen settles, and an observation that moves the app
+  /// changes the thing it observes.
+  func isPassiveReadCommand(_ command: CommandType) -> Bool {
+    command == .snapshot || command == .idle
   }
 
   func isInteractionCommand(_ command: CommandType) -> Bool {
@@ -313,13 +380,42 @@ extension RunnerTests {
     }
   }
 
+  // MARK: - Idle
+
+  /// Runs the idle command against `app` (already resolved without
+  /// activation). The wait happens only for a foreground app: XCTest skips
+  /// its quiescence check for any other and leaves the flags stale, so there
+  /// is nothing honest to report but idle: false.
+  func executeIdle(app: XCUIApplication, command: Command) -> Response {
+    let capMs = min(max(command.timeoutMs ?? Self.idleDefaultTimeoutMs, 0), Self.idleMaxTimeoutMs)
+    let state = app.state
+    if capMs == 0 || state != .runningForeground {
+      let reason = capMs == 0 ? "not waited: timeoutMs is 0" : "not waited: app is not in the foreground"
+      return idleResponse(idle: false, waitedMs: 0, app: app, message: reason)
+    }
+    let started = ProcessInfo.processInfo.systemUptime
+    let outcome = RunnerXCTestTimeouts.waitForQuiescence(of: app, timeout: capMs / 1000)
+    let waitedMs = (ProcessInfo.processInfo.systemUptime - started) * 1000
+    switch outcome {
+    case .idle:
+      return idleResponse(idle: true, waitedMs: waitedMs, app: app, message: "quiescent")
+    case .busy:
+      return idleResponse(idle: false, waitedMs: waitedMs, app: app, message: "not quiescent within timeoutMs")
+    default:
+      return idleResponse(idle: false, waitedMs: waitedMs, app: app, message: "quiescence API unavailable")
+    }
+  }
+
+  private func idleResponse(idle: Bool, waitedMs: Double, app: XCUIApplication, message: String) -> Response {
+    Response(
+      ok: true,
+      data: DataPayload(message: message, appState: appStateString(app), idle: idle, waitedMs: waitedMs)
+    )
+  }
+
   // MARK: - Interaction Stabilization
 
   func applyInteractionStabilizationIfNeeded() {
-    if needsPostSnapshotInteractionDelay {
-      sleepFor(postSnapshotInteractionDelay)
-      needsPostSnapshotInteractionDelay = false
-    }
     if needsFirstInteractionDelay {
       sleepFor(firstInteractionAfterActivateDelay)
       needsFirstInteractionDelay = false

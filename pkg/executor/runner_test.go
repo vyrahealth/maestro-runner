@@ -2620,13 +2620,15 @@ func TestRunner_AssertScreenshotStep(t *testing.T) {
 				t.Errorf("Status = %v, want %v", result.Status, tt.expectedStatus)
 			}
 
-			diffPath := filepath.Join(tmpDir, "reference_diff.png")
+			// The diff image now travels inside the report assets, keyed by
+			// command index, not beside the reference image.
+			diffs, _ := filepath.Glob(filepath.Join(tmpDir, "output", "assets", "*", "cmd-*-diff.png"))
 			if tt.expectedStatus == report.StatusFailed {
-				if _, err := os.Stat(diffPath); err != nil {
-					t.Errorf("expected diff image at %s: %v", diffPath, err)
+				if len(diffs) == 0 {
+					t.Errorf("expected a diff image in the report assets, found none")
 				}
-			} else if _, err := os.Stat(diffPath); err == nil {
-				t.Errorf("unexpected diff image written at %s", diffPath)
+			} else if len(diffs) != 0 {
+				t.Errorf("unexpected diff image written: %v", diffs)
 			}
 		})
 	}

@@ -31,6 +31,7 @@
 @property (nonatomic, readwrite) NSUInteger wdIndex;
 @property (nonatomic, readwrite, getter=isWDVisible) BOOL wdVisible;
 @property (nonatomic, readwrite, getter=isWDAccessible) BOOL wdAccessible;
+@property (nonatomic, readwrite, getter=isWDNativeAccessibilityElement) BOOL wdNativeAccessibilityElement;
 @property (nonatomic, readwrite, getter = isWDFocused) BOOL wdFocused;
 @property (nonatomic, readwrite, getter = isWDHittable) BOOL wdHittable;
 @property (nonatomic, copy, readwrite, nullable) NSString *wdPlaceholderValue;
@@ -44,8 +45,11 @@
 - (id _Nonnull)fb_standardSnapshot;
 - (id _Nonnull)fb_customSnapshot;
 - (nullable id)query;
+- (void)typeKey:(nonnull NSString *)key modifierFlags:(NSUInteger)modifierFlags;
 
 // Checks
 @property (nonatomic, assign, readonly) BOOL didResolve;
+@property (nonatomic, copy, readonly, nonnull) NSArray<NSString *> *typedKeys;
+@property (nonatomic, assign, readonly) NSUInteger lastTypedModifierFlags;
 
 @end

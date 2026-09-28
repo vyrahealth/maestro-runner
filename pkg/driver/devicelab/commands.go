@@ -58,7 +58,35 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 		if err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to build selectors: %v", err))
 		}
-		strategies := append(clickableStrategies, allStrategies...)
+		// Clickable-first promotes a text/label match to its nearest clickable
+		// ancestor, which is right for native buttons whose label sits on a
+		// non-clickable child. But inside a WebView that ancestor is often a
+		// large container whose centre misses the real input: a hosted form
+		// field (e.g. Shopify checkout's card iframe) then never receives focus
+		// and the key events that follow go nowhere. When a WebView is present,
+		// tap the matched element's OWN centre first — the same
+		// coordinate-tap-at-element-centre upstream Maestro uses, which lands on
+		// the field and focuses it. Clickable strategies stay as a fallback.
+		var strategies []LocatorStrategy
+		if d.webView != nil && d.webView.isConnected() {
+			strategies = append(allStrategies, clickableStrategies...)
+			// Remember the label so a following inputText can find+focus the
+			// matching cross-origin iframe input over CDP if the native tap
+			// didn't reach it (hosted card fields). The label may arrive as a
+			// plain text, a regex ("^Card number$"), or a substring — the CDP
+			// side normalises to alphanumerics, so pass whichever is set.
+			switch {
+			case step.Selector.Text != "":
+				d.lastWebTapText = step.Selector.Text
+			case step.Selector.TextRegex != "":
+				d.lastWebTapText = step.Selector.TextRegex
+			case step.Selector.TextContains != "":
+				d.lastWebTapText = step.Selector.TextContains
+			}
+		} else {
+			strategies = append(clickableStrategies, allStrategies...)
+		}
+
 		timeout := d.calculateTimeout(step.IsOptional(), step.TimeoutMs)
 		ctx, cancel := context.WithTimeout(d.parentContext(), timeout)
 		defer cancel()
@@ -89,6 +117,17 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 		for {
 			select {
 			case <-ctx.Done():
+				// WebView control the native tap can't reach (e.g. Shopify checkout's
+				// "Review order" / "Pay now" — a11y exposes the label on a non-clickable
+				// node, so no clickable node matches). Fall back to a CDP click of the
+				// element whose text matches, in the WebView's own context.
+				if os.Getenv("MAESTRO_CDP_IFRAME_FILL") != "" && d.webView != nil && d.webView.isConnected() {
+					if p := webTextPattern(step.Selector); p != "" {
+						if ok, _ := d.webView.clickIframeElementByText(p, false); ok {
+							return successResult(fmt.Sprintf("Tapped on: %s (CDP)", step.Selector.Describe()), nil)
+						}
+					}
+				}
 				if lastErr != nil {
 					return errorResult(fmt.Errorf("%s: %w", ctx.Err(), lastErr), fmt.Sprintf("Element not found: %v", lastErr))
 				}
@@ -546,6 +585,15 @@ func (d *Driver) assertVisible(step *flow.AssertVisibleStep) *core.CommandResult
 		return d.assertVisibleCount(step)
 	}
 
+	// Hosted WebView content — Shopify checkout's card-field values and the
+	// order-confirmation text — isn't in the a11y tree and the JS helper can't
+	// reach cross-origin frames, so a plain `visible: text` assert can't see it
+	// even though it's on screen. When enabled and a WebView is connected, poll
+	// native and a direct CDP text search together.
+	if os.Getenv("MAESTRO_CDP_IFRAME_FILL") != "" && d.webView != nil && d.webView.isConnected() && webTextPattern(step.Selector) != "" {
+		return d.assertVisibleWithWebViewText(step)
+	}
+
 	_, info, err := d.findElementFastWithLazyRetry(step.Selector, step.IsOptional(), step.TimeoutMs)
 	if err != nil {
 		err = d.notFoundOrCrash(err)
@@ -557,6 +605,55 @@ func (d *Driver) assertVisible(step *flow.AssertVisibleStep) *core.CommandResult
 	}
 
 	return errorResult(fmt.Errorf("element not visible"), "Element exists but is not visible")
+}
+
+// webTextPattern returns a JS regex source for the selector's text, or "" if the
+// selector isn't text-based. A regex selector is used verbatim; a plain text /
+// substring selector is matched literally.
+func webTextPattern(sel flow.Selector) string {
+	switch {
+	case sel.TextRegex != "":
+		return sel.TextRegex
+	case sel.Text != "":
+		return sel.Text
+	case sel.TextContains != "":
+		return regexp.QuoteMeta(sel.TextContains)
+	}
+	return ""
+}
+
+// assertVisibleWithWebViewText polls, each round, a fast native find and a direct
+// CDP text search of the WebView (main frame + iframes) — so hosted values and
+// the order-confirmation text that the a11y tree can't expose still satisfy a
+// `visible: text` assert once they're on screen.
+func (d *Driver) assertVisibleWithWebViewText(step *flow.AssertVisibleStep) *core.CommandResult {
+	timeout := step.TimeoutMs
+	if timeout <= 0 {
+		timeout = 5000
+	}
+	pattern := webTextPattern(step.Selector)
+	deadline := time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	for {
+		cdpMatch := d.webView != nil && d.webView.isConnected() && d.webView.webViewMatchesText(pattern)
+		_, info, ferr := d.findElementFast(step.Selector, true, 400)
+		nativeMatch := ferr == nil && info != nil && info.Visible
+		if cdpMatch {
+			return successResult("Element is visible (webview text)", nil)
+		}
+		if nativeMatch {
+			return successResult("Element is visible", info)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+	// Not visible. Return a failure even when the step is optional — matching the
+	// non-WebView assertVisible path, whose caller (the executor) makes an optional
+	// miss non-fatal. Returning success here instead would make a `when: visible`
+	// condition (which reads result.Success) treat a missing element as present,
+	// running the wrong branch (e.g. tapping a nonexistent "Review order" button).
+	return errorResult(fmt.Errorf("element not visible"), "Element not visible")
 }
 
 // assertVisibleCount asserts that the selector matches exactly the requested
@@ -736,6 +833,7 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 		if err := d.client.SendKeyActions(text); err != nil {
 			return errorResult(err, "Failed to input text via key press")
 		}
+		invalidateText(target)
 		// Per-character key events are the path that loses characters when the
 		// app janks — the reason this verification exists at all.
 		note := core.ConfirmTypedText(target, text, before, logger.Warn)
@@ -774,6 +872,27 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 			}
 		}
 	} else {
+		// Cross-origin WebView iframe inputs — e.g. Shopify checkout's hosted PCI
+		// card fields (checkout.pci.shopifyinc.com) — live in their own execution
+		// context that the main-frame JS helper and native key events can't reach,
+		// so setText fails and blind keys go nowhere. When enabled, fill the input
+		// matching the last tapped label inside a cross-origin iframe directly over
+		// CDP, appending so a field typed in parts (expiry MM/YY) accumulates.
+		//
+		// Opt-in: proven to fill and read hosted card fields in isolation, but
+		// mid-journey the shared CDP connection is congested by the helper-refresh
+		// loop and the evals stall, so it is gated behind a flag until that
+		// connection-health issue is fixed (see fillIframeInput).
+		if os.Getenv("MAESTRO_CDP_IFRAME_FILL") != "" && d.webView != nil && d.webView.isConnected() {
+			// Focus the iframe input over CDP, then type with REAL hardware key events.
+			// Setting .value programmatically bypasses the checkout's own formatter (the
+			// expiry field inserts " / " only on genuine keystrokes), so we drive the keys
+			// and let the page format. The flow chunks input (expiry as "1","2","3","0"),
+			// so the formatter runs between chunks.
+			if ok, _ := d.webView.typeIntoIframeInput(d.lastWebTapText, text); ok {
+				return successResult(fmt.Sprintf("Entered text: %s%s", text, unicodeWarning), nil)
+			}
+		}
 		// No selector — type into whatever has focus. findFocused prefers
 		// the WebView's DOM activeElement over the native ActiveElement,
 		// which matters after a CDP tap: the DOM input has focus but blind
@@ -803,6 +922,17 @@ func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 
 	note := core.ConfirmTypedText(typedInto, text, beforeText, logger.Warn)
 	return successResult(fmt.Sprintf("Entered text: %s%s%s", text, unicodeWarning, note), nil)
+}
+
+// textInvalidator is a field whose cached text can be marked stale.
+type textInvalidator interface{ InvalidateText() }
+
+// invalidateText tells field its cached text is out of date after it was typed
+// into by a route it did not see. Fields that always read live need nothing.
+func invalidateText(field core.TextField) {
+	if f, ok := field.(textInvalidator); ok {
+		f.InvalidateText()
+	}
 }
 
 // focusedFieldBefore resolves the element that key events will reach and reads
@@ -1102,6 +1232,10 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	// Height of a flush candidate awaiting confirmation, or -1 for none.
 	pendingHeight := -1
 
+	// Stop early when the surface stops moving — a target that is not in the
+	// list should not cost every scroll the step allows.
+	var progress core.ScrollProgress
+
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		_, info, err := d.findElement(step.Element, true, 1000)
 		if err == nil && info != nil {
@@ -1132,6 +1266,10 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			return errorResult(err, "Failed to find element")
 		}
 
+		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+			return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found: scrolling %s made no progress after %d scrolls (end of content?)", direction, i))
+		}
+
 		if err := d.performScroll(direction, width, height, step.Engine, 0.3, scrollMs); err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to scroll: %v", err))
 		}
@@ -1140,6 +1278,17 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	}
 
 	return errorResult(fmt.Errorf("element not found"), fmt.Sprintf("Element not found after %d scrolls", maxScrolls))
+}
+
+// scrollSurfaceSignature reduces the current page source to a key for
+// core.ScrollProgress. A capture that cannot be read reports ok=false and is
+// not observed, so a hiccup never passes for the end of the content.
+func (d *Driver) scrollSurfaceSignature() (string, bool) {
+	source, err := d.client.Source()
+	if err != nil || source == "" {
+		return "", false
+	}
+	return core.ScrollSignature(source), true
 }
 
 // performScroll dispatches a scroll gesture using the engine selected by the
@@ -2268,6 +2417,13 @@ func (d *Driver) waitUntil(step *flow.WaitUntilStep) *core.CommandResult {
 				_, info, err := d.findElementOnce(*step.Visible)
 				if err == nil && info != nil {
 					return successResult("Element is now visible", info)
+				}
+				// Hosted WebView content (card-field values, order confirmation)
+				// isn't in the a11y tree — read it directly over CDP.
+				if os.Getenv("MAESTRO_CDP_IFRAME_FILL") != "" && d.webView != nil && d.webView.isConnected() {
+					if p := webTextPattern(*step.Visible); p != "" && d.webView.webViewMatchesText(p) {
+						return successResult("Element is now visible (webview text)", nil)
+					}
 				}
 			} else {
 				_, info, err := d.findElementOnce(*step.NotVisible)

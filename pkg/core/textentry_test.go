@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestVerifyTypedText(t *testing.T) {
 	tests := []struct {
@@ -58,5 +61,47 @@ func TestIsMasked(t *testing.T) {
 		if isMasked(plain) {
 			t.Errorf("%q should not read as masked", plain)
 		}
+	}
+}
+
+// recordingField is a text field whose value the test sets, and which
+// records what a retry typed into it.
+type recordingField struct {
+	value string
+	typed []string
+}
+
+func (f *recordingField) Text() (string, error) { return f.value, nil }
+func (f *recordingField) Clear() error          { f.value = ""; return nil }
+func (f *recordingField) Input(s string) error {
+	f.typed = append(f.typed, s)
+	f.value += s
+	return nil
+}
+
+// A retype clears the whole field, so what it held before this step typed
+// must go back in with it. Before the fix, "abc" + a dropped "defgh" came
+// back as "defgh".
+func TestConfirmTypedTextKeepsExistingText(t *testing.T) {
+	tests := []struct {
+		name, before, typed, after, want string
+	}{
+		{"existing text survives", "abc", "defgh", "abcd", "abcdefgh"},
+		{"empty field", "", "hello", "hel", "hello"},
+		{"hint replaced by typing is not kept", "Username", "devicelab", "devi", "devicelab"},
+		{"typed text starting with before is ambiguous, nothing kept", "Search", "Search tips", "Search t", "Search tips"},
+		{"masked value is not retyped as bullets", "•••", "secret", "•••••", "secret"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := &recordingField{value: tt.after}
+			note := ConfirmTypedText(f, tt.typed, tt.before, nil)
+			if !strings.Contains(note, "retyped") && !strings.Contains(note, "warning") {
+				t.Fatalf("no retry happened (note %q)", note)
+			}
+			if f.value != tt.want {
+				t.Errorf("field holds %q after the retry, want %q", f.value, tt.want)
+			}
+		})
 	}
 }

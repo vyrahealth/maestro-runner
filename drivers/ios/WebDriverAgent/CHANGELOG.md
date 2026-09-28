@@ -1,3 +1,549 @@
+## [16.12.8](https://github.com/appium/WebDriverAgent/compare/v16.12.7...v16.12.8) (2026-09-11)
+
+### Bug Fixes
+
+* use wdFrame instead of raw frame for scroll gesture anchor ([#1256](https://github.com/appium/WebDriverAgent/issues/1256)) ([9ada9fd](https://github.com/appium/WebDriverAgent/commit/9ada9fd4077796b7c1002292c21ec9e45fab4d89))
+
+## [16.12.7](https://github.com/appium/WebDriverAgent/compare/v16.12.6...v16.12.7) (2026-09-10)
+
+### Bug Fixes
+
+* remaining strong box file ([#1255](https://github.com/appium/WebDriverAgent/issues/1255)) ([f5f7004](https://github.com/appium/WebDriverAgent/commit/f5f70041e463777d7604e84fd8d27bf11cb268b9))
+
+## [16.12.6](https://github.com/appium/WebDriverAgent/compare/v16.12.5...v16.12.6) (2026-09-09)
+
+### Bug Fixes
+
+* rescale gesture coordinates for compatibility-mode window mismatches ([#1249](https://github.com/appium/WebDriverAgent/issues/1249)) ([25fcd95](https://github.com/appium/WebDriverAgent/commit/25fcd9558314c367c755b047cd0db0949654e90b))
+
+## [16.12.5](https://github.com/appium/WebDriverAgent/compare/v16.12.4...v16.12.5) (2026-09-07)
+
+### Bug Fixes
+
+* touch and scroll related view issue in IntegrationApp ([#1253](https://github.com/appium/WebDriverAgent/issues/1253)) ([34859e9](https://github.com/appium/WebDriverAgent/commit/34859e9b443c184505206576b3b531d85d2afbcf))
+
+## [16.12.4](https://github.com/appium/WebDriverAgent/compare/v16.12.3...v16.12.4) (2026-09-06)
+
+### Miscellaneous Chores
+
+* add coordinate screen in the integration app ([#1251](https://github.com/appium/WebDriverAgent/issues/1251)) ([de6acac](https://github.com/appium/WebDriverAgent/commit/de6acac7ebbaf70915f0c09093e3a12623efcea2))
+
+## [16.12.3](https://github.com/appium/WebDriverAgent/compare/v16.12.2...v16.12.3) (2026-09-04)
+
+### Bug Fixes
+
+* resolve key name lookup for dictionary-form keyboardInput keys ([#1247](https://github.com/appium/WebDriverAgent/issues/1247)) ([f40bac6](https://github.com/appium/WebDriverAgent/commit/f40bac6ea77f6220883fe4437ee63e51fe44d74f))
+
+## [16.12.2](https://github.com/appium/WebDriverAgent/compare/v16.12.1...v16.12.2) (2026-09-03)
+
+### Bug Fixes
+
+* allow pause action items to appear before any pointer movement ([#1246](https://github.com/appium/WebDriverAgent/issues/1246)) ([282478a](https://github.com/appium/WebDriverAgent/commit/282478a2e631501fd904b0675717123c779d9b84))
+
+## [16.12.1](https://github.com/appium/WebDriverAgent/compare/v16.12.0...v16.12.1) (2026-09-01)
+
+### Miscellaneous Chores
+
+* bump support-related dependencies ([#1245](https://github.com/appium/WebDriverAgent/issues/1245)) ([3ff08a6](https://github.com/appium/WebDriverAgent/commit/3ff08a64b2428bbc81aef1dece492f49e273d702))
+
+## [16.12.0](https://github.com/appium/WebDriverAgent/compare/v16.11.4...v16.12.0) (2026-09-01)
+
+### Features
+
+* add get screens endpoint ([#1242](https://github.com/appium/WebDriverAgent/issues/1242)) ([55808de](https://github.com/appium/WebDriverAgent/commit/55808de21df801c69991cd0de66ee7eeaac3407e))
+
+### Bug Fixes
+
+* scope xcodebuild process kill to this package's own processes ([#1244](https://github.com/appium/WebDriverAgent/issues/1244)) ([988f309](https://github.com/appium/WebDriverAgent/commit/988f3097876f627a48b38a242958c755c429db95))
+
+## [16.11.4](https://github.com/appium/WebDriverAgent/compare/v16.11.3...v16.11.4) (2026-08-30)
+
+### Bug Fixes
+
+* prevent a stale teardown from affecting a newer session generation ([#1231](https://github.com/appium/WebDriverAgent/issues/1231)) ([83642a1](https://github.com/appium/WebDriverAgent/commit/83642a11218fd2b2801af0a04d3b253125246bd7))
+
+## [16.11.3](https://github.com/appium/WebDriverAgent/compare/v16.11.2...v16.11.3) (2026-08-30)
+
+### Miscellaneous Chores
+
+* bump base-driver & support ([#1240](https://github.com/appium/WebDriverAgent/issues/1240)) ([b8ee694](https://github.com/appium/WebDriverAgent/commit/b8ee694adacb8b7a835becdbc36bdee1c5a6f684))
+
+## [16.11.2](https://github.com/appium/WebDriverAgent/compare/v16.11.1...v16.11.2) (2026-08-30)
+
+### Bug Fixes
+
+* reject requests admitted after their session was abandoned ([#1229](https://github.com/appium/WebDriverAgent/issues/1229)) ([d6b4862](https://github.com/appium/WebDriverAgent/commit/d6b4862ea113083959a80e87c488fd555cbc8061))
+
+## [16.11.1](https://github.com/appium/WebDriverAgent/compare/v16.11.0...v16.11.1) (2026-08-29)
+
+### Bug Fixes
+
+* build of FBMjpegServer ([#1239](https://github.com/appium/WebDriverAgent/issues/1239)) ([a3b8650](https://github.com/appium/WebDriverAgent/commit/a3b8650670b9b30c5fc0cd5aa4834a6774d4a828))
+
+## [16.11.0](https://github.com/appium/WebDriverAgent/compare/v16.10.0...v16.11.0) (2026-08-29)
+
+### Features
+
+* expose AXTimeout and XCTest XPC request timeout wrappers  ([#1233](https://github.com/appium/WebDriverAgent/issues/1233)) ([d5c8571](https://github.com/appium/WebDriverAgent/commit/d5c85718c32bc495a0f73518d3e40eee624b3582))
+
+## [16.10.0](https://github.com/appium/WebDriverAgent/compare/v16.9.4...v16.10.0) (2026-08-29)
+
+### Features
+
+* add displayId in the wda/screen ([#1238](https://github.com/appium/WebDriverAgent/issues/1238)) ([bfbe6b0](https://github.com/appium/WebDriverAgent/commit/bfbe6b00b196647f87267827627a5ff675496c30))
+
+## [16.9.4](https://github.com/appium/WebDriverAgent/compare/v16.9.3...v16.9.4) (2026-08-29)
+
+### Bug Fixes
+
+* drop MJPEG frames for clients that stop draining their socket ([#1227](https://github.com/appium/WebDriverAgent/issues/1227)) ([00cb6b6](https://github.com/appium/WebDriverAgent/commit/00cb6b612a5a1a1d00a386e23de01c4eca811df8))
+
+## [16.9.3](https://github.com/appium/WebDriverAgent/compare/v16.9.2...v16.9.3) (2026-08-29)
+
+### Bug Fixes
+
+* reject malformed Content-Length values and bound request header buffering ([#1226](https://github.com/appium/WebDriverAgent/issues/1226)) ([60c5fc4](https://github.com/appium/WebDriverAgent/commit/60c5fc461d91611778b8bb0745a21c80451d6ccf))
+
+## [16.9.2](https://github.com/appium/WebDriverAgent/compare/v16.9.1...v16.9.2) (2026-08-28)
+
+### Bug Fixes
+
+* cache the testmanagerd protocol version fallback on timeout ([#1228](https://github.com/appium/WebDriverAgent/issues/1228)) ([f3d8e0c](https://github.com/appium/WebDriverAgent/commit/f3d8e0ce42488b6e95a74f1c59e0f20a500d1a54))
+* sanitize non-UTF-8-encodable strings before JSON response serialization ([#1236](https://github.com/appium/WebDriverAgent/issues/1236)) ([fa6a250](https://github.com/appium/WebDriverAgent/commit/fa6a2503222ac2ffd039cb73a96689467774d7f2))
+
+### Miscellaneous Chores
+
+* **deps:** bump @appium/strongbox from 1.1.3 to 2.0.0 ([#1237](https://github.com/appium/WebDriverAgent/issues/1237)) ([03db844](https://github.com/appium/WebDriverAgent/commit/03db844ee0cb408bb323d0d77241ba55188c47f3))
+
+## [16.9.1](https://github.com/appium/WebDriverAgent/compare/v16.9.0...v16.9.1) (2026-08-28)
+
+### Bug Fixes
+
+* add missing settings to the exported WDASettings/WDACapabilities types ([#1230](https://github.com/appium/WebDriverAgent/issues/1230)) ([a9e8203](https://github.com/appium/WebDriverAgent/commit/a9e8203d71051db7a0c14c192288b2b5115cf5cf))
+* do not trust XCUIElement.lastSnapshot for long-lived elements ([#1235](https://github.com/appium/WebDriverAgent/issues/1235)) ([57968cc](https://github.com/appium/WebDriverAgent/commit/57968cc58b69ea9f036d70a694a0c9a5b6f764f7))
+
+## [16.9.0](https://github.com/appium/WebDriverAgent/compare/v16.8.0...v16.9.0) (2026-08-27)
+
+### Features
+
+* cache the system application resolution for WDA's process lifetime ([#1232](https://github.com/appium/WebDriverAgent/issues/1232)) ([21c98f2](https://github.com/appium/WebDriverAgent/commit/21c98f253561ee3dfc93edfb1c4de6afc3200b50))
+
+## [16.8.0](https://github.com/appium/WebDriverAgent/compare/v16.7.3...v16.8.0) (2026-08-24)
+
+### Features
+
+* bound accessibility snapshot requests to avoid indefinite hangs ([#1214](https://github.com/appium/WebDriverAgent/issues/1214)) ([cd829eb](https://github.com/appium/WebDriverAgent/commit/cd829eb9725f57efbfb9538a073de059020ddd38))
+
+## [16.7.3](https://github.com/appium/WebDriverAgent/compare/v16.7.2...v16.7.3) (2026-08-24)
+
+### Bug Fixes
+
+* let /status, /screenshot, and DELETE /session API methods to bypass the dispatch queue ([#1222](https://github.com/appium/WebDriverAgent/issues/1222)) ([f99b011](https://github.com/appium/WebDriverAgent/commit/f99b0111bba6f5cceabbddf1f9f0144d69d8f168))
+
+## [16.7.2](https://github.com/appium/WebDriverAgent/compare/v16.7.1...v16.7.2) (2026-08-24)
+
+### Bug Fixes
+
+* harden FBHTTPServer/FBTCPSocket against races and protocol gaps ([#1224](https://github.com/appium/WebDriverAgent/issues/1224)) ([cf4bb2b](https://github.com/appium/WebDriverAgent/commit/cf4bb2b57b4d3a55ee4bbe8f860b00b0e7f5a326))
+
+## [16.7.1](https://github.com/appium/WebDriverAgent/compare/v16.7.0...v16.7.1) (2026-08-23)
+
+### Bug Fixes
+
+* return W3C-compliant JSON error for unmatched routes ([#1223](https://github.com/appium/WebDriverAgent/issues/1223)) ([c951a91](https://github.com/appium/WebDriverAgent/commit/c951a91c8202d3c875db04dd633d37b409c80e43))
+
+## [16.7.0](https://github.com/appium/WebDriverAgent/compare/v16.6.0...v16.7.0) (2026-08-22)
+
+### Features
+
+* unify HTTP server across iOS/tvOS/watchOS on Network.framework ([#1221](https://github.com/appium/WebDriverAgent/issues/1221)) ([cd741c5](https://github.com/appium/WebDriverAgent/commit/cd741c5cafe47d03635a88cc9296bbd5a841e773))
+
+## [16.6.0](https://github.com/appium/WebDriverAgent/compare/v16.5.1...v16.6.0) (2026-08-22)
+
+### Features
+
+* Add MJPEG screenshot streaming support to watchOS ([#1220](https://github.com/appium/WebDriverAgent/issues/1220)) ([c6dcf03](https://github.com/appium/WebDriverAgent/commit/c6dcf03096dd5faab83398f16fb772724fcc5220))
+
+## [16.5.1](https://github.com/appium/WebDriverAgent/compare/v16.5.0...v16.5.1) (2026-08-20)
+
+### Bug Fixes
+
+* add watchOS assets to GitHub release artifacts ([#1219](https://github.com/appium/WebDriverAgent/issues/1219)) ([ce5a9e8](https://github.com/appium/WebDriverAgent/commit/ce5a9e8af36747a72669c34b38bd39e495b57f5b))
+
+## [16.5.0](https://github.com/appium/WebDriverAgent/compare/v16.4.0...v16.5.0) (2026-08-20)
+
+### Features
+
+* Add watchOS support to the TS driver, functional tests, and release pipeline ([#1217](https://github.com/appium/WebDriverAgent/issues/1217)) ([b53bb8f](https://github.com/appium/WebDriverAgent/commit/b53bb8fbd03ea37fd3bfc4e3eca4d2c6765b9c9c))
+
+## [16.4.0](https://github.com/appium/WebDriverAgent/compare/v16.3.0...v16.4.0) (2026-08-19)
+
+### Features
+
+* Add Digital Crown rotation and hand gesture support for watchOS ([#1215](https://github.com/appium/WebDriverAgent/issues/1215)) ([5e021f8](https://github.com/appium/WebDriverAgent/commit/5e021f8d12791d126e9524763d9455ceaf04bb2f))
+
+## [16.3.0](https://github.com/appium/WebDriverAgent/compare/v16.2.2...v16.3.0) (2026-08-18)
+
+### Features
+
+* Add WatchOS support ([#1209](https://github.com/appium/WebDriverAgent/issues/1209)) ([90b443c](https://github.com/appium/WebDriverAgent/commit/90b443c543346a4d12c5a5b69f4532c84cf2ae8f))
+
+## [16.2.2](https://github.com/appium/WebDriverAgent/compare/v16.2.1...v16.2.2) (2026-08-18)
+
+### Reverts
+
+* Revert "ci: use Xcode 27 ([#1203](https://github.com/appium/WebDriverAgent/issues/1203))" ([#1212](https://github.com/appium/WebDriverAgent/issues/1212)) ([7d06063](https://github.com/appium/WebDriverAgent/commit/7d060631a4f1a5c5c145c11efeed96f505c0a6e2))
+
+## [16.2.1](https://github.com/appium/WebDriverAgent/compare/v16.2.0...v16.2.1) (2026-08-17)
+
+### Bug Fixes
+
+* sign the runner by certificate hash instead of display name ([#1211](https://github.com/appium/WebDriverAgent/issues/1211)) ([59e95a7](https://github.com/appium/WebDriverAgent/commit/59e95a73986a91c90c951608d7744a032997810b))
+
+## [16.2.0](https://github.com/appium/WebDriverAgent/compare/v16.1.7...v16.2.0) (2026-08-13)
+
+### Features
+
+* Convert FBConfiguration to a singleton with native properties ([#1208](https://github.com/appium/WebDriverAgent/issues/1208)) ([ee029da](https://github.com/appium/WebDriverAgent/commit/ee029da84448895c4ad51be0688e7b7df30697de))
+
+## [16.1.7](https://github.com/appium/WebDriverAgent/compare/v16.1.6...v16.1.7) (2026-08-11)
+
+### Bug Fixes
+
+* Use wdaRemotePort instead of wdaLocalPort for preinstalled WDA USE_PORT ([#1206](https://github.com/appium/WebDriverAgent/issues/1206)) ([76e759f](https://github.com/appium/WebDriverAgent/commit/76e759ff959b4497c8a77d92e277f3531709abd8))
+
+## [16.1.6](https://github.com/appium/WebDriverAgent/compare/v16.1.5...v16.1.6) (2026-08-10)
+
+### Bug Fixes
+
+* Update PrivateHeaders/XCTest to modern Xcode private API surface ([#1202](https://github.com/appium/WebDriverAgent/issues/1202)) ([ad92558](https://github.com/appium/WebDriverAgent/commit/ad925582432262886852fde9d13fc4959678d44a))
+
+### Miscellaneous Chores
+
+* rename safe occurrences of JWProxy ([#1201](https://github.com/appium/WebDriverAgent/issues/1201)) ([0387506](https://github.com/appium/WebDriverAgent/commit/0387506df19700a41ac27bb8dbdcc6e19b7eabbe))
+
+## [16.1.5](https://github.com/appium/WebDriverAgent/compare/v16.1.4...v16.1.5) (2026-08-05)
+
+### Bug Fixes
+
+* Update various consumers to properly use cached snapshots ([#1198](https://github.com/appium/WebDriverAgent/issues/1198)) ([bed67cc](https://github.com/appium/WebDriverAgent/commit/bed67ccf6a1375f1d1164d7a2ef18d10ac44f632))
+
+## [16.1.4](https://github.com/appium/WebDriverAgent/compare/v16.1.3...v16.1.4) (2026-08-04)
+
+### Bug Fixes
+
+* Eliminate unnecessary activeApplication call in handlePressAndDragCoordinateWithVelocity ([#1197](https://github.com/appium/WebDriverAgent/issues/1197)) ([cf604bd](https://github.com/appium/WebDriverAgent/commit/cf604bdeacb3accceb2346551a3704c0dee2c2bd))
+* Reduce the amount of AX calls while determining direction to focused element ([#1196](https://github.com/appium/WebDriverAgent/issues/1196)) ([5c08bed](https://github.com/appium/WebDriverAgent/commit/5c08beddf40645a7f7237c4205f5a8c1ffb4cc89))
+
+## [16.1.3](https://github.com/appium/WebDriverAgent/compare/v16.1.2...v16.1.3) (2026-08-03)
+
+### Bug Fixes
+
+* Optimize alert operations ([#1193](https://github.com/appium/WebDriverAgent/issues/1193)) ([2bc1c40](https://github.com/appium/WebDriverAgent/commit/2bc1c40d20883a9b924b8a177be4d43ffd497901))
+
+## [16.1.2](https://github.com/appium/WebDriverAgent/compare/v16.1.1...v16.1.2) (2026-08-03)
+
+### Bug Fixes
+
+* Optimize class chain lookup ([#1194](https://github.com/appium/WebDriverAgent/issues/1194)) ([47cbbb5](https://github.com/appium/WebDriverAgent/commit/47cbbb597495ac78c4290c27c2ef0ee349004406))
+
+## [16.1.1](https://github.com/appium/WebDriverAgent/compare/v16.1.0...v16.1.1) (2026-08-01)
+
+### Miscellaneous Chores
+
+* Drop esmock ([#1195](https://github.com/appium/WebDriverAgent/issues/1195)) ([987b06b](https://github.com/appium/WebDriverAgent/commit/987b06ba11c0084b9d6b921d7ecf86e8234c110a))
+
+## [16.1.0](https://github.com/appium/WebDriverAgent/compare/v16.0.3...v16.1.0) (2026-07-30)
+
+### Features
+
+* Add callback for server startup failure ([#1192](https://github.com/appium/WebDriverAgent/issues/1192)) ([3a80439](https://github.com/appium/WebDriverAgent/commit/3a80439603a45321ad8d238186b6327bb2599a8b))
+
+## [16.0.3](https://github.com/appium/WebDriverAgent/compare/v16.0.2...v16.0.3) (2026-07-28)
+
+### Miscellaneous Chores
+
+* Update @appium/tsconfig version to 1.2.0 ([4948b40](https://github.com/appium/WebDriverAgent/commit/4948b40266d3ef39f67ac2612253b613f8fc9ee0))
+
+## [16.0.2](https://github.com/appium/WebDriverAgent/compare/v16.0.1...v16.0.2) (2026-07-28)
+
+### Miscellaneous Chores
+
+* Tune editorconfig ([c111a46](https://github.com/appium/WebDriverAgent/commit/c111a46d8e619e1ebcb54b0ff579b74984c21e52))
+
+## [16.0.1](https://github.com/appium/WebDriverAgent/compare/v16.0.0...v16.0.1) (2026-07-27)
+
+### Miscellaneous Chores
+
+* Integrate oxc and release configs ([#1182](https://github.com/appium/WebDriverAgent/issues/1182)) ([0a7c1ee](https://github.com/appium/WebDriverAgent/commit/0a7c1ee65aa81344e01b7211398e3b8a8209acf2))
+
+## [16.0.0](https://github.com/appium/WebDriverAgent/compare/v15.1.6...v16.0.0) (2026-07-23)
+
+### ⚠ BREAKING CHANGES
+
+* Consumers using require('appium-webdriveragent') must switch to import/dynamic import() — the package no longer ships a CommonJS entry point.
+* WebDriverAgent#retrieveDerivedDataPath() has been removed; use #retrieveBuildSettings() instead.
+
+### Features
+
+* Migrate the package to ESM ([#1176](https://github.com/appium/WebDriverAgent/issues/1176)) ([fa54e5e](https://github.com/appium/WebDriverAgent/commit/fa54e5e65bdf40d8a653029142e44bcbbf143389))
+
+## [15.1.6](https://github.com/appium/WebDriverAgent/compare/v15.1.5...v15.1.6) (2026-07-12)
+
+### Bug Fixes
+
+* use double instead of CGFloat for mjpegScalingFactor public API ([#1168](https://github.com/appium/WebDriverAgent/issues/1168)) ([33dbaa4](https://github.com/appium/WebDriverAgent/commit/33dbaa4f56337bccc44ce7b0e796366d04df3630))
+
+## [15.1.5](https://github.com/appium/WebDriverAgent/compare/v15.1.4...v15.1.5) (2026-07-12)
+
+### Bug Fixes
+
+* lock screen via IOHID Power press on iOS 27 ([#1171](https://github.com/appium/WebDriverAgent/issues/1171)) ([64be238](https://github.com/appium/WebDriverAgent/commit/64be2388ad5d1cefa184beaf34ae85fe8e14e0c8))
+
+## [15.1.4](https://github.com/appium/WebDriverAgent/compare/v15.1.3...v15.1.4) (2026-07-07)
+
+### Miscellaneous Chores
+
+* Drop mocha and chai ([#1169](https://github.com/appium/WebDriverAgent/issues/1169)) ([11ba27c](https://github.com/appium/WebDriverAgent/commit/11ba27c71a38d7a8f4882ea70716541b3679e67f))
+
+## [15.1.3](https://github.com/appium/WebDriverAgent/compare/v15.1.2...v15.1.3) (2026-07-01)
+
+### Miscellaneous Chores
+
+* downgrade conventional-changelog-conventionalcommits to v9 ([#1165](https://github.com/appium/WebDriverAgent/issues/1165)) ([6ac033d](https://github.com/appium/WebDriverAgent/commit/6ac033db8fdec31f11d246f8a254491517976013))
+
+## [15.1.2](https://github.com/appium/WebDriverAgent/compare/v15.1.1...v15.1.2) (2026-07-01)
+
+## [15.1.1](https://github.com/appium/WebDriverAgent/compare/v15.1.0...v15.1.1) (2026-06-29)
+
+## [15.1.0](https://github.com/appium/WebDriverAgent/compare/v15.0.0...v15.1.0) (2026-06-26)
+
+### Features
+
+* Expose device orientation via /wda/deviceOrientation ([#1162](https://github.com/appium/WebDriverAgent/issues/1162)) ([deb623c](https://github.com/appium/WebDriverAgent/commit/deb623c71a0598f1932c8018f985b973aa2fb9ff))
+
+## [15.0.0](https://github.com/appium/WebDriverAgent/compare/v14.2.1...v15.0.0) (2026-06-22)
+
+### ⚠ BREAKING CHANGES
+
+* AppleDevice is now abstract and only contains udid; it no longer exposes simctl or devicectl.
+* Preinstalled WDA launch/terminate no longer falls back to package-owned simctl or devicectl behavior. Callers must provide hostOps.simulator or hostOps.realDevicePreinstalled for those flows.
+
+### Features
+
+* Abstract out platform-specific actions ([#1160](https://github.com/appium/WebDriverAgent/issues/1160)) ([890d32b](https://github.com/appium/WebDriverAgent/commit/890d32b4ac3fa881784dacc012650d58274941c8))
+
+## [14.2.1](https://github.com/appium/WebDriverAgent/compare/v14.2.0...v14.2.1) (2026-06-19)
+
+### Miscellaneous Chores
+
+* **deps-dev:** bump @types/node from 25.9.4 to 26.0.0 ([#1159](https://github.com/appium/WebDriverAgent/issues/1159)) ([93d7043](https://github.com/appium/WebDriverAgent/commit/93d704317483eb9c29a2d46070a6a2c2943ae014))
+
+## [14.2.0](https://github.com/appium/WebDriverAgent/compare/v14.1.1...v14.2.0) (2026-06-18)
+
+### Features
+
+* Limit the maximum request body size ([#1158](https://github.com/appium/WebDriverAgent/issues/1158)) ([9ea244b](https://github.com/appium/WebDriverAgent/commit/9ea244b29e3c2b160079a620fdf4ef445a3c1e38))
+
+## [14.1.1](https://github.com/appium/WebDriverAgent/compare/v14.1.0...v14.1.1) (2026-06-10)
+
+### Miscellaneous Chores
+
+* address runtime version rather than Xcode for selector based methods ([#1154](https://github.com/appium/WebDriverAgent/issues/1154)) ([6618b0b](https://github.com/appium/WebDriverAgent/commit/6618b0b6ccd06c69fc9e4a0947ef0c88c89b1e48))
+
+## [14.1.0](https://github.com/appium/WebDriverAgent/compare/v14.0.0...v14.1.0) (2026-06-10)
+
+### Features
+
+* Add VoiceOver automation support ([#1153](https://github.com/appium/WebDriverAgent/issues/1153)) ([6b3631a](https://github.com/appium/WebDriverAgent/commit/6b3631aed7a95439b01a9a3bb87189df384dcf06))
+
+## [14.0.0](https://github.com/appium/WebDriverAgent/compare/v13.3.0...v14.0.0) (2026-06-09)
+
+### ⚠ BREAKING CHANGES
+
+* bump the deployment target to 15
+
+### Features
+
+* bump the deployment target to 15 ([#1152](https://github.com/appium/WebDriverAgent/issues/1152)) ([74498f7](https://github.com/appium/WebDriverAgent/commit/74498f79c9f00678f2bc37b9afb50f70e30d0f88))
+
+## [13.3.0](https://github.com/appium/WebDriverAgent/compare/v13.2.4...v13.3.0) (2026-06-09)
+
+### Features
+
+* Expose native isAccessibilityElement ([#1146](https://github.com/appium/WebDriverAgent/issues/1146)) ([e615621](https://github.com/appium/WebDriverAgent/commit/e6156212e6fba6af98a69a400f5fa18b67f1e3e3))
+
+## [13.2.4](https://github.com/appium/WebDriverAgent/compare/v13.2.3...v13.2.4) (2026-06-08)
+
+### Bug Fixes
+
+* update WebDriverAgentRunner app icon ([#1151](https://github.com/appium/WebDriverAgent/issues/1151)) ([eea2229](https://github.com/appium/WebDriverAgent/commit/eea2229f8d2e8bd2dd936fe3ddb69a9458789f49))
+
+## [13.2.3](https://github.com/appium/WebDriverAgent/compare/v13.2.2...v13.2.3) (2026-06-07)
+
+### Bug Fixes
+
+* auto-handle iOS 18+ limited access permission prompt ([#1150](https://github.com/appium/WebDriverAgent/issues/1150)) ([98d79e7](https://github.com/appium/WebDriverAgent/commit/98d79e7c3875424cb4b5fdee55bb079286a14b05))
+
+## [13.2.2](https://github.com/appium/WebDriverAgent/compare/v13.2.1...v13.2.2) (2026-06-06)
+
+### Miscellaneous Chores
+
+* Refactor session creation handler ([#1149](https://github.com/appium/WebDriverAgent/issues/1149)) ([923b523](https://github.com/appium/WebDriverAgent/commit/923b523b55f880b921de2c95a82786ce0699cb9d))
+
+## [13.2.1](https://github.com/appium/WebDriverAgent/compare/v13.2.0...v13.2.1) (2026-06-06)
+
+### Miscellaneous Chores
+
+* Refactor settings handling API ([#1148](https://github.com/appium/WebDriverAgent/issues/1148)) ([ff7ac36](https://github.com/appium/WebDriverAgent/commit/ff7ac368debb22659509169a0eca530bae3dc879))
+
+## [13.2.0](https://github.com/appium/WebDriverAgent/compare/v13.1.3...v13.2.0) (2026-05-26)
+
+### Features
+
+* Add XPath extensions ([#1144](https://github.com/appium/WebDriverAgent/issues/1144)) ([a975b89](https://github.com/appium/WebDriverAgent/commit/a975b89ac998d31a72bf3723b843d85af8867cf0))
+
+## [13.1.3](https://github.com/appium/WebDriverAgent/compare/v13.1.2...v13.1.3) (2026-05-24)
+
+### Bug Fixes
+
+* Scheme for derived data path retrieval ([#1142](https://github.com/appium/WebDriverAgent/issues/1142)) ([9ada5f6](https://github.com/appium/WebDriverAgent/commit/9ada5f6fe2af29278c488e845f8714f22fabfeee))
+
+## [13.1.2](https://github.com/appium/WebDriverAgent/compare/v13.1.1...v13.1.2) (2026-05-23)
+
+### Bug Fixes
+
+* Address compilation warnings ([#1143](https://github.com/appium/WebDriverAgent/issues/1143)) ([f1f9976](https://github.com/appium/WebDriverAgent/commit/f1f9976f4a0a0fb8a8aa3ee1f2483b25275600e6))
+
+## [13.1.1](https://github.com/appium/WebDriverAgent/compare/v13.1.0...v13.1.1) (2026-05-22)
+
+### Bug Fixes
+
+* ship Scripts/embed-runner-icon.sh in the npm package ([#1141](https://github.com/appium/WebDriverAgent/issues/1141)) ([17ac1c1](https://github.com/appium/WebDriverAgent/commit/17ac1c16a0890ee0fbfe73504a3ff570dfe1a7bf)), closes [#1138](https://github.com/appium/WebDriverAgent/issues/1138)
+
+## [13.1.0](https://github.com/appium/WebDriverAgent/compare/v13.0.0...v13.1.0) (2026-05-21)
+
+### Features
+
+* add app icon to WebDriverAgentRunner ([#1138](https://github.com/appium/WebDriverAgent/issues/1138)) ([fe8adc8](https://github.com/appium/WebDriverAgent/commit/fe8adc89923994428783397170de850e11ebb3c6))
+* Add helper method to fetch build settings ([#1139](https://github.com/appium/WebDriverAgent/issues/1139)) ([56b5f38](https://github.com/appium/WebDriverAgent/commit/56b5f384ed9ba1a014d4b642ddf26b8573ceaafe))
+
+## [13.0.0](https://github.com/appium/WebDriverAgent/compare/v12.2.2...v13.0.0) (2026-05-17)
+
+### ⚠ BREAKING CHANGES
+
+* quitAndUninstall() removed — use quit() only. App uninstall is out of scope for this module.
+* uninstall() removed — WDA must not be uninstalled from this package; callers (e.g. xcuitest-driver) should own that if needed.
+* setupCaching() no longer uninstalls WDA — on bundle-id or version mismatch it logs and skips caching instead of removing apps from the device. Also, it now returns the cached url on success.
+* appium-ios-device dependency removed — preinstalled WDA on real devices always launches via devicectl (no iOS < 17 Xctest fallback).
+
+### Features
+
+* Drop legacy APIs ([#1137](https://github.com/appium/WebDriverAgent/issues/1137)) ([8995d24](https://github.com/appium/WebDriverAgent/commit/8995d24e16634a4624918319996839993502c7b4))
+
+## [12.2.2](https://github.com/appium/WebDriverAgent/compare/v12.2.1...v12.2.2) (2026-05-08)
+
+### Bug Fixes
+
+* linter ([#1134](https://github.com/appium/WebDriverAgent/issues/1134)) ([2bd1816](https://github.com/appium/WebDriverAgent/commit/2bd181628a1d4525a8f1c459ea295ac0541b514c))
+
+## [12.2.1](https://github.com/appium/WebDriverAgent/compare/v12.2.0...v12.2.1) (2026-05-06)
+
+### Miscellaneous Chores
+
+* **deps-dev:** bump sinon from 21.1.2 to 22.0.0 ([#1133](https://github.com/appium/WebDriverAgent/issues/1133)) ([11c579b](https://github.com/appium/WebDriverAgent/commit/11c579b7ed3a9995715d65590a2959763871aa6d))
+
+## [12.2.0](https://github.com/appium/WebDriverAgent/compare/v12.1.1...v12.2.0) (2026-04-29)
+
+### Features
+
+* Ditch bluebird and lodash ([#1130](https://github.com/appium/WebDriverAgent/issues/1130)) ([8899895](https://github.com/appium/WebDriverAgent/commit/88998951f004daed1d22ce2c06eec89a08129e4f))
+
+## [12.1.1](https://github.com/appium/WebDriverAgent/compare/v12.1.0...v12.1.1) (2026-04-27)
+
+### Miscellaneous Chores
+
+* **compile:** fix compilation ([#1129](https://github.com/appium/WebDriverAgent/issues/1129)) ([76d59e8](https://github.com/appium/WebDriverAgent/commit/76d59e85c75680c97abe9e67fdf4a70cacd46418))
+
+## [12.1.0](https://github.com/appium/WebDriverAgent/compare/v12.0.0...v12.1.0) (2026-04-24)
+
+### Features
+
+* **client:** add ability to set headers on requests ([#1127](https://github.com/appium/WebDriverAgent/issues/1127)) ([a8889cd](https://github.com/appium/WebDriverAgent/commit/a8889cd7cb85c1b58faee306295fb3c5c2a9d0e3))
+
+## [12.0.0](https://github.com/appium/WebDriverAgent/compare/v11.4.3...v12.0.0) (2026-04-14)
+
+### ⚠ BREAKING CHANGES
+
+* remove idb from AppleDevice; clients must stop passing device.idb.
+* remove includeNonModalElements WDA setting; clients must stop sending this setting in /settings.
+* remove shouldUseTestManagerForVisibilityDetection capability; clients must stop sending this desired capability.
+
+### Code Refactoring
+
+* remove deprecated WDA settings/capabilities and idb typing ([#1124](https://github.com/appium/WebDriverAgent/issues/1124)) ([5072e25](https://github.com/appium/WebDriverAgent/commit/5072e255faa3538f5ff4c8769bf16fd290ee8af9))
+
+## [11.4.3](https://github.com/appium/WebDriverAgent/compare/v11.4.2...v11.4.3) (2026-04-12)
+
+### Miscellaneous Chores
+
+* **deps-dev:** bump typescript from 5.9.3 to 6.0.2 ([#1121](https://github.com/appium/WebDriverAgent/issues/1121)) ([046b080](https://github.com/appium/WebDriverAgent/commit/046b08042df33f507466f55b68b444c91684931a))
+
+## [11.4.2](https://github.com/appium/WebDriverAgent/compare/v11.4.1...v11.4.2) (2026-04-12)
+
+### Bug Fixes
+
+* Avoid keeping strong reference to self instance in delegates ([#1123](https://github.com/appium/WebDriverAgent/issues/1123)) ([dd15f48](https://github.com/appium/WebDriverAgent/commit/dd15f48d33edabef6aea8ac951cf539946b492f2))
+
+## [11.4.1](https://github.com/appium/WebDriverAgent/compare/v11.4.0...v11.4.1) (2026-03-15)
+
+### Bug Fixes
+
+* Add exponential backoff interval on consecutive screenshot failures ([#1119](https://github.com/appium/WebDriverAgent/issues/1119)) ([8aa1c5b](https://github.com/appium/WebDriverAgent/commit/8aa1c5b81363f45a4046161099ad624febdc0802))
+
+## [11.4.0](https://github.com/appium/WebDriverAgent/compare/v11.3.0...v11.4.0) (2026-03-08)
+
+### Features
+
+* make maxChildren configuable ([#1117](https://github.com/appium/WebDriverAgent/issues/1117)) ([57dd6dc](https://github.com/appium/WebDriverAgent/commit/57dd6dce1677e84740c13aec2742872d11d64526))
+
+## [11.3.0](https://github.com/appium/WebDriverAgent/compare/v11.2.0...v11.3.0) (2026-03-05)
+
+### Features
+
+* add 6 tvOS button values for `mobile: pressButton` ([#1116](https://github.com/appium/WebDriverAgent/issues/1116)) ([efd64ed](https://github.com/appium/WebDriverAgent/commit/efd64ede7212b322f412cd6b25eab9c8097c286d))
+
+## [11.2.0](https://github.com/appium/WebDriverAgent/compare/v11.1.7...v11.2.0) (2026-03-04)
+
+### Features
+
+* add `action` and `camera` values for `mobile: pressButton` ([#1115](https://github.com/appium/WebDriverAgent/issues/1115)) ([3df0284](https://github.com/appium/WebDriverAgent/commit/3df0284d741f8b4a36a9e12e130ecf0711b60366))
+
+## [11.1.7](https://github.com/appium/WebDriverAgent/compare/v11.1.6...v11.1.7) (2026-03-03)
+
+### Miscellaneous Chores
+
+* **deps:** bump actions/download-artifact from 7 to 8 ([#1114](https://github.com/appium/WebDriverAgent/issues/1114)) ([b3de174](https://github.com/appium/WebDriverAgent/commit/b3de174fd5793f12d9976c6e1567be7bda89ef79))
+* **deps:** bump actions/upload-artifact from 6 to 7 ([#1113](https://github.com/appium/WebDriverAgent/issues/1113)) ([981757c](https://github.com/appium/WebDriverAgent/commit/981757c958217a0a3a9f9070c8bc72bfa9fd6076))
+
+## [11.1.6](https://github.com/appium/WebDriverAgent/compare/v11.1.5...v11.1.6) (2026-02-23)
+
+### Bug Fixes
+
+* bump the minimum deployment target and apply recommend settings with xcode 26 ([#1112](https://github.com/appium/WebDriverAgent/issues/1112)) ([681ffcc](https://github.com/appium/WebDriverAgent/commit/681ffccd04fe5b23295d72f23cb94df9e385af48))
+
+## [11.1.5](https://github.com/appium/WebDriverAgent/compare/v11.1.4...v11.1.5) (2026-02-16)
+
+### Bug Fixes
+
+* format ([#1111](https://github.com/appium/WebDriverAgent/issues/1111)) ([f099df1](https://github.com/appium/WebDriverAgent/commit/f099df154676c71d4a696c5cdfad1ae336a4f750))
+
+## [11.1.4](https://github.com/appium/WebDriverAgent/compare/v11.1.3...v11.1.4) (2026-02-01)
+
+### Miscellaneous Chores
+
+* **deps:** bump asyncbox from 4.1.1 to 6.1.0 ([#1109](https://github.com/appium/WebDriverAgent/issues/1109)) ([eb0ef79](https://github.com/appium/WebDriverAgent/commit/eb0ef7919fb80e42db287ef8fc476b921167bfd8))
+
 ## [11.1.3](https://github.com/appium/WebDriverAgent/compare/v11.1.2...v11.1.3) (2026-01-28)
 
 ### Miscellaneous Chores

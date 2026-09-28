@@ -3,6 +3,7 @@ package appium
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2809,19 +2810,22 @@ func TestInputTextAndroidStillUsesActions(t *testing.T) {
 
 func TestAppiumScrollUntilVisibleRespectsMaxScrolls(t *testing.T) {
 	scrollCount := 0
+	captures := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
 
 		if strings.HasSuffix(path, "/source") {
-			// Element never found
+			// Element never found; one row drifts on every capture so the
+			// list reads as still moving and maxScrolls stays the limit.
+			captures++
 			writeJSON(w, map[string]interface{}{
-				"value": `<?xml version="1.0" encoding="UTF-8"?>
+				"value": fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <hierarchy rotation="0">
   <android.widget.FrameLayout bounds="[0,0][1080,2340]">
-    <android.widget.TextView text="Other" bounds="[100,100][300,150]"/>
+    <android.widget.TextView text="Other" bounds="[100,%d][300,%d]"/>
   </android.widget.FrameLayout>
-</hierarchy>`,
+</hierarchy>`, 100+captures, 150+captures),
 			})
 			return
 		}
@@ -2944,4 +2948,52 @@ func TestAccessibilityLabelOf(t *testing.T) {
 			t.Errorf("made %d requests, want 0", calls)
 		}
 	})
+}
+
+func TestAppiumScrollUntilVisibleStopsWhenScreenStopsMoving(t *testing.T) {
+	// The same source on every read: a list at its end. Two scrolls that
+	// change nothing are proof enough — the loop must not spend the other 18.
+	scrollCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/source"):
+			writeJSON(w, map[string]interface{}{
+				"value": `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <android.widget.FrameLayout bounds="[0,0][1080,2340]">
+    <android.widget.TextView text="Last row" bounds="[100,2200][300,2250]"/>
+  </android.widget.FrameLayout>
+</hierarchy>`,
+			})
+		case strings.Contains(path, "/actions") && r.Method == "POST":
+			scrollCount++
+			writeJSON(w, map[string]interface{}{"value": nil})
+		case strings.Contains(path, "/window/rect"):
+			writeJSON(w, map[string]interface{}{
+				"value": map[string]interface{}{"width": 1080.0, "height": 2340.0, "x": 0.0, "y": 0.0},
+			})
+		default:
+			writeJSON(w, map[string]interface{}{"value": nil})
+		}
+	}))
+	defer server.Close()
+	driver := createTestAppiumDriver(server)
+
+	result := driver.scrollUntilVisible(&flow.ScrollUntilVisibleStep{
+		Element:   flow.Selector{Text: "NonExistent"},
+		Direction: "down",
+		BaseStep:  flow.BaseStep{TimeoutMs: 60000},
+	})
+
+	if result.Success {
+		t.Fatal("expected failure when the element is not in the list")
+	}
+	if scrollCount != 2 {
+		t.Errorf("expected 2 scrolls before the no-progress stop, got %d", scrollCount)
+	}
+	if !strings.Contains(result.Message, "made no progress") {
+		t.Errorf("message should name the reason, got %q", result.Message)
+	}
 }

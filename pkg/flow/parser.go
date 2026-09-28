@@ -278,7 +278,7 @@ func isStepType(key string) bool {
 		StepMockNetwork, StepBlockNetwork, StepSetNetworkConditions, StepWaitForRequest, StepClearNetworkMocks,
 		StepTakeScreenshot, StepStartRecording,
 		StepStopRecording, StepAddMedia, StepRemoveMedia, StepPressKey, StepWaitForAnimationToEnd,
-		StepDefineVariables, StepDragAndDrop:
+		StepWait, StepDefineVariables, StepDragAndDrop:
 		return true
 	}
 	return false
@@ -1071,6 +1071,34 @@ func decodeStep(stepType StepType, valueNode *yaml.Node, sourcePath string) (Ste
 		var s WaitForAnimationToEndStep
 		if err := valueNode.Decode(&s); err != nil {
 			return nil, wrapParseError(sourcePath, valueNode.Line, err)
+		}
+		s.StepType = stepType
+		return &s, nil
+
+	case StepWait:
+		var s WaitStep
+		// Scalar form `- wait: 2000` is the duration in ms; mapping form
+		// `- wait: { duration: 2000, optional: true }` carries the same plus
+		// the base-step options.
+		if valueNode.Kind == yaml.ScalarNode {
+			ms, err := strconv.Atoi(strings.TrimSpace(valueNode.Value))
+			if err != nil {
+				return nil, &ParseError{
+					Path:    sourcePath,
+					Line:    valueNode.Line,
+					Message: fmt.Sprintf("wait: expected a duration in milliseconds, got %q", valueNode.Value),
+				}
+			}
+			s.DurationMs = ms
+		} else if err := valueNode.Decode(&s); err != nil {
+			return nil, wrapParseError(sourcePath, valueNode.Line, err)
+		}
+		if s.DurationMs < 0 {
+			return nil, &ParseError{
+				Path:    sourcePath,
+				Line:    valueNode.Line,
+				Message: fmt.Sprintf("wait: duration must not be negative, got %d", s.DurationMs),
+			}
 		}
 		s.StepType = stepType
 		return &s, nil

@@ -34,12 +34,11 @@
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
 {
-  self.numberOFTaps += 1;
-  [self.delegate shouldHandleTouchesNumber:(int)touches.count];
   for (UITouch *touch in touches)
   {
     [self createViewForTouch:touch];
   }
+  [self.delegate shouldHandleTouchesNumber:(int)self.touchViews.count];
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -56,8 +55,13 @@
 {
   for (UITouch *touch in touches)
   {
+    // Count completed contacts, independently of how UIKit batches callbacks.
+    if ([self viewForTouch:touch] != nil) {
+      self.numberOFTaps += 1;
+    }
     [self removeViewForTouch:touch];
   }
+  [self.delegate shouldHandleTouchesNumber:(int)self.touchViews.count];
   [self.delegate shouldHandleTapsNumber:self.numberOFTaps];
 }
 
@@ -67,15 +71,22 @@
   {
     [self removeViewForTouch:touch];
   }
+  [self.delegate shouldHandleTouchesNumber:(int)self.touchViews.count];
 }
 
 - (void)createViewForTouch:(UITouch *)touch
 {
   if (touch)
   {
+    CGPoint location = [touch locationInView:self];
+    // Exposes the last touch-down location, in this view's own bounds coordinate
+    // space, for tests to assert on regardless of any window-level scaling.
+    self.isAccessibilityElement = YES;
+    self.accessibilityValue = [NSString stringWithFormat:@"%.2f,%.2f", location.x, location.y];
+
     TouchSpotView *newView = [[TouchSpotView alloc] init];
     newView.bounds = CGRectMake(0, 0, 1, 1);
-    newView.center = [touch locationInView:self];
+    newView.center = location;
     [self addSubview:newView];
     [UIView animateWithDuration:0.2 animations:^{
       newView.bounds = CGRectMake(0, 0, 100, 100);

@@ -10,6 +10,8 @@
 
 @interface XCUIElementDouble ()
 @property (nonatomic, assign, readwrite) BOOL didResolve;
+@property (nonatomic, copy, readwrite, nonnull) NSArray<NSString *> *typedKeys;
+@property (nonatomic, assign, readwrite) NSUInteger lastTypedModifierFlags;
 @end
 
 @implementation XCUIElementDouble
@@ -28,6 +30,7 @@
     self.wdCustomActions = nil;
     self.wdVisible = YES;
     self.wdAccessible = YES;
+    self.wdNativeAccessibilityElement = YES;
     self.wdEnabled = YES;
     self.wdSelected = YES;
     self.wdFocused = YES;
@@ -47,8 +50,15 @@
     self.wdType = @"XCUIElementTypeOther";
     self.wdUID = @"0";
     self.lastSnapshot = nil;
+    self.typedKeys = @[];
   }
   return self;
+}
+
+- (void)typeKey:(NSString *)key modifierFlags:(NSUInteger)modifierFlags
+{
+  self.typedKeys = [self.typedKeys arrayByAddingObject:key];
+  self.lastTypedModifierFlags = modifierFlags;
 }
 
 - (id)fb_valueForWDAttributeName:(NSString *)name

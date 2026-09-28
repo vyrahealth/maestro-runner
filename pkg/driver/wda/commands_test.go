@@ -2,6 +2,7 @@ package wda
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -883,6 +884,13 @@ func TestInputTextWithSelectorElementIDDirectSend(t *testing.T) {
 			})
 			return
 		}
+		// Id lookups list every match
+		if strings.HasSuffix(path, "/elements") && r.Method == "POST" {
+			jsonResponse(w, map[string]interface{}{
+				"value": []map[string]interface{}{{"ELEMENT": "text-field-1"}},
+			})
+			return
+		}
 		// Element rect
 		if strings.Contains(path, "/element/") && strings.Contains(path, "/rect") {
 			jsonResponse(w, map[string]interface{}{
@@ -1269,25 +1277,47 @@ func TestOpenBrowserEmptyURL(t *testing.T) {
 // tapOn keyboard key tests
 // =============================================================================
 
-// TestTapOnKeyboardKey tests tapOn with a text selector matching a keyboard key.
-func TestTapOnKeyboardKey(t *testing.T) {
-	var sendKeysCalled bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// keyboardKeyServer answers a key-named tapOn: no element has the label, the
+// keyboard is up only when keyboardShown, and /wda/keys answers keysStatus.
+func keyboardKeyServer(keyboardShown bool, keysStatus int, sendKeys *bool) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, "/wda/keys") {
-			sendKeysCalled = true
+			*sendKeys = true
+			if keysStatus != http.StatusOK {
+				jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{"error": "send keys failed"}})
+				return
+			}
 			jsonResponse(w, map[string]interface{}{"status": 0})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/elements") {
+			body, _ := io.ReadAll(r.Body)
+			if keyboardShown && strings.Contains(string(body), "XCUIElementTypeKeyboard") {
+				jsonResponse(w, map[string]interface{}{"value": []map[string]interface{}{{"ELEMENT": "kb"}}})
+				return
+			}
+			jsonResponse(w, map[string]interface{}{"value": []interface{}{}})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/element") {
+			w.WriteHeader(http.StatusNotFound)
+			jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{"error": "no such element"}})
 			return
 		}
 		jsonResponse(w, map[string]interface{}{"status": 0})
 	}))
+}
+
+// TestTapOnKeyboardKey: a key name with no element of that label, and a
+// keyboard up, is sent as the key.
+func TestTapOnKeyboardKey(t *testing.T) {
+	var sendKeysCalled bool
+	server := keyboardKeyServer(true, http.StatusOK, &sendKeysCalled)
 	defer server.Close()
 	driver := createTestDriver(server)
 
-	step := &flow.TapOnStep{
-		Selector: flow.Selector{Text: "Return"},
-	}
-	result := driver.tapOn(step)
+	result := driver.tapOn(&flow.TapOnStep{Selector: flow.Selector{Text: "Return"}})
 
 	if !result.Success {
 		t.Errorf("Expected success, got: %s", result.Message)
@@ -1300,26 +1330,37 @@ func TestTapOnKeyboardKey(t *testing.T) {
 	}
 }
 
-// TestTapOnKeyboardKeySendKeysFails tests tapOn when SendKeys fails for a keyboard key.
-func TestTapOnKeyboardKeySendKeysFails(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.URL.Path, "/wda/keys") {
-			jsonResponse(w, map[string]interface{}{
-				"value": map[string]interface{}{"error": "send keys failed"},
-			})
-			return
-		}
-		jsonResponse(w, map[string]interface{}{"status": 0})
-	}))
+// TestTapOnKeyboardKeyNoKeyboard: with no element and no keyboard, a key
+// name is looked up like any text and fails; it is never sent as a key and
+// reported as a success (#179).
+func TestTapOnKeyboardKeyNoKeyboard(t *testing.T) {
+	var sendKeysCalled bool
+	server := keyboardKeyServer(false, http.StatusOK, &sendKeysCalled)
 	defer server.Close()
 	driver := createTestDriver(server)
 
-	step := &flow.TapOnStep{
-		Selector: flow.Selector{Text: "Return"},
-	}
-	result := driver.tapOn(step)
+	result := driver.tapOn(&flow.TapOnStep{BaseStep: flow.BaseStep{TimeoutMs: 1000}, Selector: flow.Selector{Text: "Delete"}})
 
+	if result.Success {
+		t.Errorf("Expected failure, got success: %s", result.Message)
+	}
+	if sendKeysCalled {
+		t.Error("SendKeys must not be called when no keyboard is shown")
+	}
+}
+
+// TestTapOnKeyboardKeySendKeysFails tests tapOn when SendKeys fails for a keyboard key.
+func TestTapOnKeyboardKeySendKeysFails(t *testing.T) {
+	var sendKeysCalled bool
+	server := keyboardKeyServer(true, http.StatusInternalServerError, &sendKeysCalled)
+	defer server.Close()
+	driver := createTestDriver(server)
+
+	result := driver.tapOn(&flow.TapOnStep{Selector: flow.Selector{Text: "Return"}})
+
+	if !sendKeysCalled {
+		t.Fatal("Expected SendKeys to be attempted")
+	}
 	if result.Success {
 		t.Error("Expected failure when SendKeys fails for keyboard key")
 	}
@@ -4496,6 +4537,7 @@ func TestToggleAirplaneModeTapFails(t *testing.T) {
 
 func TestScrollUntilVisibleRespectsMaxScrolls(t *testing.T) {
 	scrollCount := 0
+	captures := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
@@ -4506,12 +4548,15 @@ func TestScrollUntilVisibleRespectsMaxScrolls(t *testing.T) {
 			return
 		}
 		if strings.HasSuffix(path, "/source") {
-			// Element never found
+			// Element never found; one row drifts on every capture so the
+			// list reads as still moving and maxScrolls stays the limit.
+			captures++
 			jsonResponse(w, map[string]interface{}{
-				"value": `<AppiumAUT>
+				"value": fmt.Sprintf(`<AppiumAUT>
   <XCUIElementTypeApplication name="TestApp" enabled="true" visible="true" x="0" y="0" width="390" height="844">
+    <XCUIElementTypeStaticText name="Other" label="Other" enabled="true" visible="true" x="20" y="%d" width="200" height="40"/>
   </XCUIElementTypeApplication>
-</AppiumAUT>`,
+</AppiumAUT>`, 100+captures),
 			})
 			return
 		}
@@ -5224,5 +5269,52 @@ func TestSwipeFromElementPointStartsAtPoint(t *testing.T) {
 	}
 	if toX >= fromX {
 		t.Errorf("left swipe should move leftwards, got fromX=%.0f toX=%.0f", fromX, toX)
+	}
+}
+
+func TestScrollUntilVisibleStopsWhenScreenStopsMoving(t *testing.T) {
+	// The same source on every read: a list at its end. Two scrolls that
+	// change nothing are proof enough — the loop must not spend the other 18.
+	scrollCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case strings.Contains(path, "/dragfromtoforduration"):
+			scrollCount++
+			jsonResponse(w, map[string]interface{}{"status": 0})
+		case strings.HasSuffix(path, "/source"):
+			jsonResponse(w, map[string]interface{}{
+				"value": `<AppiumAUT>
+  <XCUIElementTypeApplication name="TestApp" enabled="true" visible="true" x="0" y="0" width="390" height="844">
+    <XCUIElementTypeStaticText name="Last row" label="Last row" enabled="true" visible="true" x="20" y="780" width="200" height="40"/>
+  </XCUIElementTypeApplication>
+</AppiumAUT>`,
+			})
+		case strings.Contains(path, "/window/size"):
+			jsonResponse(w, map[string]interface{}{
+				"value": map[string]interface{}{"width": 390.0, "height": 844.0},
+			})
+		default:
+			jsonResponse(w, map[string]interface{}{"status": 0})
+		}
+	}))
+	defer server.Close()
+	driver := createTestDriver(server)
+
+	result := driver.scrollUntilVisible(&flow.ScrollUntilVisibleStep{
+		Element:   flow.Selector{Text: "NonExistent"},
+		Direction: "down",
+		BaseStep:  flow.BaseStep{TimeoutMs: 60000},
+	})
+
+	if result.Success {
+		t.Fatal("expected failure when the element is not in the list")
+	}
+	if scrollCount != 2 {
+		t.Errorf("expected 2 scrolls before the no-progress stop, got %d", scrollCount)
+	}
+	if !strings.Contains(result.Message, "made no progress") {
+		t.Errorf("message should name the reason, got %q", result.Message)
 	}
 }

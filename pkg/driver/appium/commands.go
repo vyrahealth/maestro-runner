@@ -39,7 +39,13 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 		return errorResult(err, fmt.Sprintf("Element not found: %s", step.Selector.Describe()))
 	}
 
-	cx, cy := info.Bounds.Center()
+	// `point` with a selector is relative to the element ("90%,50%" is near its
+	// right edge), as Maestro documents and every other driver does. Tapping
+	// the centre instead hit the row, not the switch at its edge (#175).
+	cx, cy, perr := core.PointInBounds(step.Point, info.Bounds)
+	if perr != nil {
+		return errorResult(perr, fmt.Sprintf("Invalid point coordinates: %v", perr))
+	}
 
 	// If duration is set (or longPress: true), hold the press for that long.
 	if step.DurationMs > 0 || step.LongPress {
@@ -57,6 +63,10 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// to atomically focus + type (bypasses keyboard focus timing issues).
 	if d.platform == "ios" && info.ID != "" {
 		d.lastTappedElementID = info.ID
+	}
+	// A point inside the element needs the coordinate tap below: an element
+	// click always lands on the element's centre.
+	if d.platform == "ios" && info.ID != "" && step.Point == "" {
 		// Use ClickElement (POST /element/{id}/click) instead of coordinate tap.
 		// Coordinate taps via W3C pointer actions are unreliable on iOS: they can miss
 		// if the keyboard is animating, or if the element is partially obscured.
@@ -368,6 +378,10 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	partiallyVisible := false
 	// Height of a flush candidate awaiting confirmation, or -1 for none.
 	pendingHeight := -1
+	// Stop early when the surface stops moving — a target that is not in the
+	// list should not cost every scroll the step allows.
+	var progress core.ScrollProgress
+
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		if err := d.parentContext().Err(); err != nil {
 			return errorResult(fmt.Errorf("scroll cancelled: %w", err), "")
@@ -405,6 +419,14 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			}
 		}
 
+		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+			reason := fmt.Sprintf("scrolling %s made no progress after %d scrolls (end of content?)", direction, i)
+			if partiallyVisible {
+				return errorResult(fmt.Errorf("element found but never sufficiently visible after scrolling"), reason)
+			}
+			return errorResult(fmt.Errorf("element not found after scrolling"), reason)
+		}
+
 		// Scroll
 		d.scroll(&flow.ScrollStep{Direction: direction, Speed: step.Speed})
 		time.Sleep(300 * time.Millisecond)
@@ -414,6 +436,17 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		return errorResult(fmt.Errorf("element found but never sufficiently visible after scrolling"), "")
 	}
 	return errorResult(fmt.Errorf("element not found after scrolling"), "")
+}
+
+// scrollSurfaceSignature reduces the current page source to a key for
+// core.ScrollProgress. A capture that cannot be read reports ok=false and is
+// not observed, so a hiccup never passes for the end of the content.
+func (d *Driver) scrollSurfaceSignature() (string, bool) {
+	source, err := d.client.Source()
+	if err != nil || source == "" {
+		return "", false
+	}
+	return core.ScrollSignature(source), true
 }
 
 // atScrollContainerEdge reports whether the element with bounds b sits flush
@@ -1114,7 +1147,13 @@ func (d *Driver) waitUntil(step *flow.WaitUntilStep) *core.CommandResult {
 					return successResult("Element is no longer visible", nil)
 				}
 			}
-			// HTTP round-trip (~100ms) is natural rate limit, no sleep needed
+			// A miss used to cost a page-source dump, which throttled this
+			// loop by accident; a proven absence now returns in ~13ms on a
+			// local simulator (#173), which spun ~75 queries a second.
+			select {
+			case <-ctx.Done():
+			case <-time.After(100 * time.Millisecond):
+			}
 		}
 	}
 }

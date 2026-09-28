@@ -175,16 +175,12 @@ func TestRunner_Port(t *testing.T) {
 
 func TestRunner_Destination(t *testing.T) {
 	// Fake UDID — isSimulator() won't match it, so this is the real-device
-	// branch. It used to assert the UNPINNED "platform=iOS,id=<udid>", which
-	// encoded the gap rather than the intent: the destination ambiguity this
-	// guards against is not simulator-specific. xcodebuild lists both arm64
-	// and arm64e for one iPhone, warns "Using the first of multiple matching
-	// destinations", and a wrong pick leaves testmanagerd without a test
-	// bundle — the run then stalls with no further log output, which is how it
-	// was reported on a real device against 1.1.25.
+	// branch. A physical device is selected by its id alone; xcodebuild rejects
+	// arch= on a device destination ("Please supply only supported device
+	// specifier options", #172), so there must be no arch here.
 	runner := &Runner{deviceUDID: "my-device-udid"}
 	dest := runner.destination()
-	expected := "platform=iOS,arch=arm64,id=my-device-udid"
+	expected := "platform=iOS,id=my-device-udid"
 
 	if dest != expected {
 		t.Errorf("expected destination %q, got %q", expected, dest)
@@ -305,18 +301,16 @@ func TestPortFromUDID_UUIDPortUnchanged(t *testing.T) {
 	}
 }
 
-// TestDestinationPinsArchOnPhysicalDevices covers the stall reported against
-// 1.1.25: xcodebuild lists both arm64 and arm64e for one iPhone, warns "Using
-// the first of multiple matching destinations", and a wrong pick leaves
-// testmanagerd without a test bundle — the run then stalls with no further log
-// output. The arch pin existed for simulators only, so devices kept the coin
-// flip.
-func TestDestinationPinsArchOnPhysicalDevices(t *testing.T) {
+// TestDestinationHasNoArchOnPhysicalDevices covers #172: xcodebuild rejects
+// arch= (and OS=) on a physical-device destination, so the default device
+// destination must be the plain "platform=iOS,id=<udid>" — the id alone
+// selects the device.
+func TestDestinationHasNoArchOnPhysicalDevices(t *testing.T) {
 	r := &Runner{deviceUDID: "00008101-001C0C660A13001E"}
 
 	got := r.destination()
-	if !strings.Contains(got, "arch=") {
-		t.Errorf("expected an arch pin for a physical device, got %q", got)
+	if strings.Contains(got, "arch=") {
+		t.Errorf("a physical-device destination must not carry arch=, got %q", got)
 	}
 	if !strings.Contains(got, "platform=iOS,") || strings.Contains(got, "Simulator") {
 		t.Errorf("expected a physical-device platform, got %q", got)

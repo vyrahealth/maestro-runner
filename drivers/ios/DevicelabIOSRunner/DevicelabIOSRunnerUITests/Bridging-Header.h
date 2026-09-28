@@ -1,4 +1,6 @@
 #import "RunnerObjCExceptionCatcher.h"
 #import "SyntheticTyping.h"
 #import "SnapshotParams.h"
+#import "RunnerAXSnapshotBridge.h"
+#import "RunnerXCTestTimeouts.h"
 #import "PrivateHeaders/XCTest/XCUIApplication+ActiveApp.h"

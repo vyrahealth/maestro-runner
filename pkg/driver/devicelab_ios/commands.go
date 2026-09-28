@@ -388,8 +388,10 @@ func (d *Driver) assertVisibleCount(s *flow.AssertVisibleStep, want int) *core.C
 		}
 		firstPass = false
 
+		// An unreadable snapshot keeps polling like a wrong count, and is
+		// reported as the cause if it is still failing at the deadline.
 		nodes, err := d.snapshotMatching(s.Selector)
-		if err != nil {
+		if err != nil && !isSnapshotFailure(err) {
 			return core.ErrorResult(err, "assertVisible: "+err.Error())
 		}
 		got = countDisplayed(nodes)
@@ -397,6 +399,9 @@ func (d *Driver) assertVisibleCount(s *flow.AssertVisibleStep, want int) *core.C
 			return core.SuccessResult(fmt.Sprintf("%d visible", got), nil)
 		}
 		if !time.Now().Before(deadline) {
+			if err != nil {
+				return core.ErrorResult(err, "assertVisible: "+err.Error())
+			}
 			err := fmt.Errorf("expected %d visible matches of %s, found %d",
 				want, describeSelector(s.Selector), got)
 			return core.ErrorResult(err, err.Error())
@@ -418,16 +423,44 @@ func countDisplayed(nodes []SnapshotNode) int {
 }
 
 func (d *Driver) handleAssertNotVisible(s *flow.AssertNotVisibleStep) *core.CommandResult {
-	nodes, err := d.snapshotMatching(s.Selector)
-	if err != nil {
-		return core.ErrorResult(err, "assertNotVisible: "+err.Error())
-	}
-	for i := range nodes {
-		if isDisplayed(&nodes[i]) {
-			return core.ErrorResult(fmt.Errorf("element unexpectedly visible"), "element visible")
+	deadline := time.Now().Add(time.Duration(d.resolveFindTimeoutMs(s.IsOptional(), s.TimeoutMs)) * time.Millisecond)
+	for firstPass := true; ; firstPass = false {
+		if !firstPass {
+			d.invalidateSnapshotCache()
+			time.Sleep(200 * time.Millisecond)
+		}
+		nodes, err := d.snapshotMatching(s.Selector)
+		if err == nil {
+			if countDisplayed(nodes) > 0 {
+				return core.ErrorResult(fmt.Errorf("element unexpectedly visible"), "element visible")
+			}
+			return core.SuccessResult("not visible", nil)
+		}
+		if !isSnapshotFailure(err) {
+			return core.ErrorResult(err, "assertNotVisible: "+err.Error())
+		}
+		// The runner could not read a tree. An app that is not in the
+		// foreground (stopped, backgrounded, suspended) shows nothing, so
+		// none of its elements is visible: that is the answer, not a
+		// failure. A foreground app that failed to answer proves nothing, so
+		// it is retried like the other snapshot callers and reported at the
+		// deadline. when:/while: notVisible run through here too.
+		if state := d.lastSnapshotAppState; appOffScreen(state) {
+			return core.SuccessResult("not visible (app "+state+")", nil)
+		}
+		if !time.Now().Before(deadline) {
+			return core.ErrorResult(err, "assertNotVisible: "+err.Error())
 		}
 	}
-	return core.SuccessResult("not visible", nil)
+}
+
+// appOffScreen reports whether an app in this state has nothing on screen.
+func appOffScreen(state string) bool {
+	switch state {
+	case "notRunning", "runningBackground", "runningBackgroundSuspended":
+		return true
+	}
+	return false
 }
 
 // handleTakeScreenshot uses simctl io booted screenshot for a host-side
@@ -525,12 +558,16 @@ func (d *Driver) handleWaitForAnimation(s *flow.WaitForAnimationToEndStep) *core
 	return core.SuccessResult("animation ended", nil)
 }
 
-// handleEraseText emits a `type` request with textEntryMode="replace"
-// and an empty text payload — the runner sees replace mode, calls
-// clearTextInput on the focused element (which uses element.typeText
-// with backspaces and is much faster than app.typeText), then
-// typeTextReliably's empty-text short-circuit returns before typing
-// anything. We build the JSON manually here because the Command struct's
+// handleEraseText emits a `type` request with textEntryMode="replace", an
+// empty text payload and deleteCount, which the runner treats as "delete this
+// many characters from the end": it resolves the input (last-tapped coords /
+// id) and sends that many deletes. A count that covers the whole value clears
+// the field instead, verifying it reads back empty (a placeholder counts as
+// empty) and clearing once more if text is left; a field that still holds
+// text comes back as a TEXT_ENTRY_MISMATCH error. The count defaults to 50,
+// as in Maestro and the WDA driver. With no text input to act on there is
+// nothing to erase, and the step passes, as it does in Maestro.
+// We build the JSON manually here because the Command struct's
 // `text` field is JSON `omitempty` (any other handler sending an empty
 // string would mis-trigger text-based element matching on the runner).
 func (d *Driver) handleEraseText(s *flow.EraseTextStep) *core.CommandResult {
@@ -538,6 +575,7 @@ func (d *Driver) handleEraseText(s *flow.EraseTextStep) *core.CommandResult {
 		"command":       string(CmdType),
 		"text":          "",
 		"textEntryMode": "replace",
+		"deleteCount":   eraseCount(s.Characters),
 	}
 	if d.appID != "" {
 		body["appBundleId"] = d.appID
@@ -553,9 +591,21 @@ func (d *Driver) handleEraseText(s *flow.EraseTextStep) *core.CommandResult {
 	ctx, cancel := d.callTimeout()
 	defer cancel()
 	if _, err := d.client.CallRaw(ctx, body); err != nil {
+		if re, ok := IsRunnerError(err); ok && re.Code == ErrNoTextInput {
+			return core.SuccessResult("nothing to erase: no focused text input", nil)
+		}
 		return core.ErrorResult(err, "eraseText failed: "+err.Error())
 	}
 	return core.SuccessResult("erased", nil)
+}
+
+// eraseCount is how many characters eraseText deletes: the step's count, or
+// Maestro's default of 50.
+func eraseCount(characters int) int {
+	if characters > 0 {
+		return characters
+	}
+	return 50
 }
 
 func (d *Driver) handleBack(s *flow.BackStep) *core.CommandResult {
@@ -744,6 +794,10 @@ func (d *Driver) handleScrollUntilVisible(s *flow.ScrollUntilVisibleStep) *core.
 		timeout = time.Duration(s.TimeoutMs) * time.Millisecond
 	}
 	deadline := time.Now().Add(timeout)
+	// Stop early when the surface stops moving — a target that is not in the
+	// list should not cost every scroll the step allows.
+	var progress core.ScrollProgress
+
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		node, err := d.findElement(s.Element, true, 1000)
 		if err == nil && node != nil && isDisplayed(node) {
@@ -773,6 +827,13 @@ func (d *Driver) handleScrollUntilVisible(s *flow.ScrollUntilVisibleStep) *core.
 				}
 			}
 		}
+		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+			return core.ErrorResult(
+				fmt.Errorf("element not found after %d scrolls", i),
+				fmt.Sprintf("scroll target not found: scrolling %s made no progress (end of content?)", direction),
+			)
+		}
+
 		result := d.handleScroll(&flow.ScrollStep{Direction: direction})
 		if !result.Success {
 			return result
@@ -783,6 +844,22 @@ func (d *Driver) handleScrollUntilVisible(s *flow.ScrollUntilVisibleStep) *core.
 		fmt.Errorf("element not found after %d scrolls", maxScrolls),
 		"scroll target not found",
 	)
+}
+
+// scrollSurfaceSignature reduces the current snapshot to a key for
+// core.ScrollProgress: type, label, identifier, value and frame of every
+// node, so a list that advanced by one row still reads as movement. A
+// snapshot that cannot be read reports ok=false and is not observed.
+func (d *Driver) scrollSurfaceSignature() (string, bool) {
+	nodes, err := d.fetchSnapshot()
+	if err != nil || len(nodes) == 0 {
+		return "", false
+	}
+	var sb strings.Builder
+	for _, n := range nodes {
+		fmt.Fprintf(&sb, "%s|%s|%s|%s|%v\n", n.Type, n.Label, n.Identifier, n.Value, n.Rect)
+	}
+	return core.ScrollSignature(sb.String()), true
 }
 
 func (d *Driver) handleDoubleTap(s *flow.DoubleTapOnStep) *core.CommandResult {
@@ -1050,19 +1127,19 @@ func (d *Driver) handleWaitUntil(s *flow.WaitUntilStep) *core.CommandResult {
 			}
 		}
 		if s.NotVisible != nil {
+			// A snapshot that could not be read proves nothing is gone;
+			// keep polling.
 			nodes, err := d.snapshotMatching(*s.NotVisible)
-			if err != nil {
+			if err != nil && !isSnapshotFailure(err) {
 				return core.ErrorResult(err, "snapshot failed")
 			}
-			anyVisible := false
-			for i := range nodes {
-				if isDisplayed(&nodes[i]) {
-					anyVisible = true
-					break
-				}
-			}
-			if !anyVisible {
+			if err == nil && countDisplayed(nodes) == 0 {
 				return core.SuccessResult("not visible", nil)
+			}
+			// As in assertNotVisible: an app that is not in the foreground
+			// has nothing on screen.
+			if err != nil && appOffScreen(d.lastSnapshotAppState) {
+				return core.SuccessResult("not visible (app "+d.lastSnapshotAppState+")", nil)
 			}
 		}
 		if !time.Now().Before(deadline) {
@@ -1200,9 +1277,10 @@ func (d *Driver) findElement(sel flow.Selector, optional bool, stepTimeoutMs int
 		}
 		firstPass = false
 
-		// Strategy 1: snapshot dump + local filter.
+		// Strategy 1: snapshot dump + local filter. A snapshot the runner
+		// could not read is retried like a miss, not returned at once.
 		nodes, err := d.snapshotMatching(sel)
-		if err != nil {
+		if err != nil && !isSnapshotFailure(err) {
 			return nil, err
 		}
 		if len(nodes) > 0 {
@@ -1223,11 +1301,21 @@ func (d *Driver) findElement(sel flow.Selector, optional bool, stepTimeoutMs int
 			if optional {
 				return nil, nil
 			}
-			return nil, fmt.Errorf("element not found: %s", describeSelector(sel))
+			return nil, elementNotFound(sel, err)
 		}
 		// No explicit sleep — strategies 1 and 2 each do real HTTP round-trips
 		// (~100-200ms snapshot + ~50ms query) which paces the loop naturally.
 	}
+}
+
+// elementNotFound is findElement's timeout error. When the last snapshot could
+// not be read at all, it says so: "not found" alone would claim the screen was
+// read and the element was absent.
+func elementNotFound(sel flow.Selector, snapErr error) error {
+	if snapErr != nil {
+		return fmt.Errorf("element not found: %s (last snapshot failed: %w)", describeSelector(sel), snapErr)
+	}
+	return fmt.Errorf("element not found: %s", describeSelector(sel))
 }
 
 // resolveFindTimeoutMs picks the poll budget for element resolution: an
@@ -1290,6 +1378,10 @@ func (d *Driver) fetchSnapshot() ([]SnapshotNode, error) {
 		Command:     CmdSnapshot,
 		AppBundleID: d.appID,
 	})
+	d.lastSnapshotAppState = ""
+	if data != nil {
+		d.lastSnapshotAppState = data.AppState
+	}
 	if err != nil {
 		return nil, err
 	}

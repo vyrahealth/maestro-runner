@@ -50,6 +50,10 @@ type Driver struct {
 	appDeathCount    int
 	appDeathFirstAt  time.Time
 	crashAbortReason string
+
+	// The element the last step tapped, while the next step may still need
+	// to wait for that tap's UI to settle
+	lastTapID string
 }
 
 // Crash-loop detection thresholds.
@@ -220,6 +224,15 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 		}
 	}
 
+	// An action right after a tap waits for that tap's UI to settle. WDA's
+	// own wait for quiescence is off (it crashed XCTest), so a second tap
+	// went out tens of milliseconds after the first, before the push the
+	// first one started, and landed on the screen being left (#179).
+	if d.lastTapID != "" && actsOnScreen(step) {
+		d.settleAfterTap()
+	}
+	d.lastTapID = ""
+
 	var result *core.CommandResult
 	switch s := step.(type) {
 	// Tap commands
@@ -335,14 +348,65 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 	default:
 		result = &core.CommandResult{
 			Success: false,
-			Error:   fmt.Errorf("unknown step type: %T", step),
-			Message: fmt.Sprintf("Step type '%T' is not supported on iOS", step),
+			Error:   fmt.Errorf("unknown step type: %s", step.Type()),
+			Message: fmt.Sprintf("Step type '%s' is not supported on iOS", step.Type()),
 		}
 	}
 
 	result.Duration = time.Since(start)
 	d.trackCrashLoop(result)
 	return result
+}
+
+// actsOnScreen reports whether a step acts on what is on screen, so it must
+// not run while the previous tap's UI is still changing.
+func actsOnScreen(step flow.Step) bool {
+	switch step.(type) {
+	case *flow.TapOnStep, *flow.DoubleTapOnStep, *flow.LongPressOnStep, *flow.TapOnPointStep,
+		*flow.SwipeStep, *flow.ScrollStep, *flow.BackStep, *flow.PressKeyStep, *flow.InputTextStep:
+		return true
+	}
+	return false
+}
+
+// Settle limits after a tap: how long a screen change may take to show, and
+// how long it may take to finish.
+const (
+	tapEffectWait   = 400 * time.Millisecond
+	tapSettleLimit  = 1500 * time.Millisecond
+	tapSettleSample = 50 * time.Millisecond
+)
+
+// settleAfterTap waits for the UI the last tap started to finish, watching
+// the tapped element: if it moves or goes away a transition is under way,
+// and it waits until the element is gone or at rest. An element that has
+// not moved within tapEffectWait means the tap changed nothing there. Each
+// look is one rect call, far cheaper than comparing page sources.
+func (d *Driver) settleAfterTap() {
+	start := time.Now()
+	moving := false
+	var prev core.Bounds
+	for first := true; time.Since(start) < tapSettleLimit; first = false {
+		x, y, w, h, err := d.client.ElementRect(d.lastTapID)
+		if err != nil {
+			return // gone: the screen it was on has been replaced
+		}
+		cur := core.Bounds{X: x, Y: y, Width: w, Height: h}
+		// Compare readings taken after the tap with each other: the bounds
+		// read before the click can differ from the first one after it
+		// without anything moving, which read as "moved, then at rest".
+		switch {
+		case !first && cur != prev:
+			moving = true
+		case moving:
+			return // moved and came to rest
+		case time.Since(start) >= tapEffectWait:
+			return // never moved: nothing to wait for
+		}
+		prev = cur
+		time.Sleep(tapSettleSample)
+	}
+	logger.Debug("[wda] screen still changing %v after the last tap — continuing", tapSettleLimit)
 }
 
 // trackCrashLoop counts consecutive "app died on launch" failures and trips a
@@ -577,8 +641,11 @@ func (d *Driver) findElementForTapWithContext(ctx context.Context, sel flow.Sele
 
 			// Step 2a: Try exact-match predicate first.
 			// This prevents "Password" from matching "Forgot Password?" etc.
-			exactPredicate := fmt.Sprintf("(label == '%s' OR name == '%s' OR value == '%s')%s",
-				sel.Text, sel.Text, sel.Text, stateFilter)
+			// Text matches what the element shows (label, value), never its
+			// accessibility identifier: XCUITest reports the identifier as
+			// name, and Maestro matches ids only through id: (#178).
+			exactPredicate := fmt.Sprintf("(label == '%s' OR value == '%s')%s",
+				sel.Text, sel.Text, stateFilter)
 			exactElemID, _ := d.client.FindElement("predicate string", exactPredicate)
 
 			// If exact predicate found element, try getElementInfo directly — avoids
@@ -590,8 +657,8 @@ func (d *Driver) findElementForTapWithContext(ctx context.Context, sel flow.Sele
 			}
 
 			// Step 2b: Check if text exists via substring WDA predicate
-			predicateBase := fmt.Sprintf("label CONTAINS[c] '%s' OR name CONTAINS[c] '%s' OR value CONTAINS[c] '%s'",
-				sel.Text, sel.Text, sel.Text)
+			predicateBase := fmt.Sprintf("label CONTAINS[c] '%s' OR value CONTAINS[c] '%s'",
+				sel.Text, sel.Text)
 			predicate := "(" + predicateBase + ")" + stateFilter
 			containsElemID, textExistsErr := d.client.FindElement("predicate string", predicate)
 
@@ -636,13 +703,13 @@ func (d *Driver) findInteractiveElementByWDA(sel flow.Selector, stateFilter stri
 
 	textFieldChain := fmt.Sprintf("**/XCUIElementTypeTextField[`(label CONTAINS[c] '%s' OR value CONTAINS[c] '%s' OR placeholderValue CONTAINS[c] '%s')%s`]", sel.Text, sel.Text, sel.Text, stateFilter)
 	secureFieldChain := fmt.Sprintf("**/XCUIElementTypeSecureTextField[`(label CONTAINS[c] '%s' OR value CONTAINS[c] '%s' OR placeholderValue CONTAINS[c] '%s')%s`]", sel.Text, sel.Text, sel.Text, stateFilter)
-	buttonChain := fmt.Sprintf("**/XCUIElementTypeButton[`(label ==[c] '%s' OR name ==[c] '%s')%s`]", sel.Text, sel.Text, stateFilter)
+	buttonChain := fmt.Sprintf("**/XCUIElementTypeButton[`(label ==[c] '%s')%s`]", sel.Text, stateFilter)
 
 	// Fallback: combined predicate for all interactive types.
 	// Class chain can fail due to quiescence while predicate queries may succeed.
 	fallbackPred := fmt.Sprintf(
-		"((type == 'XCUIElementTypeTextField' OR type == 'XCUIElementTypeSecureTextField' OR type == 'XCUIElementTypeSearchField') AND (label CONTAINS[c] '%s' OR value CONTAINS[c] '%s')) OR (type == 'XCUIElementTypeButton' AND (label ==[c] '%s' OR name ==[c] '%s'))",
-		sel.Text, sel.Text, sel.Text, sel.Text,
+		"((type == 'XCUIElementTypeTextField' OR type == 'XCUIElementTypeSecureTextField' OR type == 'XCUIElementTypeSearchField') AND (label CONTAINS[c] '%s' OR value CONTAINS[c] '%s')) OR (type == 'XCUIElementTypeButton' AND label ==[c] '%s')",
+		sel.Text, sel.Text, sel.Text,
 	)
 	if stateFilter != "" {
 		fallbackPred = fmt.Sprintf("(%s)%s", fallbackPred, stateFilter)
@@ -839,12 +906,12 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 			// CONTAINS fallback preserves the lenient Maestro-compat behavior
 			// for callers that rely on partial-id matching.
 			exact := fmt.Sprintf("**/XCUIElementTypeAny[`name == '%s'%s`]", sel.ID, stateFilter)
-			if elemID, err := d.client.FindElement("class chain", exact); err == nil && elemID != "" {
-				return d.getElementInfo(elemID)
+			if info, err, found := d.findByIDQuery(exact); found {
+				return info, err
 			}
 			contains := fmt.Sprintf("**/XCUIElementTypeAny[`name CONTAINS '%s'%s`]", sel.ID, stateFilter)
-			if elemID, err := d.client.FindElement("class chain", contains); err == nil && elemID != "" {
-				return d.getElementInfo(elemID)
+			if info, err, found := d.findByIDQuery(contains); found {
+				return info, err
 			}
 		}
 	}
@@ -852,8 +919,8 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 	if sel.Text != "" {
 		// Try generic predicate first — most assertions target StaticText/labels,
 		// so this avoids 3 wasted type-specific queries (TextField, SecureTextField, Button)
-		predicateBase := fmt.Sprintf("label CONTAINS[c] '%s' OR name CONTAINS[c] '%s' OR value CONTAINS[c] '%s'",
-			sel.Text, sel.Text, sel.Text)
+		predicateBase := fmt.Sprintf("label CONTAINS[c] '%s' OR value CONTAINS[c] '%s'",
+			sel.Text, sel.Text)
 		predicate := "(" + predicateBase + ")" + stateFilter
 		if elemID, err := d.client.FindElement("predicate string", predicate); err == nil && elemID != "" {
 			return d.getElementInfo(elemID)
@@ -909,11 +976,16 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 	}()
 	wg.Wait()
 
+	if rectErr != nil {
+		return nil, fmt.Errorf("element bounds unavailable: %w", rectErr)
+	}
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("element has invalid bounds: %dx%d", w, h)
+	}
+	info.Bounds = core.Bounds{X: x, Y: y, Width: w, Height: h}
+
 	if textErr == nil {
 		info.Text = text
-	}
-	if rectErr == nil {
-		info.Bounds = core.Bounds{X: x, Y: y, Width: w, Height: h}
 	}
 	if nameErr == nil {
 		info.Class = elemName
@@ -924,9 +996,6 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 		// XCUITest says off-screen. Check bounds geometrically — if they're
 		// inside the viewport, override XCUITest and accept the element with
 		// a MatchNote so the report records the override.
-		if rectErr != nil {
-			return nil, fmt.Errorf("element exists but is not visible on screen (no bounds)")
-		}
 		screenW, screenH, sErr := d.screenSize()
 		if sErr != nil {
 			return nil, fmt.Errorf("element exists but is not visible on screen (screen size unavailable)")
@@ -942,6 +1011,60 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 	}
 
 	return info, nil
+}
+
+// findByIDQuery resolves a class-chain id query, preferring an on-screen
+// element when several match (onScreenOf). found is false when nothing
+// matched. A WDA that cannot list elements gets the single-element query.
+func (d *Driver) findByIDQuery(query string) (*core.ElementInfo, error, bool) { //nolint:revive,staticcheck // found last reads naturally at call sites
+	ids, err := d.client.FindElements("class chain", query)
+	if err != nil {
+		elemID, ferr := d.client.FindElement("class chain", query)
+		if ferr != nil || elemID == "" {
+			return nil, nil, false
+		}
+		info, ierr := d.getElementInfo(elemID)
+		return info, ierr, true
+	}
+	if len(ids) == 0 {
+		return nil, nil, false
+	}
+	info, ierr := d.onScreenOf(ids)
+	return info, ierr, true
+}
+
+// maxIDCandidates caps how many same-id elements are inspected; each costs
+// the element calls in getElementInfo.
+const maxIDCandidates = 5
+
+// onScreenOf picks among elements sharing an id: the first XCUITest reports
+// displayed, else the first the viewport check in getElementInfo accepts.
+// While a push animates, the outgoing screen and the incoming one both hold
+// an element with the same id, and the outgoing copy comes first in tree
+// order; taking it tapped the screen being left (#179).
+func (d *Driver) onScreenOf(ids []string) (*core.ElementInfo, error) {
+	var fallback *core.ElementInfo
+	var lastErr error
+	for i, id := range ids {
+		if i == maxIDCandidates {
+			break
+		}
+		info, err := d.getElementInfo(id)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if info.Visible {
+			return info, nil
+		}
+		if fallback == nil {
+			fallback = info
+		}
+	}
+	if fallback != nil {
+		return fallback, nil
+	}
+	return nil, lastErr
 }
 
 // findElementRelativeWithContext handles relative selectors with context-based timeout.

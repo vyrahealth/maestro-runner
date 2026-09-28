@@ -1,0 +1,22 @@
+version: "2"
+
+# Matches what golangci-lint v1 checked here, so the v2 upgrade (needed for
+# the go1.26 toolchain pin in go.mod) changes the tool, not the rules.
+linters:
+  settings:
+    staticcheck:
+      # v1 ran staticcheck and gosimple (SA, S); v2 folds stylecheck (ST) and
+      # the quick-fix suggestions (QF) into staticcheck. Adopting those is its
+      # own change.
+      checks:
+        - all
+        - -ST*
+        - -QF*
+  exclusions:
+    # The exclusions v1 applied by default. v2 dropped them; these presets are
+    # the documented way to keep the same baseline.
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,7 +45,6 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 		"bundleId":                bundleID,
 		"shouldWaitForQuiescence": false,
 		"waitForIdleTimeout":      0,
-		"shouldUseTestManagerForVisibilityDetection": false,
 	}
 	if alertAction != "" {
 		alwaysMatch["defaultAlertAction"] = alertAction
@@ -71,7 +72,31 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 		}
 	}
 
+	// Raise the snapshot depth cap. WebDriverAgent defaults snapshotMaxDepth to
+	// 50, which clips deep React Native (Fabric / New Architecture) trees:
+	// content nested inside a ScrollView sits below level 50 and drops out of
+	// the hierarchy, so assertVisible / extendedWaitUntil on those ids time out
+	// even though stock Maestro's XCTest traversal (no such cap) sees them
+	// (#171). Applied here so every session — the primary one and the one
+	// launchApp recreates — gets it.
+	_ = c.UpdateSettings(map[string]interface{}{"snapshotMaxDepth": wdaSnapshotMaxDepth()})
+
 	return nil
+}
+
+// wdaSnapshotMaxDepth is the WebDriverAgent accessibility-snapshot depth cap.
+// The default of 100 clears the deep native wrapper nesting a React Native
+// screen produces while staying well under XCAXClient's INT_MAX (which
+// WebDriverAgent avoids because it can hang on pathological trees). Override
+// with MAESTRO_WDA_SNAPSHOT_MAX_DEPTH for an unusually deep app.
+func wdaSnapshotMaxDepth() int {
+	const defaultDepth = 100
+	if v := os.Getenv("MAESTRO_WDA_SNAPSHOT_MAX_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultDepth
 }
 
 // UpdateSettings updates WDA session settings.
@@ -195,6 +220,25 @@ func (c *Client) Swipe(fromX, fromY, toX, toY float64, durationSec float64) erro
 		"toY":      toY,
 		"duration": durationSec,
 	})
+	return err
+}
+
+// PointerSwipe is a one-finger swipe as W3C pointer actions: down at the start,
+// a move to the end that takes durationMs, then up. The move's duration is the
+// swipe's speed, which dragfromtoforduration cannot set.
+func (c *Client) PointerSwipe(fromX, fromY, toX, toY float64, durationMs int) error {
+	finger := map[string]interface{}{
+		"type":       "pointer",
+		"id":         "finger1",
+		"parameters": map[string]interface{}{"pointerType": "touch"},
+		"actions": []interface{}{
+			map[string]interface{}{"type": "pointerMove", "duration": 0, "x": fromX, "y": fromY},
+			map[string]interface{}{"type": "pointerDown", "button": 0},
+			map[string]interface{}{"type": "pointerMove", "duration": durationMs, "x": toX, "y": toY},
+			map[string]interface{}{"type": "pointerUp", "button": 0},
+		},
+	}
+	_, err := c.post(c.sessionPath("/actions"), map[string]interface{}{"actions": []interface{}{finger}})
 	return err
 }
 
