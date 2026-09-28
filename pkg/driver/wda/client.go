@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
@@ -281,6 +283,24 @@ func (c *Client) ElementSendKeys(elementID, text string, frequency int) error {
 	}
 	_, err := c.post(c.sessionPath(fmt.Sprintf("/element/%s/value", elementID)), body)
 	return err
+}
+
+// isDroppedConnection reports a request that died on its connection before any
+// response came back: an EOF, a reset or a broken pipe. Over a forwarded WDA port
+// this happens. On a real iPhone reached through usbmux and an SSH tunnel, WDA
+// began dropping about one request in fourteen, 90 minutes into a suite, each
+// within about 10 ms and nearly all of them element reads sent in parallel; one
+// such dropped text read made a copyTextFrom come back empty.
+func isDroppedConnection(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
+// isLookupPath reports a POST that only finds elements, from the root or from an
+// element (/element, /elements, /element/{id}/element(s)), so repeating it changes
+// nothing on the device.
+func isLookupPath(path string) bool {
+	return strings.HasSuffix(path, "/element") || strings.HasSuffix(path, "/elements")
 }
 
 // ElementClear clears an element's text.
@@ -601,6 +621,11 @@ func (c *Client) get(path string) (map[string]interface{}, error) {
 	logger.Debug("WDA GET %s", path)
 
 	resp, err := c.httpClient.Get(c.baseURL + path)
+	if err != nil && isDroppedConnection(err) {
+		// A read is safe to send twice.
+		logger.Warn("WDA GET %s: the connection dropped before a response (%v), sending it again", path, err)
+		resp, err = c.httpClient.Get(c.baseURL + path)
+	}
 	duration := time.Since(start).Milliseconds()
 
 	if err != nil {
@@ -619,23 +644,35 @@ func (c *Client) get(path string) (map[string]interface{}, error) {
 
 func (c *Client) post(path string, body interface{}) (map[string]interface{}, error) {
 	start := time.Now()
-	var reqBody io.Reader
+	var data []byte
 	bodyStr := ""
 	if body != nil {
-		data, err := json.Marshal(body)
+		var err error
+		data, err = json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		reqBody = bytes.NewReader(data)
 		bodyStr = string(data)
 		if len(bodyStr) > 100 {
 			bodyStr = bodyStr[:100] + "..."
 		}
 	}
+	newBody := func() io.Reader {
+		if data == nil {
+			return nil
+		}
+		return bytes.NewReader(data)
+	}
 
 	logger.Debug("WDA POST %s body=%s", path, core.RedactTypedText(path, bodyStr))
 
-	resp, err := c.httpClient.Post(c.baseURL+path, "application/json", reqBody)
+	resp, err := c.httpClient.Post(c.baseURL+path, "application/json", newBody())
+	if err != nil && isDroppedConnection(err) && isLookupPath(path) {
+		// A lookup changes nothing, so it is as safe to repeat as a GET. An action is
+		// not sent twice: it may have reached WDA before the connection went.
+		logger.Warn("WDA POST %s: the connection dropped before a response (%v), sending it again", path, err)
+		resp, err = c.httpClient.Post(c.baseURL+path, "application/json", newBody())
+	}
 	duration := time.Since(start).Milliseconds()
 
 	if err != nil {
