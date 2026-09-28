@@ -4,6 +4,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime/debug"
 	"sync"
@@ -61,9 +62,10 @@ type RunnerConfig struct {
 	Env map[string]string
 
 	// Driver settings
-	WaitForIdleTimeout int // Global wait for idle timeout in ms
-	TypingFrequency    int // Global WDA typing frequency in keys/sec (0 = WDA default)
-	ConditionTimeout   int // Default timeout (ms) for when:/while: condition checks (0 = engine default)
+	WaitForIdleTimeout int  // Global wait for idle timeout in ms
+	TypingFrequency    int  // Global WDA typing frequency in keys/sec (0 = WDA default)
+	ConditionTimeout   int  // Default timeout (ms) for when:/while: condition checks (0 = engine default)
+	Insecure           bool // Skip TLS verification for runScript http.* calls (--insecure)
 	// StepDelay pauses between top-level steps (ms). Flow config overrides it.
 	// For pacing demos and apps whose animations outrun the assertions.
 	StepDelay int
@@ -125,7 +127,7 @@ func New(driver core.Driver, cfg RunnerConfig) *Runner {
 // Run executes all flows and generates reports.
 func (r *Runner) Run(ctx context.Context, flows []flow.Flow) (*RunResult, error) {
 	// Expand suites into individual test case flows
-	expandedFlows := expandSuites(flows)
+	expandedFlows := flowsToRun(flows)
 
 	// Build report skeleton
 	builderCfg := report.BuilderConfig{
@@ -295,6 +297,23 @@ func (r *Runner) buildRunResult(flowResults []FlowResult) *RunResult {
 	}
 
 	return result
+}
+
+// flowsToRun is the list Run executes: the flows with every suite expanded,
+// unless MAESTRO_NO_SUITE_EXPANSION is set.
+//
+// Maestro has no suites. To Maestro a flow made only of runFlow steps is one
+// flow that runs its subflows in order, in one context: each runFlow's env
+// expands against the calling flow's env, and a subflow's `output` reaches the
+// steps after it. Expanded, the same file becomes one flow per runFlow, run with
+// the step's env as written, so `API_BASE_URL: ${API_BASE_URL}` arrives
+// unexpanded and a later part runs without the account the first part signed in
+// to. The switch keeps Maestro's reading for a suite written for Maestro.
+func flowsToRun(flows []flow.Flow) []flow.Flow {
+	if os.Getenv("MAESTRO_NO_SUITE_EXPANSION") != "" {
+		return flows
+	}
+	return expandSuites(flows)
 }
 
 // expandSuites expands suite files into individual test case flows.

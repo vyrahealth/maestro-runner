@@ -171,11 +171,23 @@ func buildTestCase(entry *FlowEntry, detail *FlowDetail, index *Index) string {
 		if entry.Error != nil {
 			errMsg = *entry.Error
 		}
+		// The real error goes in BOTH the message attribute and the element
+		// body. Maestro puts it in the body, and parsers written against
+		// Maestro read the body, so putting it only in the attribute (as we
+		// used to) left those parsers seeing just the step description and
+		// missing the actual cause — which defeats being drop-in. The message
+		// attribute keeps it too, for parsers that read there. When no
+		// command-level error was captured, fall back to the step description
+		// so the body is never empty.
+		body := errMsg
+		if body == "" {
+			body = failureBody
+		}
 		b.WriteString(fmt.Sprintf(
 			`      <failure message="%s" type="%s">%s</failure>`+"\n",
 			xmlEscape(errMsg),
 			xmlEscape(failureType),
-			xmlEscape(failureBody),
+			xmlEscape(body),
 		))
 	case StatusSkipped:
 		b.WriteString("      <skipped/>\n")

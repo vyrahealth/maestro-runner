@@ -26,6 +26,87 @@
 static const NSTimeInterval FBHomeButtonCoolOffTime = 1.;
 static const NSTimeInterval FBScreenLockTimeout = 5.;
 
+#if TARGET_OS_TV
+NSDictionary<NSString *, NSNumber *> *fb_availableButtonNames(void) {
+  static dispatch_once_t onceToken;
+  static NSDictionary *result;
+  dispatch_once(&onceToken, ^{
+    NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
+    // https://developer.apple.com/design/human-interface-guidelines/remotes
+    buttons[@"up"] = @(XCUIRemoteButtonUp);                     // 0
+    buttons[@"down"] = @(XCUIRemoteButtonDown);                 // 1
+    buttons[@"left"] = @(XCUIRemoteButtonLeft);                 // 2
+    buttons[@"right"] = @(XCUIRemoteButtonRight);               // 3
+    buttons[@"select"] = @(XCUIRemoteButtonSelect);             // 4
+    buttons[@"menu"] = @(XCUIRemoteButtonMenu);                 // 5
+    buttons[@"playpause"] = @(XCUIRemoteButtonPlayPause);       // 6
+    buttons[@"home"] = @(XCUIRemoteButtonHome);                 // 7
+#if __clang_major__ >= 15 // Xcode 15+
+    buttons[@"pageup"] = @(XCUIRemoteButtonPageUp);             // 9
+    buttons[@"pagedown"] = @(XCUIRemoteButtonPageDown);         // 10
+    buttons[@"guide"] = @(XCUIRemoteButtonGuide);               // 11
+#endif
+#if __clang_major__ >= 17 // likely Xcode 16.3+
+    if (@available(tvOS 18.1, *)) {
+      buttons[@"fourcolors"] = @(XCUIRemoteButtonFourColors);   // 12
+      buttons[@"onetwothree"] = @(XCUIRemoteButtonOneTwoThree); // 13
+      buttons[@"tvprovider"] = @(XCUIRemoteButtonTVProvider);   // 14
+    }
+#endif
+    result = [buttons copy];
+  });
+  return result;
+}
+#else
+NSDictionary<NSString *, NSNumber *> *fb_availableButtonNames(void) {
+  static dispatch_once_t onceToken;
+  static NSDictionary *result;
+  dispatch_once(&onceToken, ^{
+    NSMutableDictionary *buttons = [NSMutableDictionary dictionary];
+    buttons[@"home"] = @(XCUIDeviceButtonHome);             // 1
+#if !TARGET_OS_SIMULATOR
+    buttons[@"volumeup"] = @(XCUIDeviceButtonVolumeUp);     // 2
+    buttons[@"volumedown"] = @(XCUIDeviceButtonVolumeDown); // 3
+#endif
+    if (@available(iOS 16.0, watchOS 9.0, *)) {
+#if __clang_major__ >= 15 // likely Xcode 15+
+      if ([XCUIDevice.sharedDevice hasHardwareButton:XCUIDeviceButtonAction]) {
+        buttons[@"action"] = @(XCUIDeviceButtonAction);     // 4
+      }
+#endif
+#if (!TARGET_OS_SIMULATOR && !TARGET_OS_WATCH && __clang_major__ >= 16) // likely Xcode 16+; camera button does not exist on watchOS
+      if ([XCUIDevice.sharedDevice hasHardwareButton:XCUIDeviceButtonCamera]) {
+        buttons[@"camera"] = @(XCUIDeviceButtonCamera);
+      }
+#endif
+    }
+    result = [buttons copy];
+  });
+  return result;
+}
+#endif
+
+#if TARGET_OS_WATCH
+// Raw values from XCUIDeviceHandGesture (XCUIAutomation/XCUIDeviceHandGesture.h): doubleTap = 1, flick = 2.
+// Referenced by raw integer rather than the enum constant, and invoked via NSInvocation in
+// fb_performHandGesture:error: below, since that enum/selector was only added to the SDK in Xcode 16.3
+// (flick specifically needs watchOS 12.0/26 - see the @available check below). This way the code compiles
+// against any Xcode version; unsupported gestures/selectors are only rejected at runtime.
+NSDictionary<NSString *, NSNumber *> *fb_availableHandGestureNames(void) {
+  static dispatch_once_t onceToken;
+  static NSDictionary *result;
+  dispatch_once(&onceToken, ^{
+    NSMutableDictionary *gestures = [NSMutableDictionary dictionary];
+    gestures[@"doubletap"] = @(1);
+    if (@available(watchOS 12.0, *)) {
+      gestures[@"flick"] = @(2);
+    }
+    result = [gestures copy];
+  });
+  return result;
+}
+#endif // TARGET_OS_WATCH
+
 @implementation XCUIDevice (FBHelpers)
 
 static bool fb_isLocked;
@@ -63,7 +144,21 @@ static bool fb_isLocked;
   if (fb_isLocked) {
     return YES;
   }
+#if TARGET_OS_SIMULATOR
   [self pressLockButton];
+#else
+  if (SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"27.0")) {
+    // iOS 27: pressLockButton no longer locks; use a direct IOHID Power press (0x0C/0x30, ~0.5s hold).
+    if (![self fb_performIOHIDEventWithPage:0x0C
+                                      usage:0x30
+                                   duration:0.5
+                                      error:error]) {
+      return NO;
+    }
+  } else {
+    [self pressLockButton];
+  }
+#endif
   return [[[[FBRunLoopSpinner new]
             timeout:FBScreenLockTimeout]
            timeoutErrorMessage:@"Timed out while waiting until the screen gets locked"]
@@ -100,7 +195,7 @@ static bool fb_isLocked;
 
 - (NSData *)fb_screenshotWithError:(NSError*__autoreleasing*)error
 {
-  return [FBScreenshot takeInOriginalResolutionWithQuality:FBConfiguration.screenshotQuality
+  return [FBScreenshot takeInOriginalResolutionWithQuality:FBConfiguration.sharedInstance.screenshotQuality
                                                      error:error];
 }
 
@@ -169,10 +264,10 @@ static bool fb_isLocked;
     return [self fb_activateSiriVoiceRecognitionWithText:[NSString stringWithFormat:@"Open {%@}", url] error:error];
   }
 
-  NSString *description = [NSString stringWithFormat:@"Cannot open '%@' with the default application assigned for it. Consider upgrading to Xcode 14.3+/iOS 16.4+", url];
+  NSString *description = [NSString stringWithFormat:@"Cannot open '%@' with the default application assigned for it. This API requires an iOS 16.4+ runtime", url];
   return [[[FBErrorBuilder builder]
            withDescriptionFormat:@"%@", description]
-          buildError:error];;
+          buildError:error];
 }
 
 - (BOOL)fb_openUrl:(NSString *)url withApplication:(NSString *)bundleId error:(NSError **)error
@@ -210,6 +305,11 @@ static bool fb_isLocked;
   }
 }
 
+- (BOOL)fb_hasButton:(NSString *)buttonName
+{
+  return fb_availableButtonNames()[buttonName.lowercaseString] != nil;
+}
+
 - (BOOL)fb_pressButton:(NSString *)buttonName
            forDuration:(nullable NSNumber *)duration
                  error:(NSError **)error
@@ -217,71 +317,23 @@ static bool fb_isLocked;
 #if !TARGET_OS_TV
   return [self fb_pressButton:buttonName error:error];
 #else
-  NSMutableArray<NSString *> *supportedButtonNames = [NSMutableArray array];
-  NSInteger remoteButton = -1; // no remote button
-  if ([buttonName.lowercaseString isEqualToString:@"home"]) {
-    //  XCUIRemoteButtonHome        = 7
-    remoteButton = XCUIRemoteButtonHome;
-  }
-  [supportedButtonNames addObject:@"home"];
 
-  // https://developer.apple.com/design/human-interface-guidelines/tvos/remote-and-controllers/remote/
-  if ([buttonName.lowercaseString isEqualToString:@"up"]) {
-    //  XCUIRemoteButtonUp          = 0,
-    remoteButton = XCUIRemoteButtonUp;
-  }
-  [supportedButtonNames addObject:@"up"];
-
-  if ([buttonName.lowercaseString isEqualToString:@"down"]) {
-    //  XCUIRemoteButtonDown        = 1,
-    remoteButton = XCUIRemoteButtonDown;
-  }
-  [supportedButtonNames addObject:@"down"];
-
-  if ([buttonName.lowercaseString isEqualToString:@"left"]) {
-    //  XCUIRemoteButtonLeft        = 2,
-    remoteButton = XCUIRemoteButtonLeft;
-  }
-  [supportedButtonNames addObject:@"left"];
-
-  if ([buttonName.lowercaseString isEqualToString:@"right"]) {
-    //  XCUIRemoteButtonRight       = 3,
-    remoteButton = XCUIRemoteButtonRight;
-  }
-  [supportedButtonNames addObject:@"right"];
-
-  if ([buttonName.lowercaseString isEqualToString:@"menu"]) {
-    //  XCUIRemoteButtonMenu        = 5,
-    remoteButton = XCUIRemoteButtonMenu;
-  }
-  [supportedButtonNames addObject:@"menu"];
-
-  if ([buttonName.lowercaseString isEqualToString:@"playpause"]) {
-    //  XCUIRemoteButtonPlayPause   = 6,
-    remoteButton = XCUIRemoteButtonPlayPause;
-  }
-  [supportedButtonNames addObject:@"playpause"];
-
-  if ([buttonName.lowercaseString isEqualToString:@"select"]) {
-    //  XCUIRemoteButtonSelect      = 4,
-    remoteButton = XCUIRemoteButtonSelect;
-  }
-  [supportedButtonNames addObject:@"select"];
-
-  if (remoteButton == -1) {
+  NSDictionary<NSString *, NSNumber *> *availableButtons = fb_availableButtonNames();
+  NSNumber *buttonValue = availableButtons[buttonName.lowercaseString];
+  
+  if (!buttonValue) {
+    NSArray *sortedKeys = [availableButtons.allKeys sortedArrayUsingSelector:@selector(compare:)];
     return [[[FBErrorBuilder builder]
-             withDescriptionFormat:@"The button '%@' is unknown. Only the following button names are supported: %@", buttonName, supportedButtonNames]
+             withDescriptionFormat:@"The button '%@' is not supported. The device under test only supports the following buttons: %@", buttonName, sortedKeys]
             buildError:error];
   }
-
   if (duration) {
-    // https://developer.apple.com/documentation/xctest/xcuiremote/1627475-pressbutton
-    [[XCUIRemote sharedRemote] pressButton:remoteButton forDuration:duration.doubleValue];
+    // https://developer.apple.com/documentation/xcuiautomation/xcuiremote/press(_:forduration:)
+    [[XCUIRemote sharedRemote] pressButton:(XCUIRemoteButton)[buttonValue unsignedIntegerValue] forDuration:duration.doubleValue];
   } else {
-    // https://developer.apple.com/documentation/xctest/xcuiremote/1627476-pressbutton
-    [[XCUIRemote sharedRemote] pressButton:remoteButton];
+    // https://developer.apple.com/documentation/xcuiautomation/xcuiremote/press(_:)
+    [[XCUIRemote sharedRemote] pressButton:(XCUIRemoteButton)[buttonValue unsignedIntegerValue]];
   }
-
   return YES;
 #endif
 }
@@ -290,29 +342,16 @@ static bool fb_isLocked;
 - (BOOL)fb_pressButton:(NSString *)buttonName
                  error:(NSError **)error
 {
-  NSMutableArray<NSString *> *supportedButtonNames = [NSMutableArray array];
-  XCUIDeviceButton dstButton = 0;
-  if ([buttonName.lowercaseString isEqualToString:@"home"]) {
-    dstButton = XCUIDeviceButtonHome;
-  }
-  [supportedButtonNames addObject:@"home"];
-#if !TARGET_OS_SIMULATOR
-  if ([buttonName.lowercaseString isEqualToString:@"volumeup"]) {
-    dstButton = XCUIDeviceButtonVolumeUp;
-  }
-  if ([buttonName.lowercaseString isEqualToString:@"volumedown"]) {
-    dstButton = XCUIDeviceButtonVolumeDown;
-  }
-  [supportedButtonNames addObject:@"volumeUp"];
-  [supportedButtonNames addObject:@"volumeDown"];
-#endif
-
-  if (dstButton == 0) {
+  NSDictionary<NSString *, NSNumber *> *availableButtons = fb_availableButtonNames();
+  NSNumber *buttonValue = availableButtons[buttonName.lowercaseString];
+  
+  if (!buttonValue) {
+    NSArray *sortedKeys = [availableButtons.allKeys sortedArrayUsingSelector:@selector(compare:)];
     return [[[FBErrorBuilder builder]
-             withDescriptionFormat:@"The button '%@' is unknown. Only the following button names are supported: %@", buttonName, supportedButtonNames]
+             withDescriptionFormat:@"The button '%@' is not supported. The device under test only supports the following buttons: %@", buttonName, sortedKeys]
             buildError:error];
   }
-  [self pressButton:dstButton];
+  [self pressButton:(XCUIDeviceButton)[buttonValue unsignedIntegerValue]];
   return YES;
 }
 #endif
@@ -339,9 +378,9 @@ static bool fb_isLocked;
     return YES;
   }
 
-#if __clang_major__ >= 15 || (__clang_major__ >= 14 && __clang_minor__ >= 0 && __clang_patchlevel__ >= 3)
+#if !TARGET_OS_WATCH && (__clang_major__ >= 15 || (__clang_major__ >= 14 && __clang_minor__ >= 0 && __clang_patchlevel__ >= 3))
   // Xcode 14.3.1 can build these values.
-  // For iOS 17+
+  // For iOS 17+; the `appearance` property does not exist on watchOS
   if ([self respondsToSelector:NSSelectorFromString(@"appearance")]) {
     self.appearance = (XCUIDeviceAppearance) appearance;
     return YES;
@@ -367,6 +406,57 @@ static bool fb_isLocked;
   ? [NSNumber numberWithLongLong:[self appearanceMode]]
   : nil;
 }
+
+#if TARGET_OS_WATCH
+- (BOOL)fb_rotateDigitalCrown:(double)delta velocity:(nullable NSNumber *)velocity error:(NSError **)error
+{
+  SEL selector = nil == velocity
+    ? NSSelectorFromString(@"rotateDigitalCrownByDelta:")
+    : NSSelectorFromString(@"rotateDigitalCrownByDelta:withVelocity:");
+  if (nil == selector || ![self respondsToSelector:selector]) {
+    return [[[FBErrorBuilder builder]
+             withDescriptionFormat:@"Digital Crown rotation is not supported by the current Xcode SDK/OS combination"]
+            buildError:error];
+  }
+  NSMethodSignature *signature = [self methodSignatureForSelector:selector];
+  NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+  [invocation setSelector:selector];
+  [invocation setTarget:self];
+  [invocation setArgument:&delta atIndex:2];
+  if (velocity) {
+    double velocityValue = velocity.doubleValue;
+    [invocation setArgument:&velocityValue atIndex:3];
+  }
+  [invocation invoke];
+  return YES;
+}
+
+- (BOOL)fb_performHandGesture:(NSString *)gestureName error:(NSError **)error
+{
+  NSDictionary<NSString *, NSNumber *> *availableGestures = fb_availableHandGestureNames();
+  NSNumber *gestureValue = availableGestures[gestureName.lowercaseString];
+  if (!gestureValue) {
+    NSArray *sortedKeys = [availableGestures.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    return [[[FBErrorBuilder builder]
+             withDescriptionFormat:@"The hand gesture '%@' is not supported. The device under test only supports the following hand gestures: %@", gestureName, sortedKeys]
+            buildError:error];
+  }
+  SEL selector = NSSelectorFromString(@"performHandGesture:");
+  if (nil == selector || ![self respondsToSelector:selector]) {
+    return [[[FBErrorBuilder builder]
+             withDescriptionFormat:@"Hand gesture automation is not supported by the current Xcode SDK/OS combination"]
+            buildError:error];
+  }
+  NSMethodSignature *signature = [self methodSignatureForSelector:selector];
+  NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+  [invocation setSelector:selector];
+  [invocation setTarget:self];
+  NSInteger gestureRawValue = gestureValue.integerValue;
+  [invocation setArgument:&gestureRawValue atIndex:2];
+  [invocation invoke];
+  return YES;
+}
+#endif // TARGET_OS_WATCH
 
 #if !TARGET_OS_TV
 - (BOOL)fb_setSimulatedLocation:(CLLocation *)location error:(NSError **)error

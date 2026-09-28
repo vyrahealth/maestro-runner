@@ -13,6 +13,16 @@ NS_ASSUME_NONNULL_BEGIN
 @interface FBScreen : NSObject
 
 /**
+ Information about all displays available to the device
+ */
++ (nullable NSArray<NSDictionary<NSString *, id> *> *)screensWithError:(NSError **)error;
+
+/**
+ The identifier of the main device's display
+ */
++ (long long)displayID;
+
+/**
  The scale factor of the main device's screen
  */
 + (double)scale;

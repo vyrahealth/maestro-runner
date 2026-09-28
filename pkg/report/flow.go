@@ -1,6 +1,7 @@
 package report
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -199,7 +200,15 @@ func (w *FlowWriter) SaveNamedScreenshot(cmdIndex int, name string, data []byte)
 
 // SaveViewHierarchy saves view hierarchy and returns the relative path.
 func (w *FlowWriter) SaveViewHierarchy(cmdIndex int, data []byte) (string, error) {
-	filename := fmt.Sprintf("cmd-%03d-hierarchy.xml", cmdIndex)
+	// Pick the extension from the content: the uiautomator2 / wda / appium page
+	// source is XML, but the devicelab_ios driver returns a JSON snapshot. A
+	// `.xml` file holding JSON confuses editors and any tooling that reads the
+	// report by extension.
+	ext := "xml"
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		ext = "json"
+	}
+	filename := fmt.Sprintf("cmd-%03d-hierarchy.%s", cmdIndex, ext)
 	absPath := filepath.Join(w.assetsDir, filename)
 
 	if err := os.WriteFile(absPath, data, 0o644); err != nil {
@@ -207,6 +216,42 @@ func (w *FlowWriter) SaveViewHierarchy(cmdIndex int, data []byte) (string, error
 	}
 
 	return filepath.Join("assets", w.flow.ID, filename), nil
+}
+
+// SaveNestedScreenshot saves the after-screenshot for a failed nested step
+// (inside runFlow / repeat / retry). Nested steps have no top-level command
+// index, so these use a `nested-NNN` sequence that cannot collide with the
+// `cmd-NNN` names top-level steps use.
+func (w *FlowWriter) SaveNestedScreenshot(seq int, data []byte) (string, error) {
+	filename := fmt.Sprintf("nested-%03d-after.png", seq)
+	if err := os.WriteFile(filepath.Join(w.assetsDir, filename), data, 0o644); err != nil {
+		return "", err
+	}
+	return filepath.Join("assets", w.flow.ID, filename), nil
+}
+
+// SaveNestedHierarchy saves the view hierarchy for a failed nested step, with
+// the extension picked from the content (XML page source vs JSON snapshot),
+// same as SaveViewHierarchy.
+func (w *FlowWriter) SaveNestedHierarchy(seq int, data []byte) (string, error) {
+	ext := "xml"
+	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+		ext = "json"
+	}
+	filename := fmt.Sprintf("nested-%03d-hierarchy.%s", seq, ext)
+	if err := os.WriteFile(filepath.Join(w.assetsDir, filename), data, 0o644); err != nil {
+		return "", err
+	}
+	return filepath.Join("assets", w.flow.ID, filename), nil
+}
+
+// ScreenshotDiffPath returns the absolute and report-relative paths for an
+// assertScreenshot comparison diff. It lives in the report's assets, keyed by
+// command index, so the diff travels with the report instead of being written
+// beside the reference image outside it (upstream #3572 / #3484).
+func (w *FlowWriter) ScreenshotDiffPath(cmdIndex int) (absPath, relPath string) {
+	filename := fmt.Sprintf("cmd-%03d-diff.png", cmdIndex)
+	return filepath.Join(w.assetsDir, filename), filepath.Join("assets", w.flow.ID, filename)
 }
 
 // RecordingTarget returns the absolute path a flow screen recording should be

@@ -314,7 +314,9 @@ func TestGenerateJUnitWithFailedFlows(t *testing.T) {
 
 	checks := []string{
 		`failures="1"`,
-		`<failure message="Element not found" type="AssertionError">Verify checkout button</failure>`,
+		// Drop-in with Maestro: the real error is in the body, not just the
+		// message attribute (a step description used to sit here).
+		`<failure message="Element not found" type="AssertionError">Element not found</failure>`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(xml, check) {
@@ -481,7 +483,7 @@ func TestGenerateJUnitMixedResults(t *testing.T) {
 		`<testcase name="Login"`,
 		`<testcase name="Checkout"`,
 		`<testcase name="Settings"`,
-		`<failure message="Tap failed" type="ElementInteractionError">tapOn</failure>`,
+		`<failure message="Tap failed" type="ElementInteractionError">Tap failed</failure>`,
 		`<skipped/>`,
 	}
 	for _, check := range checks {
@@ -787,4 +789,50 @@ func TestJUnit_CustomPropertiesAndAttachments(t *testing.T) {
 	if strings.Count(xml, "[[ATTACHMENT|") != 2 {
 		t.Errorf("expected exactly 2 attachments, got:\n%s", xml)
 	}
+}
+
+// TestJUnitFailureErrorInBothMessageAndBody locks in the drop-in behavior:
+// the real error must appear in BOTH the <failure> message attribute and the
+// element body (Maestro puts it in the body; parsers written against Maestro
+// read the body). When no command-level error is captured, the body falls
+// back to the step description so it is never empty.
+func TestJUnitFailureErrorInBothMessageAndBody(t *testing.T) {
+	d := int64(10)
+	mkIndex := func(err *string) *Index {
+		return &Index{
+			MaestroRunner: RunnerInfo{Version: "0.1.0", Driver: "uiautomator2"},
+			Summary:       Summary{Total: 1, Failed: 1},
+			Flows: []FlowEntry{{
+				Index: 0, ID: "flow-000", Name: "Checkout",
+				Status: StatusFailed, Duration: &d, Error: err,
+				Commands: CommandSummary{Total: 1, Failed: 1},
+			}},
+		}
+	}
+	flows := []FlowDetail{{
+		ID: "flow-000", Name: "Checkout", Duration: &d,
+		Commands: []Command{{
+			ID: "cmd-000", Type: "assertVisible", Label: "Verify checkout button",
+			Status: StatusFailed, Duration: &d,
+			Error: &Error{Type: "element_not_found", Message: "Element not found"},
+		}},
+	}}
+
+	t.Run("error is in both the attribute and the body", func(t *testing.T) {
+		errMsg := "Element not found: text=Login"
+		xml := buildJUnitXML(mkIndex(&errMsg), flows)
+		if !strings.Contains(xml, `message="Element not found: text=Login"`) {
+			t.Errorf("error missing from message attribute:\n%s", xml)
+		}
+		if !strings.Contains(xml, `>Element not found: text=Login</failure>`) {
+			t.Errorf("error missing from failure body (breaks Maestro-tuned parsers):\n%s", xml)
+		}
+	})
+
+	t.Run("body falls back to step description when no flow error", func(t *testing.T) {
+		xml := buildJUnitXML(mkIndex(nil), flows)
+		if !strings.Contains(xml, `>Verify checkout button</failure>`) {
+			t.Errorf("body should fall back to the step description:\n%s", xml)
+		}
+	})
 }

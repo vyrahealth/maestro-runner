@@ -7,6 +7,7 @@
  */
 
 #import "ViewController.h"
+#import "FBCoordinateProbeViewController.h"
 
 @interface ViewController ()
 @property (weak, nonatomic) IBOutlet UILabel *orentationLabel;
@@ -30,6 +31,11 @@
   self.button.accessibilityCustomActions = @[action1, action2];
 }
 
+- (IBAction)showCoordinateProbe:(id)sender
+{
+  [self.navigationController pushViewController:[FBCoordinateProbeViewController new] animated:NO];
+}
+
 - (BOOL)handleCustomAction:(UIAccessibilityCustomAction *)action
 {
   // Custom action handler - just return YES to indicate success
@@ -38,14 +44,49 @@
 
 - (IBAction)deadlockApp:(id)sender
 {
-  dispatch_sync(dispatch_get_main_queue(), ^{
-    // This will never execute
-  });
+  // A self dispatch_sync would trip the OS watchdog and get the process
+  // killed outright. Sleeping instead simulates an app that stops answering
+  // accessibility requests while staying alive, per #1210.
+  [NSThread sleepForTimeInterval:20.0];
 }
 
 - (IBAction)didTapButton:(UIButton *)button
 {
   button.selected = !button.selected;
+}
+
+- (IBAction)goToDeepHierarchy:(id)sender
+{
+  // Plain UIViews with fixed frames only - no Auto Layout constraints and no
+  // specialized subclasses (e.g. UITextView) that carry their own layout/text
+  // engines, which can make a deep nested chain pathologically expensive to
+  // lay out. This page exists purely as a fixture for exercising element
+  // lookups (e.g. class chain locators) against a deep accessibility tree.
+  UIViewController *deepHierarchyViewController = [UIViewController new];
+  deepHierarchyViewController.view.backgroundColor = UIColor.systemBackgroundColor;
+  deepHierarchyViewController.view.accessibilityIdentifier = @"DeepHierarchyPage";
+
+  NSInteger depth = 70;
+  // A plain UILabel sibling, not part of the nested chain below, so the
+  // fixture stays recognizable to a human glancing at the simulator instead
+  // of showing a blank screen.
+  UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 60, CGRectGetWidth(UIScreen.mainScreen.bounds) - 40, 60)];
+  titleLabel.text = [NSString stringWithFormat:@"Deep Hierarchy\n%ld nested elements", (long)depth];
+  titleLabel.numberOfLines = 2;
+  titleLabel.textAlignment = NSTextAlignmentCenter;
+  titleLabel.font = [UIFont systemFontOfSize:20];
+  [deepHierarchyViewController.view addSubview:titleLabel];
+
+  UIView *parent = deepHierarchyViewController.view;
+  for (NSInteger i = 0; i < depth; i++) {
+    UIView *view = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+    view.accessibilityIdentifier = [NSString stringWithFormat:@"view_%ld", (long)i];
+    view.accessibilityLabel = [NSString stringWithFormat:@"View %ld", (long)i];
+    [parent addSubview:view];
+    parent = view;
+  }
+
+  [self.navigationController pushViewController:deepHierarchyViewController animated:NO];
 }
 
 - (void)viewDidLayoutSubviews

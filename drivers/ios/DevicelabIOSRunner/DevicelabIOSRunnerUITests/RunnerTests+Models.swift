@@ -57,6 +57,11 @@ enum CommandType: String, Codable {
   // Local extension: set the device's light/dark appearance. Takes
   // `appearance` as "dark" or "light".
   case setAppearance
+  // Local extension (DeviceDeck): wait, capped by `timeoutMs`, for the
+  // target app to go quiescent including animations — the check XCTest runs
+  // around every synthesized event, on demand. Read-only: it never
+  // activates the app. Returns `idle` and `waitedMs`.
+  case idle
 }
 
 struct Command: Codable {
@@ -102,6 +107,11 @@ struct Command: Codable {
   let mimeType: String?
   let mediaData: String?  // base64-encoded file bytes (addMedia)
   let appearance: String?  // "dark" or "light" (setAppearance)
+  let timeoutMs: Double?  // idle: the cap on the wait; absent = 1000, 0 = do not wait
+  // Local extension (eraseText): with an empty replace, delete this many
+  // characters from the end. Absent, or at least the field's length, clears
+  // the whole field.
+  let deleteCount: Int?
 }
 
 struct Response: Codable {
@@ -156,6 +166,30 @@ struct DataPayload: Codable {
   // this is the app's true state, which no signal in the node tree
   // reports reliably (hittable oscillates while a screen backgrounds).
   let appState: String?
+  // Local extension (DeviceDeck): the outcome of a type command's read-back.
+  // `verified` is true when the field's value read back as expected, false
+  // on a mismatch, and absent (null) when the value could not be read (a
+  // secure field, or an element that no longer resolves) — typing that was
+  // never checked is not reported as checked. `repaired` is true when the
+  // first attempt read back wrong and the runner cleared and retyped the
+  // field; the text on screen then came from the second attempt.
+  let verified: Bool?
+  let repaired: Bool?
+  // Local extension (DeviceDeck): which reader produced a snapshot's nodes —
+  // SnapshotSource.xctest (XCTest's public snapshot) or
+  // SnapshotSource.privateAX (the private accessibility client, used when
+  // the public path failed or came back with only the root on a deep React
+  // Native tree). The two differ in coverage and in how hittable is
+  // computed, so a caller comparing trees across snapshots needs to know.
+  let source: String?
+  // Local extension (DeviceDeck): the idle command's answer. `idle` is true
+  // only when XCTest reported the event loop idle and animations finished
+  // within the cap; false when the cap passed first, when the app is not in
+  // the foreground, when no wait was asked for, or when the quiescence API
+  // is missing — an unknown is never reported as idle. `waitedMs` is the
+  // time actually spent.
+  let idle: Bool?
+  let waitedMs: Double?
 
   init(
     message: String? = nil,
@@ -181,7 +215,12 @@ struct DataPayload: Codable {
     diffFraction: Double? = nil,
     identifier: String? = nil,
     appearance: String? = nil,
-    appState: String? = nil
+    appState: String? = nil,
+    verified: Bool? = nil,
+    repaired: Bool? = nil,
+    source: String? = nil,
+    idle: Bool? = nil,
+    waitedMs: Double? = nil
   ) {
     self.message = message
     self.text = text
@@ -207,7 +246,18 @@ struct DataPayload: Codable {
     self.identifier = identifier
     self.appearance = appearance
     self.appState = appState
+    self.verified = verified
+    self.repaired = repaired
+    self.source = source
+    self.idle = idle
+    self.waitedMs = waitedMs
   }
+}
+
+/// Values of DataPayload.source.
+enum SnapshotSource {
+  static let xctest = "xctest"
+  static let privateAX = "privateAX"
 }
 
 struct ErrorPayload: Codable {
@@ -255,4 +305,7 @@ struct SnapshotOptions {
   let depth: Int?
   let scope: String?
   let raw: Bool
+  /// The caller named no app: the snapshot is of whatever is on screen, so
+  /// it may move to the app in front if the one chosen earlier has left it.
+  var followsScreen = false
 }

@@ -188,6 +188,7 @@ func TestParse_AllStepTypes(t *testing.T) {
 		{"addMedia", `- addMedia: {files: ["img.png"]}`, StepAddMedia},
 		{"pressKey", `- pressKey: ENTER`, StepPressKey},
 		{"waitForAnimationToEnd", `- waitForAnimationToEnd: {}`, StepWaitForAnimationToEnd},
+		{"wait", `- wait: 2000`, StepWait},
 		{"defineVariables", `- defineVariables: {VAR1: value1}`, StepDefineVariables},
 	}
 
@@ -2559,4 +2560,52 @@ func TestParse_SetDarkModeValueKey(t *testing.T) {
 	if _, err := Parse([]byte(`- setDarkMode: {value: dim}`), "t.yaml"); err == nil {
 		t.Error("an unknown value: should be a parse error")
 	}
+}
+
+func TestParse_WaitStep(t *testing.T) {
+	t.Run("scalar milliseconds", func(t *testing.T) {
+		f, err := Parse([]byte(`- wait: 2000`), "test.yaml")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		w, ok := f.Steps[0].(*WaitStep)
+		if !ok {
+			t.Fatalf("expected *WaitStep, got %T", f.Steps[0])
+		}
+		if w.DurationMs != 2000 {
+			t.Errorf("DurationMs = %d, want 2000", w.DurationMs)
+		}
+		if got := w.Describe(); got != "wait: 2000ms" {
+			t.Errorf("Describe = %q, want %q", got, "wait: 2000ms")
+		}
+	})
+
+	t.Run("mapping form with options", func(t *testing.T) {
+		f, err := Parse([]byte(`- wait: {duration: 500, optional: true, label: settle}`), "test.yaml")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		w := f.Steps[0].(*WaitStep)
+		if w.DurationMs != 500 {
+			t.Errorf("DurationMs = %d, want 500", w.DurationMs)
+		}
+		if !w.IsOptional() {
+			t.Error("expected optional")
+		}
+		if w.Label() != "settle" {
+			t.Errorf("Label = %q, want settle", w.Label())
+		}
+	})
+
+	t.Run("non-numeric scalar is a parse error", func(t *testing.T) {
+		if _, err := Parse([]byte(`- wait: soon`), "test.yaml"); err == nil {
+			t.Error("expected a parse error for a non-numeric duration")
+		}
+	})
+
+	t.Run("negative duration is a parse error", func(t *testing.T) {
+		if _, err := Parse([]byte(`- wait: -100`), "test.yaml"); err == nil {
+			t.Error("expected a parse error for a negative duration")
+		}
+	})
 }

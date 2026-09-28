@@ -39,16 +39,28 @@ func TestNewClient(t *testing.T) {
 
 // TestCreateSession tests session creation
 func TestCreateSession(t *testing.T) {
+	var sawSnapshotDepth bool
 	server := mockWDAServer(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || r.URL.Path != "/session" {
-			t.Errorf("Expected POST /session, got %s %s", r.Method, r.URL.Path)
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/session":
+			jsonResponse(w, map[string]interface{}{
+				"value": map[string]interface{}{
+					"sessionId": "test-session-123",
+				},
+			})
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/appium/settings"):
+			// CreateSession raises the snapshot depth cap (#171) — verify it.
+			var body struct {
+				Settings map[string]interface{} `json:"settings"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if _, ok := body.Settings["snapshotMaxDepth"]; ok {
+				sawSnapshotDepth = true
+			}
+			jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{}})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-
-		jsonResponse(w, map[string]interface{}{
-			"value": map[string]interface{}{
-				"sessionId": "test-session-123",
-			},
-		})
 	})
 	defer server.Close()
 
@@ -64,6 +76,9 @@ func TestCreateSession(t *testing.T) {
 
 	if client.sessionID != "test-session-123" {
 		t.Errorf("Expected sessionID 'test-session-123', got '%s'", client.sessionID)
+	}
+	if !sawSnapshotDepth {
+		t.Error("CreateSession should raise snapshotMaxDepth so deep RN trees are not clipped")
 	}
 }
 

@@ -10,6 +10,7 @@
 
 #import "FBAlert.h"
 #import "FBTestMacros.h"
+#import "FBExceptions.h"
 #import "FBIntegrationTestCase.h"
 #import "FBConfiguration.h"
 #import "FBMacros.h"
@@ -26,6 +27,15 @@ NSString *const FBShowSheetAlertButtonName = @"Create Sheet Alert";
 NSString *const FBShowAlertForceTouchButtonName = @"Create Alert (Force Touch)";
 NSString *const FBTouchesCountLabelIdentifier = @"numberOfTouchesLabel";
 NSString *const FBTapsCountLabelIdentifier = @"numberOfTapsLabel";
+NSArray<NSString *> *const FBMainViewButtonLabels = @[
+  @"Alerts",
+  @"Deadlock app",
+  @"Attributes",
+  @"Scrolling",
+  @"Touch",
+  @"DeepHierarchy",
+  @"Coordinate Probe",
+];
 
 @interface FBIntegrationTestCase ()
 @property (nonatomic, strong) XCUIApplication *testedApplication;
@@ -34,16 +44,22 @@ NSString *const FBTapsCountLabelIdentifier = @"numberOfTapsLabel";
 
 @implementation FBIntegrationTestCase
 
++ (BOOL)isRunningInCI
+{
+  NSString *value = NSProcessInfo.processInfo.environment[@"CI"];
+  return nil != value && value.length > 0;
+}
+
 - (void)setUp
 {
   // Enable it to get extended XCTest logs printed into the console
-  // [FBConfiguration enableXcTestDebugLogs];
+  // [FBConfiguration.sharedInstance enableXcTestDebugLogs];
   [super setUp];
-  [FBConfiguration disableRemoteQueryEvaluation];
-  [FBConfiguration disableAttributeKeyPathAnalysis];
-  [FBConfiguration configureDefaultKeyboardPreferences];
-  [FBConfiguration disableApplicationUIInterruptionsHandling];
-  [FBConfiguration disableScreenshots];
+  [FBConfiguration.sharedInstance disableRemoteQueryEvaluation];
+  [FBConfiguration.sharedInstance disableAttributeKeyPathAnalysis];
+  [FBConfiguration.sharedInstance configureDefaultKeyboardPreferences];
+  [FBConfiguration.sharedInstance disableApplicationUIInterruptionsHandling];
+  [FBConfiguration.sharedInstance disableScreenshots];
   self.continueAfterFailure = NO;
   self.springboard = XCUIApplication.fb_systemApplication;
   self.testedApplication = [XCUIApplication new];
@@ -96,14 +112,6 @@ NSString *const FBTapsCountLabelIdentifier = @"numberOfTapsLabel";
   FBAssertWaitTillBecomesTrue(XCUIApplication.fb_systemApplication.icons[@"Calendar"].firstMatch.fb_isVisible);
 }
 
-- (void)goToSpringBoardExtras
-{
-  [self goToSpringBoardFirstPage];
-  [self.springboard swipeLeft];
-  [self.testedApplication fb_waitUntilStable];
-  FBAssertWaitTillBecomesTrue(self.springboard.icons[@"Extras"].fb_isVisible);
-}
-
 - (void)goToSpringBoardDashboard
 {
   [self goToSpringBoardFirstPage];
@@ -129,12 +137,40 @@ NSString *const FBTapsCountLabelIdentifier = @"numberOfTapsLabel";
   FBAssertWaitTillBecomesTrue(self.testedApplication.staticTexts[@"3"].fb_isVisible);
 }
 
+- (void)goToDeepHierarchyPage
+{
+  [self.testedApplication.buttons[@"DeepHierarchy"] tap];
+  [self.testedApplication fb_waitUntilStable];
+  // Not fb_isVisible: that runs a native visibility computation which is
+  // pathologically slow to resolve for a view nested 70 levels deep at a
+  // 1x1 frame. Existence in the accessibility tree is all this fixture
+  // actually needs to confirm navigation succeeded.
+  FBAssertWaitTillBecomesTrue(self.testedApplication.otherElements[@"view_0"].exists);
+}
+
 - (void)clearAlert
 {
   [self.testedApplication fb_waitUntilStable];
-  [[FBAlert alertWithApplication:self.testedApplication] dismissWithError:nil];
+  @try {
+    [[FBAlert alertWithApplication:self.testedApplication] dismiss];
+  } @catch (NSException *e) {
+    if (![e.name isEqualToString:FBAlertNotPresentException]) {
+      @throw e;
+    }
+    // No alert is present, nothing to clear
+  }
   [self.testedApplication fb_waitUntilStable];
   FBAssertWaitTillBecomesTrue(self.testedApplication.alerts.count == 0);
+}
+
+- (void)skipUnlessWindowSizeMismatchesDevice
+{
+  CGSize appSize = self.testedApplication.frame.size;
+  CGSize deviceSize = self.springboard.frame.size;
+  if (fabs(appSize.width - deviceSize.width) < 1 && fabs(appSize.height - deviceSize.height) < 1) {
+    XCTSkip(@"App window size matches SpringBoard's on this build/device, so it does not "
+            "reproduce the compatibility-mode mismatch from appium/appium#16185");
+  }
 }
 
 @end

@@ -69,6 +69,11 @@ const (
 	// so these are what make dark mode work on physical devices.
 	CmdAppearance    CommandType = "appearance"
 	CmdSetAppearance CommandType = "setAppearance"
+	// CmdIdle — local extension: wait, capped by Command.TimeoutMs, for the
+	// target app to go quiescent including animations (XCTest's own
+	// pre/post-event check, run on demand). Read-only: the runner never
+	// activates the app for it. Answers ResponseData.Idle and WaitedMs.
+	CmdIdle CommandType = "idle"
 )
 
 // Command is the wire request envelope. Mirrors the Swift Command struct
@@ -116,6 +121,10 @@ type Command struct {
 	Raw             *bool    `json:"raw,omitempty"`
 	Fullscreen      *bool    `json:"fullscreen,omitempty"`
 	Appearance      string   `json:"appearance,omitempty"` // "dark" or "light" (setAppearance)
+	// TimeoutMs — idle only: the cap on the wait. A pointer so an explicit 0
+	// ("answer now, do not wait") reaches the runner; nil means its default
+	// of 1000ms. The runner clamps it to 10000ms.
+	TimeoutMs *float64 `json:"timeoutMs,omitempty"`
 }
 
 // Response is the wire response envelope. The runner returns one of these
@@ -167,7 +176,40 @@ type ResponseData struct {
 	// oscillates while a screen animates into the background — so a caller
 	// that needs to know the app is frontmost reads this, not the tree.
 	AppState string `json:"appState,omitempty"`
+	// Verified — type only: the runner's read-back of the field. true means
+	// the value read back as typed, false means it did not (the call then
+	// also fails with TEXT_ENTRY_MISMATCH, and this data still comes back
+	// with the error). nil means the value could not be read (a secure
+	// field, an element that no longer resolves), so the text was typed but
+	// never checked — callers must not treat nil as success-verified.
+	Verified *bool `json:"verified,omitempty"`
+	// Repaired — type only: true when the first attempt read back wrong and
+	// the runner cleared the field and typed again. A runner that predates
+	// the field omits it (nil) on every response.
+	Repaired *bool `json:"repaired,omitempty"`
+	// Source — snapshot only: which reader produced Nodes, SnapshotSourceXCTest
+	// or SnapshotSourcePrivateAX. The private accessibility reader is the
+	// fallback for trees the public API cannot serialize (deep React Native
+	// screens); it covers more of the tree and computes hittable from geometry
+	// alone, so two snapshots from different sources are not comparable node
+	// for node. Empty from a runner that predates the field.
+	Source string `json:"source,omitempty"`
+	// Idle — idle only: true only when XCTest saw the app's event loop idle
+	// and its animations finish within the cap. false when the cap passed
+	// first, the app is not in the foreground, TimeoutMs was 0, or the
+	// runner's quiescence API is missing (Message says which). An unknown is
+	// never reported as idle.
+	Idle *bool `json:"idle,omitempty"`
+	// WaitedMs — idle only: how long the runner actually waited. It can
+	// exceed the cap when XCTest spindumps an app that failed to go idle.
+	WaitedMs *float64 `json:"waitedMs,omitempty"`
 }
+
+// Values of ResponseData.Source.
+const (
+	SnapshotSourceXCTest    = "xctest"
+	SnapshotSourcePrivateAX = "privateAX"
+)
 
 // SnapshotNode mirrors the Swift wire model. Tree is reconstructed by
 // reading ParentIndex back-references; the runner sends a flat slice.
@@ -212,4 +254,24 @@ const (
 	ErrElementNotFound      = "ELEMENT_NOT_FOUND"
 	ErrAmbiguousMatch       = "AMBIGUOUS_MATCH"
 	ErrTextEntryMismatch    = "TEXT_ENTRY_MISMATCH"
+	// ErrSnapshotFailed — no tree could be read (the query failed or timed
+	// out, usually because the app is suspended or busy). The response data
+	// still carries AppState. Older runners answered this case with ok and
+	// an empty node list, indistinguishable from an empty screen.
+	ErrSnapshotFailed = "SNAPSHOT_FAILED"
+	// ErrNoTargetApp — a read-only command (snapshot, idle) named no app and
+	// the runner could not resolve the frontmost one. Older runners launched
+	// their own host app here, covering whatever was on screen.
+	ErrNoTargetApp = "NO_TARGET_APP"
+	// ErrNoTextInput — a replace-mode type (a clear, or eraseText) found no
+	// text input to act on. Older runners sent the message with no code.
+	ErrNoTextInput = "NO_TEXT_INPUT"
 )
+
+// isSnapshotFailure reports whether err is the runner saying it could not
+// read a tree this time. Polling callers treat it like "not there yet" and
+// keep polling; it only becomes the answer once their deadline passes.
+func isSnapshotFailure(err error) bool {
+	re, ok := IsRunnerError(err)
+	return ok && re.Code == ErrSnapshotFailed
+}

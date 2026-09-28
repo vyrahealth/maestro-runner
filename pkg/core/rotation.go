@@ -26,7 +26,6 @@ var currentOrientationRe = regexp.MustCompile(`mCurrentOrientation=(\d)`)
 // says what the display reported so the caller can mention it.
 func WaitForDisplayRotation(shell func(string) (string, error), want int, timeout, interval time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	observed := -1
 	for {
 		out, err := shell("dumpsys display")
 		if err != nil {
@@ -36,7 +35,7 @@ func WaitForDisplayRotation(shell func(string) (string, error), want int, timeou
 		if m == nil {
 			return nil // unobservable on this device; do not hold the flow up
 		}
-		observed, _ = strconv.Atoi(m[1])
+		observed, _ := strconv.Atoi(m[1])
 		if observed == want {
 			return nil
 		}

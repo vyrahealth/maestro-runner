@@ -165,9 +165,14 @@ Examples:
 			Value:   1000,
 			EnvVars: []string{"MAESTRO_CONDITION_TIMEOUT"},
 		},
+		&cli.BoolFlag{
+			Name:    "insecure",
+			Usage:   "Skip TLS certificate verification for runScript http.* calls (self-signed endpoints). Override per request with `insecure: true`.",
+			EnvVars: []string{"MAESTRO_INSECURE"},
+		},
 		&cli.IntFlag{
 			Name:    "typing-frequency",
-			Usage:   "WDA typing speed in keys/sec (default 30). Lower values help React Native apps.",
+			Usage:   "Typing speed in keys/sec (default 30). Lower values help apps that drop fast key events. Applies to WDA and the DeviceLab iOS driver (all typing) and to keyPress-mode inputText on uiautomator2; the default DeviceLab Android driver types through its agent and is unaffected.",
 			Value:   30,
 			EnvVars: []string{"MAESTRO_TYPING_FREQUENCY"},
 		},
@@ -274,8 +279,10 @@ func resolveDriverName(cfg *RunConfig, platform string) string {
 	case "mock":
 		driverName = "mock"
 	default: // android or empty
-		if driverName == "" || driverName == "uiautomator2" {
-			driverName = "uiautomator2"
+		// Unset means the Android default, which is devicelab. An explicit
+		// --driver uiautomator2 is reported as uiautomator2.
+		if driverName == "" {
+			driverName = "devicelab"
 		}
 	}
 	return driverName
@@ -518,11 +525,12 @@ type RunConfig struct {
 	WindowSize  string // Browser viewport as WxH (web only, empty = 1280x800)
 
 	// Device
-	Platform string
-	Devices  []string // Device UDIDs (can be comma-separated or multiple from --parallel)
-	Verbose  bool
-	AppFile  string // App binary to install before testing
-	AppID    string // App bundle ID or package name
+	Platform      string
+	Devices       []string // Device UDIDs (can be comma-separated or multiple from --parallel)
+	Verbose       bool
+	AppFile       string // App binary to install before testing (a local path or an http(s) URL)
+	AppFileSHA256 string // Optional expected SHA-256 of a downloaded --app-file (hex); verified after download
+	AppID         string // App bundle ID or package name
 
 	// Driver
 	Driver    string // uiautomator2, appium
@@ -543,6 +551,7 @@ type RunConfig struct {
 	// Driver settings
 	WaitForIdleTimeout int    // Wait for device idle in ms (0 = disabled, default 200)
 	ConditionTimeout   int    // Default timeout (ms) for when:/while: condition checks (default 1000)
+	Insecure           bool   // Skip TLS verification for runScript http.* (--insecure)
 	StepDelay          int    // Pause between top-level steps in ms (0 = none)
 	TypingFrequency    int    // WDA typing frequency in keys/sec (0 = use WDA default of 60)
 	TeamID             string // Apple Development Team ID for WDA code signing
@@ -761,6 +770,7 @@ func runTest(c *cli.Context) error {
 		Devices:            parseDevices(getString("device")),
 		Verbose:            getBool("verbose"),
 		AppFile:            getString("app-file"),
+		AppFileSHA256:      getString("app-file-sha256"),
 		AppID:              appID,
 		Driver:             getString("driver"),
 		AppiumURL:          getString("appium-url"),
@@ -770,6 +780,7 @@ func runTest(c *cli.Context) error {
 		NewCommandTimeout:  getInt("new-command-timeout"),
 		WaitForIdleTimeout: getInt("wait-for-idle-timeout"),
 		ConditionTimeout:   getInt("condition-timeout"),
+		Insecure:           getBool("insecure"),
 		StepDelay:          getInt("step-delay"),
 		TypingFrequency:    getInt("typing-frequency"),
 		TeamID:             getString("team-id"),
@@ -852,6 +863,14 @@ func executeTest(cfg *RunConfig) error {
 	logger.Info("Output directory: %s", cfg.OutputDir)
 	logger.Info("Platform: %s", cfg.Platform)
 	logger.Info("Driver: %s", cfg.Driver)
+
+	// 2.4. Resolve a remote --app-file to a local cached path before anything
+	// downstream reads it (install, version lookup, Appium caps). After this,
+	// cfg.AppFile is a local path, so the URL — which may be a presigned link
+	// carrying credentials — never reaches those logs.
+	if err := resolveRemoteAppFile(cfg); err != nil {
+		return fmt.Errorf("failed to fetch --app-file: %w", err)
+	}
 
 	// 2.5. Initialize device lifecycle managers
 	emulatorMgr := emulator.NewManager()
@@ -964,9 +983,13 @@ func executeTest(cfg *RunConfig) error {
 		warnIfFlutterDebugBuild(cfg.AppFile)
 	}
 
-	// Extract appId/url from first flow if not in config
-	if cfg.AppID == "" && len(flows) > 0 {
-		cfg.AppID = flows[0].Config.EffectiveAppID()
+	// Extract appId/url from the flows if not in config. Use the first flow
+	// that actually declares one rather than flows[0] alone: a suite can lead
+	// with a flow that carries no appId (a device-setup or shared-steps file),
+	// and the run's appId — used for the app-version lookup and as the default
+	// launchApp target — should still come from the flows that do declare it.
+	if cfg.AppID == "" {
+		cfg.AppID = firstDeclaredAppID(flows)
 	}
 
 	// Expand the resolved appId/url once, here, so every platform sees a
@@ -1191,6 +1214,19 @@ func warnUnsupportedSelectors(flows []flow.Flow, platform string) {
 		}
 		fmt.Println()
 	}
+}
+
+// firstDeclaredAppID returns the appId/url of the first flow that declares one,
+// or "" if none do. A suite can lead with a flow that carries no appId (a
+// device-setup or shared-steps file), so the run's appId is taken from whichever
+// flow declares it rather than from flows[0] alone.
+func firstDeclaredAppID(flows []flow.Flow) string {
+	for _, f := range flows {
+		if id := f.Config.EffectiveAppID(); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // flowsUseClearState checks if any flow uses clearState (standalone or via launchApp).
@@ -1494,6 +1530,7 @@ func executeSingleDevice(cfg *RunConfig, flows []flow.Flow) (*executor.RunResult
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
 		DeviceInfo:         &deviceInfo,
@@ -1546,6 +1583,7 @@ func ExecuteFlowWithDriver(driver core.Driver, cfg *RunConfig, f flow.Flow) (*ex
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
 		DeviceInfo:         &deviceInfo,
@@ -1875,6 +1913,7 @@ func executeAppiumSingleSession(cfg *RunConfig, flows []flow.Flow) (*executor.Ru
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
 		DeviceInfo:         &deviceInfo,
@@ -2766,6 +2805,7 @@ func createParallelRunner(cfg *RunConfig, workers []executor.DeviceWorker, platf
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
 		// Callbacks will be set per-worker in parallel.go with device info

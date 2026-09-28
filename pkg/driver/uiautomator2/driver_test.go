@@ -36,6 +36,7 @@ type MockUIA2Client struct {
 	activeElementFunc  func() (*uiautomator2.Element, error)
 	sourceFunc         func() (string, error)
 	sendKeyActionsFunc func(text string) error
+	lastKeyDelayMs     int
 	screenshotFunc     func() ([]byte, error)
 
 	// Tracking
@@ -147,6 +148,11 @@ func (m *MockUIA2Client) SendKeyActions(text string) error {
 		return m.sendKeyActionsFunc(text)
 	}
 	return nil
+}
+
+func (m *MockUIA2Client) SendKeyActionsWithDelay(text string, perKeyDelayMs int) error {
+	m.lastKeyDelayMs = perKeyDelayMs
+	return m.SendKeyActions(text)
 }
 
 func (m *MockUIA2Client) Screenshot() ([]byte, error) {
@@ -3363,3 +3369,52 @@ func TestSimpleSelectorWithIDAndIndex(t *testing.T) {
 }
 
 // Note: App lifecycle tests are in commands_test.go
+
+// TestSetTypingFrequencyMapsToDelay verifies keys/sec maps to a per-key pause
+// in ms, and that a non-positive frequency clears the delay.
+func TestSetTypingFrequencyMapsToDelay(t *testing.T) {
+	cases := []struct {
+		freq   int
+		wantMs int
+	}{
+		{0, 0},
+		{-5, 0},
+		{30, 33},  // 1000/30
+		{10, 100}, // 1000/10
+	}
+	for _, tc := range cases {
+		d := New(&MockUIA2Client{}, nil, nil)
+		if err := d.SetTypingFrequency(tc.freq); err != nil {
+			t.Fatalf("SetTypingFrequency(%d): %v", tc.freq, err)
+		}
+		if d.typingDelayMs != tc.wantMs {
+			t.Errorf("freq %d: typingDelayMs = %d, want %d", tc.freq, d.typingDelayMs, tc.wantMs)
+		}
+	}
+}
+
+// TestKeyPressAppliesTypingDelay verifies keyPress-mode inputText forwards the
+// configured per-key delay to the client, and that without SetTypingFrequency
+// no delay is applied.
+func TestKeyPressAppliesTypingDelay(t *testing.T) {
+	client := &MockUIA2Client{}
+	d := New(client, nil, nil)
+	_ = d.SetTypingFrequency(20) // 50ms/key
+
+	step := &flow.InputTextStep{Text: "hi", KeyPress: true}
+	if r := d.inputText(step); !r.Success {
+		t.Fatalf("inputText failed: %v", r.Error)
+	}
+	if client.lastKeyDelayMs != 50 {
+		t.Errorf("lastKeyDelayMs = %d, want 50", client.lastKeyDelayMs)
+	}
+
+	client2 := &MockUIA2Client{}
+	d2 := New(client2, nil, nil) // no SetTypingFrequency
+	if r := d2.inputText(&flow.InputTextStep{Text: "hi", KeyPress: true}); !r.Success {
+		t.Fatalf("inputText failed: %v", r.Error)
+	}
+	if client2.lastKeyDelayMs != 0 {
+		t.Errorf("default lastKeyDelayMs = %d, want 0", client2.lastKeyDelayMs)
+	}
+}

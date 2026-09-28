@@ -8,6 +8,9 @@
 
 #import "FBCustomCommands.h"
 
+#if TARGET_OS_WATCH
+@import WatchKit;
+#endif
 #import <XCTest/XCUIDevice.h>
 #import <CoreLocation/CoreLocation.h>
 
@@ -26,6 +29,7 @@
 #import "XCUIApplication.h"
 #import "XCUIApplication+FBHelpers.h"
 #import "XCUIDevice+FBHelpers.h"
+#import "XCUIDevice+FBVoiceOver.h"
 #import "XCUIElement.h"
 #import "XCUIElement+FBIsVisible.h"
 #import "XCUIElementQuery.h"
@@ -49,9 +53,11 @@
     [[FBRoute GET:@"/wda/locked"] respondWithTarget:self action:@selector(handleIsLocked:)],
     [[FBRoute GET:@"/wda/screen"] respondWithTarget:self action:@selector(handleGetScreen:)],
     [[FBRoute GET:@"/wda/screen"].withoutSession respondWithTarget:self action:@selector(handleGetScreen:)],
+    [[FBRoute GET:@"/wda/screens"].standalone respondWithTarget:self action:@selector(handleGetScreens:)],
+    [[FBRoute GET:@"/wda/screens"].withoutSession.standalone respondWithTarget:self action:@selector(handleGetScreens:)],
     [[FBRoute GET:@"/wda/activeAppInfo"] respondWithTarget:self action:@selector(handleActiveAppInfo:)],
     [[FBRoute GET:@"/wda/activeAppInfo"].withoutSession respondWithTarget:self action:@selector(handleActiveAppInfo:)],
-#if !TARGET_OS_TV // tvOS does not provide relevant APIs
+#if !TARGET_OS_TV && !TARGET_OS_WATCH // tvOS/watchOS do not provide relevant APIs
     [[FBRoute POST:@"/wda/setPasteboard"] respondWithTarget:self action:@selector(handleSetPasteboard:)],
     [[FBRoute POST:@"/wda/setPasteboard"].withoutSession respondWithTarget:self action:@selector(handleSetPasteboard:)],
     [[FBRoute POST:@"/wda/getPasteboard"] respondWithTarget:self action:@selector(handleGetPasteboard:)],
@@ -59,6 +65,10 @@
     [[FBRoute GET:@"/wda/batteryInfo"] respondWithTarget:self action:@selector(handleGetBatteryInfo:)],
 #endif
     [[FBRoute POST:@"/wda/pressButton"] respondWithTarget:self action:@selector(handlePressButtonCommand:)],
+#if TARGET_OS_WATCH
+    [[FBRoute POST:@"/wda/rotateDigitalCrown"] respondWithTarget:self action:@selector(handleRotateDigitalCrownCommand:)],
+    [[FBRoute POST:@"/wda/performHandGesture"] respondWithTarget:self action:@selector(handlePerformHandGestureCommand:)],
+#endif
     [[FBRoute POST:@"/wda/performAccessibilityAudit"] respondWithTarget:self action:@selector(handlePerformAccessibilityAudit:)],
     [[FBRoute POST:@"/wda/performIoHidEvent"] respondWithTarget:self action:@selector(handlePeformIOHIDEvent:)],
     [[FBRoute POST:@"/wda/expectNotification"] respondWithTarget:self action:@selector(handleExpectNotification:)],
@@ -71,8 +81,10 @@
     [[FBRoute GET:@"/wda/device/location"] respondWithTarget:self action:@selector(handleGetLocation:)],
     [[FBRoute GET:@"/wda/device/location"].withoutSession respondWithTarget:self action:@selector(handleGetLocation:)],
 #if !TARGET_OS_TV // tvOS does not provide relevant APIs
+#if !TARGET_OS_WATCH
 #if __clang_major__ >= 15
     [[FBRoute POST:@"/wda/element/:uuid/keyboardInput"] respondWithTarget:self action:@selector(handleKeyboardInput:)],
+#endif
 #endif
     [[FBRoute GET:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleGetSimulatedLocation:)],
     [[FBRoute GET:@"/wda/simulatedLocation"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedLocation:)],
@@ -81,6 +93,16 @@
     [[FBRoute DELETE:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleClearSimulatedLocation:)],
     [[FBRoute DELETE:@"/wda/simulatedLocation"].withoutSession respondWithTarget:self action:@selector(handleClearSimulatedLocation:)],
 #endif
+    [[FBRoute POST:@"/wda/voiceOver/enable"] respondWithTarget:self action:@selector(handleVoiceOverEnable:)],
+    [[FBRoute POST:@"/wda/voiceOver/enable"].withoutSession respondWithTarget:self action:@selector(handleVoiceOverEnable:)],
+    [[FBRoute POST:@"/wda/voiceOver/disable"] respondWithTarget:self action:@selector(handleVoiceOverDisable:)],
+    [[FBRoute POST:@"/wda/voiceOver/disable"].withoutSession respondWithTarget:self action:@selector(handleVoiceOverDisable:)],
+    [[FBRoute GET:@"/wda/voiceOver/enabled"] respondWithTarget:self action:@selector(handleVoiceOverEnabled:)],
+    [[FBRoute GET:@"/wda/voiceOver/enabled"].withoutSession respondWithTarget:self action:@selector(handleVoiceOverEnabled:)],
+    [[FBRoute POST:@"/wda/voiceOver/move"] respondWithTarget:self action:@selector(handleVoiceOverMove:)],
+    [[FBRoute POST:@"/wda/voiceOver/move"].withoutSession respondWithTarget:self action:@selector(handleVoiceOverMove:)],
+    [[FBRoute GET:@"/wda/voiceOver/currentSpeech"] respondWithTarget:self action:@selector(handleVoiceOverCurrentSpeech:)],
+    [[FBRoute GET:@"/wda/voiceOver/currentSpeech"].withoutSession respondWithTarget:self action:@selector(handleVoiceOverCurrentSpeech:)],
     [[FBRoute OPTIONS:@"/*"].withoutSession respondWithTarget:self action:@selector(handlePingCommand:)],
   ];
 }
@@ -140,7 +162,7 @@
   XCUIElement *mainStatusBar = app.statusBars.allElementsBoundByIndex.firstObject;
   CGSize statusBarSize = (nil == mainStatusBar) ? CGSizeZero : mainStatusBar.frame.size;
 
-#if TARGET_OS_TV
+#if TARGET_OS_TV || TARGET_OS_WATCH
   CGSize screenSize = app.frame.size;
 #else
   CGSize screenSize = FBAdjustDimensionsForApplication(app.wdFrame.size, app.interfaceOrientation);
@@ -154,8 +176,19 @@
     @"statusBarSize": @{@"width": @(statusBarSize.width),
                         @"height": @(statusBarSize.height),
     },
+    @"displayId": @([FBScreen displayID]),
     @"scale": @([FBScreen scale]),
   });
+}
+
++ (id<FBResponsePayload>)handleGetScreens:(FBRouteRequest *)request
+{
+  NSError *error;
+  NSArray<NSDictionary<NSString *, id> *> *screens = [FBScreen screensWithError:&error];
+  if (nil == screens) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithObject(screens);
 }
 
 + (id<FBResponsePayload>)handleLock:(FBRouteRequest *)request
@@ -185,10 +218,13 @@
 + (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
 {
   XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+  // .identifier can be nil if the app stopped answering accessibility requests
+  // and accessibilityDeadline aborted the underlying snapshot fetch (#1210).
+  NSString *name = app.identifier ?: @"unknown";
   return FBResponseWithObject(@{
     @"pid": @(app.processID),
     @"bundleId": app.bundleID,
-    @"name": app.identifier,
+    @"name": name,
     @"processArguments": [self processArguments:app],
   });
 }
@@ -229,7 +265,7 @@
   };
 }
 
-#if !TARGET_OS_TV
+#if !TARGET_OS_TV && !TARGET_OS_WATCH
 + (id<FBResponsePayload>)handleSetPasteboard:(FBRouteRequest *)request
 {
   NSString *contentType = request.arguments[@"contentType"] ?: @"plaintext";
@@ -253,7 +289,7 @@
   if (nil == result) {
     return FBResponseWithUnknownError(error);
   }
-  return FBResponseWithObject([result base64EncodedStringWithOptions:0]);
+  return FBResponseWithObject([result base64EncodedStringWithOptions:(NSDataBase64EncodingOptions)0]);
 }
 
 + (id<FBResponsePayload>)handleGetBatteryInfo:(FBRouteRequest *)request
@@ -278,6 +314,38 @@
   }
   return FBResponseWithOK();
 }
+
+#if TARGET_OS_WATCH
++ (id<FBResponsePayload>)handleRotateDigitalCrownCommand:(FBRouteRequest *)request
+{
+  NSNumber *delta = request.arguments[@"delta"];
+  if (nil == delta) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'delta' argument is mandatory"
+                                                                         traceback:nil]);
+  }
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_rotateDigitalCrown:delta.doubleValue
+                                              velocity:request.arguments[@"velocity"]
+                                                 error:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handlePerformHandGestureCommand:(FBRouteRequest *)request
+{
+  NSString *gestureName = request.arguments[@"name"];
+  if (nil == gestureName) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'name' argument is mandatory"
+                                                                         traceback:nil]);
+  }
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_performHandGesture:gestureName error:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+#endif
 
 + (id<FBResponsePayload>)handleActivateSiri:(FBRouteRequest *)request
 {
@@ -346,7 +414,9 @@
   [locationManager setDistanceFilter:kCLHeadingFilterNone];
   // Always return the best acurate location data
   [locationManager setDesiredAccuracy:kCLLocationAccuracyBest];
+#if !TARGET_OS_WATCH
   [locationManager setPausesLocationUpdatesAutomatically:NO];
+#endif
   [locationManager startUpdatingLocation];
 
   CLAuthorizationStatus authStatus;
@@ -427,11 +497,17 @@
                                      @{
     @"currentLocale": currentLocale,
     @"timeZone": self.timeZone,
+#if TARGET_OS_WATCH
+    @"name": WKInterfaceDevice.currentDevice.name,
+    @"model": WKInterfaceDevice.currentDevice.model,
+    @"uuid": @"unknown",
+#else
     @"name": UIDevice.currentDevice.name,
     @"model": UIDevice.currentDevice.model,
     @"uuid": [UIDevice.currentDevice.identifierForVendor UUIDString] ?: @"unknown",
     // https://developer.apple.com/documentation/uikit/uiuserinterfaceidiom?language=objc
     @"userInterfaceIdiom": @(UIDevice.currentDevice.userInterfaceIdiom),
+#endif
     @"userInterfaceStyle": self.userInterfaceStyle,
 #if TARGET_OS_SIMULATOR
     @"isSimulator": @(YES),
@@ -462,6 +538,7 @@
   }
 
   static id userInterfaceStyle = nil;
+#if !TARGET_OS_WATCH
   static dispatch_once_t styleOnceToken;
   dispatch_once(&styleOnceToken, ^{
     if ([UITraitCollection respondsToSelector:NSSelectorFromString(@"currentTraitCollection")]) {
@@ -471,6 +548,7 @@
       }
     }
   });
+#endif
 
   if (nil == userInterfaceStyle) {
     return @"unsupported";
@@ -560,7 +638,7 @@
   return FBResponseWithOK();
 }
 
-#if __clang_major__ >= 15
+#if __clang_major__ >= 15 && !TARGET_OS_WATCH
 + (id<FBResponsePayload>)handleKeyboardInput:(FBRouteRequest *)request
 {
   FBElementCache *elementCache = request.session.elementCache;
@@ -598,8 +676,8 @@
       if ([modifiers isKindOfClass:NSNumber.class]) {
         modifierFlags = [(NSNumber *)modifiers unsignedIntValue];
       }
-      NSString *keyValue = [FBKeyboard keyValueForName:item] ?: key;
-      [destination typeKey:keyValue modifierFlags:modifierFlags];
+      NSString *keyValue = [FBKeyboard keyValueForName:key] ?: key;
+      [destination typeKey:keyValue modifierFlags:(XCUIKeyModifierFlags)modifierFlags];
     } else {
       NSString *message = @"All items of the 'keys' array must be either dictionaries or strings";
       return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:message
@@ -610,6 +688,75 @@
 }
 #endif
 #endif
+
++ (id<FBResponsePayload>)fb_handleVoiceOverSpeechResponse:(nullable NSString *)utterance
+                                                      error:(NSError *)error
+{
+  if (nil != error) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description
+                                                               traceback:nil]);
+  }
+  return FBResponseWithObject(@{
+    @"utterance": utterance ?: NSNull.null,
+  });
+}
+
++ (id<FBResponsePayload>)handleVoiceOverEnable:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_enableVoiceOver:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description
+                                                               traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleVoiceOverDisable:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_disableVoiceOver:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description
+                                                               traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleVoiceOverEnabled:(FBRouteRequest *)request
+{
+  NSError *error;
+  BOOL isEnabled = [XCUIDevice.sharedDevice fb_isVoiceOverEnabled:&error];
+  if (nil != error) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description
+                                                               traceback:nil]);
+  }
+  return FBResponseWithObject(@{@"enabled": @(isEnabled)});
+}
+
++ (id<FBResponsePayload>)handleVoiceOverMove:(FBRouteRequest *)request
+{
+  NSString *direction = request.arguments[@"direction"];
+  if (nil == direction) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"The 'direction' argument must be provided"
+                                                                       traceback:nil]);
+  }
+
+  NSError *error;
+  NSString *utterance = [XCUIDevice.sharedDevice fb_voiceOverMove:direction error:&error];
+  if (nil != error) {
+    FBCommandStatus *status = [error.localizedDescription containsString:@"Unsupported VoiceOver move direction"]
+      ? [FBCommandStatus invalidArgumentErrorWithMessage:error.description traceback:nil]
+      : [FBCommandStatus unknownErrorWithMessage:error.description traceback:nil];
+    return FBResponseWithStatus(status);
+  }
+  return [self fb_handleVoiceOverSpeechResponse:utterance error:nil];
+}
+
++ (id<FBResponsePayload>)handleVoiceOverCurrentSpeech:(FBRouteRequest *)request
+{
+  NSError *error;
+  NSString *utterance = [XCUIDevice.sharedDevice fb_voiceOverCurrentSpeech:&error];
+  return [self fb_handleVoiceOverSpeechResponse:utterance error:error];
+}
 
 + (id<FBResponsePayload>)handlePerformAccessibilityAudit:(FBRouteRequest *)request
 {

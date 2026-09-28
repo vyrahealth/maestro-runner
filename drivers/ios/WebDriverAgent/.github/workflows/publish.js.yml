@@ -15,10 +15,15 @@ permissions:
   id-token: write # to enable use of OIDC for trusted publishing and npm provenance
 
 env:
+  # DO NOT USE 26.4+ for a while since it could drop lower iOS versions forcefully
+  # while the project config allows such lower versions.
+  # (at least WDA failed to start on iOS 15)
+  # Xcode 26.3 looks like it's working as expected.
   XCODE_VERSION: '16.4'
-  # Available destination for simulators depend on Xcode version.
+  # Available destination for simulators depends on Xcode version.
   DESTINATION_SIM: platform=iOS Simulator,name=iPhone 17
   DESTINATION_SIM_TVOS: platform=tvOS Simulator,name=Apple TV 4K (3rd generation)
+  DESTINATION_SIM_WATCHOS: platform=watchOS Simulator,name=Apple Watch Series 11 (46mm)
 
 jobs:
   build_matrix:
@@ -35,7 +40,9 @@ jobs:
             {"name": "iOS Simulator arm64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner", "destination": "${{ env.DESTINATION_SIM }}", "derived_data_path": "appium_wda_ios_sim_arm64", "simulator_name": "Debug-iphonesimulator", "wd": "appium_wda_ios_sim_arm64/Build/Products/Debug-iphonesimulator", "zip_name": "WebDriverAgentRunner-Build-Sim-arm64.zip", "artifact_name": "WebDriverAgentRunner-Build-Sim-arm64", "archs": "arm64"},
             {"name": "iOS Simulator x86_64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner", "destination": "${{ env.DESTINATION_SIM }}", "derived_data_path": "appium_wda_ios_sim_x86_64", "simulator_name": "Debug-iphonesimulator", "wd": "appium_wda_ios_sim_x86_64/Build/Products/Debug-iphonesimulator", "zip_name": "WebDriverAgentRunner-Build-Sim-x86_64.zip", "artifact_name": "WebDriverAgentRunner-Build-Sim-x86_64", "archs": "x86_64"},
             {"name": "tvOS Simulator arm64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner_tvOS", "destination": "${{ env.DESTINATION_SIM_TVOS }}", "derived_data_path": "appium_wda_tvos_sim_arm64", "simulator_name": "Debug-appletvsimulator", "wd": "appium_wda_tvos_sim_arm64/Build/Products/Debug-appletvsimulator", "zip_name": "WebDriverAgentRunner_tvOS-Build-Sim-arm64.zip", "artifact_name": "WebDriverAgentRunner_tvOS-Build-Sim-arm64", "archs": "arm64"},
-            {"name": "tvOS Simulator x86_64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner_tvOS", "destination": "${{ env.DESTINATION_SIM_TVOS }}", "derived_data_path": "appium_wda_tvos_sim_x86_64", "simulator_name": "Debug-appletvsimulator", "wd": "appium_wda_tvos_sim_x86_64/Build/Products/Debug-appletvsimulator", "zip_name": "WebDriverAgentRunner_tvOS-Build-Sim-x86_64.zip", "artifact_name": "WebDriverAgentRunner_tvOS-Build-Sim-x86_64", "archs": "x86_64"}
+            {"name": "tvOS Simulator x86_64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner_tvOS", "destination": "${{ env.DESTINATION_SIM_TVOS }}", "derived_data_path": "appium_wda_tvos_sim_x86_64", "simulator_name": "Debug-appletvsimulator", "wd": "appium_wda_tvos_sim_x86_64/Build/Products/Debug-appletvsimulator", "zip_name": "WebDriverAgentRunner_tvOS-Build-Sim-x86_64.zip", "artifact_name": "WebDriverAgentRunner_tvOS-Build-Sim-x86_64", "archs": "x86_64"},
+            {"name": "watchOS Simulator arm64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner_watchOS", "destination": "${{ env.DESTINATION_SIM_WATCHOS }}", "derived_data_path": "appium_wda_watchos_sim_arm64", "simulator_name": "Debug-watchsimulator", "wd": "appium_wda_watchos_sim_arm64/Build/Products/Debug-watchsimulator", "zip_name": "WebDriverAgentRunner_watchOS-Build-Sim-arm64.zip", "artifact_name": "WebDriverAgentRunner_watchOS-Build-Sim-arm64", "archs": "arm64"},
+            {"name": "watchOS Simulator x86_64", "build_script": "build-sim.sh", "scheme": "WebDriverAgentRunner_watchOS", "destination": "${{ env.DESTINATION_SIM_WATCHOS }}", "derived_data_path": "appium_wda_watchos_sim_x86_64", "simulator_name": "Debug-watchsimulator", "wd": "appium_wda_watchos_sim_x86_64/Build/Products/Debug-watchsimulator", "zip_name": "WebDriverAgentRunner_watchOS-Build-Sim-x86_64.zip", "artifact_name": "WebDriverAgentRunner_watchOS-Build-Sim-x86_64", "archs": "x86_64"}
           ]
           MATRIX_JSON
           echo "matrix=$(cat matrix.json)" >> $GITHUB_OUTPUT
@@ -49,12 +56,12 @@ jobs:
       matrix:
         config: ${{ fromJSON(needs.build_matrix.outputs.matrix) }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - uses: maxim-lobanov/setup-xcode@v1
       with:
         xcode-version: "${{ env.XCODE_VERSION }}"
     - name: ${{ matrix.config.name }}
-      uses: nick-fields/retry@v3
+      uses: nick-fields/retry@v4
       with:
         timeout_minutes: 10
         max_attempts: 3
@@ -67,7 +74,7 @@ jobs:
           export ARCHS="${{ matrix.config.archs || '' }}"
           sh $GITHUB_WORKSPACE/Scripts/ci/${{ matrix.config.build_script }}
     - name: Upload artifact
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.config.artifact_name }}
         path: ${{ matrix.config.zip_name }}
@@ -76,9 +83,9 @@ jobs:
     needs: build-wda
     runs-on: macos-15
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Use Node.js
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version: lts/*
     - uses: maxim-lobanov/setup-xcode@v1
@@ -91,7 +98,7 @@ jobs:
     - run: npm run test
       name: Run test
     - name: Download all artifacts
-      uses: actions/download-artifact@v7
+      uses: actions/download-artifact@v8
       with:
         path: ${{ runner.temp }}/artifacts-temp
     - name: Move artifacts to root for release

@@ -15,7 +15,18 @@
 #import "XCUIApplication+FBHelpers.h"
 #import "XCUIElementQuery.h"
 #import "FBXCTestDaemonsProxy.h"
-#import "XCTestManager_ManagerInterface-Protocol.h"
+#import "XCTCapabilities.h"
+#import "XCTMessagingChannel_RunnerToDaemon-Protocol.h"
+#import "XCTRunnerDaemonSession.h"
+
+/**
+ Legacy testmanagerd (pre-Xcode 15) protocol-version handshake. Xcode 15+ testmanagerd replaced
+ this with named XCTCapabilities negotiation and no longer declares this selector at all, so it
+ does not appear in the modern XCTMessagingChannel_RunnerToDaemon protocol surface.
+ */
+@protocol FBXCTestManagerLegacyProtocolVersionExchanging <NSObject>
+- (void)_XCT_exchangeProtocolVersion:(unsigned long long)version reply:(void (^)(unsigned long long code))reply;
+@end
 
 @implementation XCUIElementQuery (FBCompatibility)
 
@@ -26,7 +37,7 @@
 
 - (XCUIElement *)fb_firstMatch
 {
-  if (FBConfiguration.useFirstMatch) {
+  if (FBConfiguration.sharedInstance.useFirstMatch) {
     XCUIElement* match = self.firstMatch;
     return [match exists] ? match : nil;
   }
@@ -35,7 +46,7 @@
 
 - (NSArray<XCUIElement *> *)fb_allMatches
 {
-  return FBConfiguration.boundElementsByIndex
+  return FBConfiguration.sharedInstance.boundElementsByIndex
     ? self.allElementsBoundByIndex
     : self.allElementsBoundByAccessibilityElement;
 }
@@ -45,21 +56,9 @@
 
 @implementation XCUIElement (FBCompatibility)
 
-+ (BOOL)fb_supportsNonModalElementsInclusion
-{
-  static dispatch_once_t hasIncludingNonModalElements;
-  static BOOL result;
-  dispatch_once(&hasIncludingNonModalElements, ^{
-    result = [XCUIApplication.fb_systemApplication.query respondsToSelector:@selector(includingNonModalElements)];
-  });
-  return result;
-}
-
 - (XCUIElementQuery *)fb_query
 {
-  return FBConfiguration.includeNonModalElements && self.class.fb_supportsNonModalElementsInclusion
-    ? self.query.includingNonModalElements
-    : self.query;
+  return self.query;
 }
 
 @end
@@ -78,22 +77,53 @@
 
 @end
 
+#define TESTMANAGERD_VERSION_TIMEOUT_SEC 20
+
 NSInteger FBTestmanagerdVersion(void)
 {
-  static dispatch_once_t getTestmanagerdVersion;
-  static NSInteger testmanagerdVersion;
-  dispatch_once(&getTestmanagerdVersion, ^{
-    id<XCTestManager_ManagerInterface> proxy = [FBXCTestDaemonsProxy testRunnerProxy];
-    if ([(NSObject *)proxy respondsToSelector:@selector(_XCT_exchangeProtocolVersion:reply:)]) {
-      [FBRunLoopSpinner spinUntilCompletion:^(void(^completion)(void)){
-        [proxy _XCT_exchangeProtocolVersion:testmanagerdVersion reply:^(unsigned long long code) {
-          testmanagerdVersion = (NSInteger) code;
-          completion();
-        }];
-      }];
-    } else {
-      testmanagerdVersion = 0xFFFF;
-    }
+  // -1 means "not yet determined". The timeout fallback is cached like any other outcome: the
+  // value is diagnostic-only, and retrying would stall every later /status for the full timeout
+  // against a daemon that never answers.
+  static NSInteger cachedVersion = -1;
+  static dispatch_queue_t syncQueue;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    syncQueue = dispatch_queue_create("com.facebook.wda.testmanagerdVersion", DISPATCH_QUEUE_SERIAL);
   });
-  return testmanagerdVersion;
+
+  __block NSInteger result;
+  dispatch_sync(syncQueue, ^{
+    if (cachedVersion >= 0) {
+      result = cachedVersion;
+      return;
+    }
+
+    id<XCTMessagingChannel_RunnerToDaemon> proxy = [FBXCTestDaemonsProxy testRunnerProxy];
+    if ([(NSObject *)proxy respondsToSelector:@selector(_XCT_exchangeProtocolVersion:reply:)]) {
+      id<FBXCTestManagerLegacyProtocolVersionExchanging> legacyProxy = (id<FBXCTestManagerLegacyProtocolVersionExchanging>)proxy;
+      __block NSInteger receivedVersion = -1;
+      dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+      [legacyProxy _XCT_exchangeProtocolVersion:0 reply:^(unsigned long long code) {
+        receivedVersion = (NSInteger) code;
+        dispatch_semaphore_signal(sem);
+      }];
+      int64_t timeoutNs = (int64_t)(TESTMANAGERD_VERSION_TIMEOUT_SEC * NSEC_PER_SEC);
+      if (0 != dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, timeoutNs))) {
+        [FBLogger logFmt:@"Did not receive a testmanagerd protocol version reply within %d seconds; assuming the newest/full-featured protocol", TESTMANAGERD_VERSION_TIMEOUT_SEC];
+        result = 0xFFFF;
+      } else {
+        result = receivedVersion;
+      }
+    } else {
+      // Modern testmanagerd (Xcode 15+) negotiates named XCTCapabilities instead of a scalar
+      // version; there's no direct integer equivalent, so just confirm capabilities negotiated.
+      XCTCapabilities *capabilities = [XCTRunnerDaemonSession sharedSession].remoteInterfaceCapabilities;
+      if (nil == capabilities) {
+        [FBLogger log:@"Could not retrieve testmanagerd capabilities"];
+      }
+      result = 0xFFFF;
+    }
+    cachedVersion = result;
+  });
+  return result;
 }

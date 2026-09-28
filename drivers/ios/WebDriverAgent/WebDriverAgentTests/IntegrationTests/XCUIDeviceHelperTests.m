@@ -90,7 +90,7 @@
 {
   NSString *adderss = [XCUIDevice sharedDevice].fb_wifiIPAddress;
   if (!adderss) {
-    return;
+    XCTSkip(@"No WiFi IP address available on this device");
   }
   NSRange range = [adderss rangeOfString:@"^([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})" options:NSRegularExpressionSearch];
   XCTAssertTrue(range.location != NSNotFound);
@@ -119,7 +119,7 @@
 - (void)testUrlSchemeActivation
 {
   if (SYSTEM_VERSION_LESS_THAN(@"16.4")) {
-    return;
+    XCTSkip(@"Requires iOS 16.4+");
   }
 
   NSError *error;
@@ -131,7 +131,7 @@
 - (void)testUrlSchemeActivationWithApp
 {
   if (SYSTEM_VERSION_LESS_THAN(@"16.4")) {
-    return;
+    XCTSkip(@"Requires iOS 16.4+");
   }
 
   NSError *error;
@@ -146,7 +146,7 @@
 - (void)testSimulatedLocationSetup
 {
   if (SYSTEM_VERSION_LESS_THAN(@"16.4")) {
-    return;
+    XCTSkip(@"Requires iOS 16.4+");
   }
 
   CLLocation *simulatedLocation = [[CLLocation alloc] initWithLatitude:50 longitude:50];
@@ -186,6 +186,22 @@
   XCTAssertNil(error);
 }
 
+- (void)testPressingDeviceSpecificButton
+{
+  NSError *error;
+  BOOL hasActionButton = [XCUIDevice.sharedDevice fb_hasButton:@"action"];
+  BOOL didPressButton = [XCUIDevice.sharedDevice fb_pressButton:@"action"
+                                                     forDuration:nil
+                                                           error:&error];
+  if (hasActionButton) {
+    XCTAssertTrue(didPressButton);
+    XCTAssertNil(error);
+  } else {
+    XCTAssertFalse(didPressButton);
+    XCTAssertNotNil(error);
+  }
+}
+
 - (void)testPressingSupportedButtonNumber
 {
   NSError *error;
@@ -210,7 +226,7 @@
 - (void)testAppearance
 {
   if (SYSTEM_VERSION_LESS_THAN(@"15.0")) {
-    return;
+    XCTSkip(@"Requires iOS 15.0+");
   }
   NSError *error;
   XCTAssertTrue([XCUIDevice.sharedDevice fb_setAppearance:FBUIInterfaceAppearanceDark error:&error]);

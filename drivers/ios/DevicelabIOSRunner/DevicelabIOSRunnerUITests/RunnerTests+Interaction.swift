@@ -616,6 +616,26 @@ extension RunnerTests {
     return nil
   }
 
+  /// Local edit (eraseText with a count): delete `count` characters from the
+  /// end of the field, as Maestro does. Returns nil when the count covers the
+  /// whole value, so the caller clears the field through the verified path.
+  func eraseTrailingCharacters(
+    app: XCUIApplication, target: TextEntryTarget, count: Int
+  ) -> Response? {
+    guard let element = resolveTextEntryElement(app: app, target: target) else {
+      return nil
+    }
+    let current = normalizedElementText(element.value)
+    guard !current.isEmpty, count < current.count else {
+      return nil
+    }
+#if !os(tvOS)
+    moveCaretToEnd(element: element)
+#endif
+    element.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: count))
+    return Response(ok: true, data: DataPayload(message: "erased \(count) characters"))
+  }
+
   func clearTextInput(_ element: XCUIElement) {
 #if !os(tvOS)
     moveCaretToEnd(element: element)
@@ -866,6 +886,13 @@ extension RunnerTests {
     repairMode: TextTypingRepairMode = .none
   ) -> TextEntryResult {
     guard !text.isEmpty else {
+      // Replacing a field WITH "" is the clear-field primitive (eraseText,
+      // Playwright fill("")/clear()): the typing is vacuous but the clear is
+      // not. Append and unrepaired entry stay no-ops, which is what an empty
+      // payload means for them.
+      if repairMode == .replacement {
+        return clearTextEntry(app: app, target: target)
+      }
       return TextEntryResult(verified: true, repaired: false, expectedText: "", observedText: "")
     }
     var activeTarget = target
@@ -991,6 +1018,61 @@ extension RunnerTests {
       expectedText: expectedText,
       repaired: repairResult.repaired
     )
+  }
+
+  /// Clears the resolved text input and verifies it reads back empty (a
+  /// visible placeholder counts as empty), clearing once more if the first
+  /// pass left text behind — the same single repair the non-empty
+  /// replacement path gets. Local edit, adapted from upstream agent-device
+  /// #2066, which fixed the same early return but without the repair pass.
+  /// `verified` stays nil when the value is unreadable (secure fields) or
+  /// the input cannot be resolved, matching the non-empty replacement path.
+  private func clearTextEntry(app: XCUIApplication, target: TextEntryTarget) -> TextEntryResult {
+    guard let clearTarget = resolveTextEntryElement(app: app, target: target) else {
+      return TextEntryResult(verified: nil, repaired: false, expectedText: "", observedText: nil)
+    }
+    let activeTarget = target.withElement(clearTarget)
+    clearTextInput(clearTarget)
+    let firstObserved = awaitClearedTextValue(app: app, target: activeTarget)
+    guard let leftover = firstObserved, !leftover.isEmpty else {
+      return TextEntryResult(
+        verified: firstObserved.map { $0.isEmpty },
+        repaired: false,
+        expectedText: "",
+        observedText: firstObserved
+      )
+    }
+    NSLog("DEVICELAB_RUNNER_REPAIR_CLEAR_TEXT observedLength=%d", leftover.count)
+    if let repairTarget = resolveTextEntryElement(app: app, target: activeTarget) {
+      clearTextInput(repairTarget)
+    }
+    let observed = awaitClearedTextValue(app: app, target: activeTarget)
+    return TextEntryResult(
+      verified: observed.map { $0.isEmpty },
+      repaired: true,
+      expectedText: "",
+      observedText: observed
+    )
+  }
+
+  /// Polls the input's value (placeholder read as empty) until it is empty
+  /// or the verification window elapses, so a value still committing the
+  /// deletes is not mistaken for a failed clear. Returns the last reading;
+  /// nil when the value is unreadable.
+  private func awaitClearedTextValue(app: XCUIApplication, target: TextEntryTarget) -> String? {
+    let deadline = Date().addingTimeInterval(TextEntryTiming.verificationStabilityWindow)
+    var observed = editableTextValue(
+      for: resolveTextEntryElement(app: app, target: target),
+      treatingPlaceholderAsEmpty: true
+    )
+    while observed?.isEmpty == false && Date() < deadline {
+      sleepFor(TextEntryTiming.pollInterval)
+      observed = editableTextValue(
+        for: resolveTextEntryElement(app: app, target: target),
+        treatingPlaceholderAsEmpty: true
+      )
+    }
+    return observed
   }
 
   private func repairTextEntryIfNeeded(
@@ -1840,6 +1922,58 @@ extension RunnerTests {
     return origin.withOffset(CGVector(dx: offsetX, dy: offsetY))
   }
 #endif
+
+  // tapNoOpDiffThreshold is the pixel-diff fraction below which the screen is
+  // considered unchanged after a tap. A real navigation changes far more than
+  // this; a button's brief press highlight has faded by the 0.3s settle. Used
+  // only to detect a tap that fired nothing, so it can be re-tried via the
+  // element's activation point.
+  var tapNoOpDiffThreshold: Double { 0.004 }
+
+  // tapActivationRetryEnabled gates the no-op recovery re-tap. Default OFF —
+  // it closes the native-stack "Pop to top" no-op flows, but the no-op probe
+  // costs a screenshot plus a 0.3s settle on EVERY tap, which erodes the
+  // driver's speed lead, and the pixel-diff no-op signal is not yet precise
+  // enough to ship on by default. Opt in with
+  // DEVICELAB_ENABLE_TAP_ACTIVATION_RETRY=1 until the probe is made cheap and
+  // precise (a targeted post-tap check, not a blanket screenshot+sleep).
+  var tapActivationRetryEnabled: Bool {
+    RunnerEnv.isTruthy("DEVICELAB_ENABLE_TAP_ACTIVATION_RETRY")
+  }
+
+  // liveElementForSnapshot resolves the live XCUIElement behind a matched
+  // snapshot, so the no-op recovery can re-tap it through its activation point
+  // (a snapshot has no tap()). Queries by the snapshot's own type + identifier
+  // / label, disambiguating multiple matches by frame proximity. Returns nil
+  // when it cannot be uniquely resolved — the caller then leaves the tap as
+  // the coordinate tap it already did.
+  func liveElementForSnapshot(_ app: XCUIApplication, _ snapshot: XCUIElementSnapshot) -> XCUIElement? {
+    let id = snapshot.identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    let label = snapshot.label.trimmingCharacters(in: .whitespacesAndNewlines)
+    var clauses: [String] = []
+    var args: [String] = []
+    if !id.isEmpty {
+      clauses.append("identifier == %@")
+      args.append(id)
+    }
+    if !label.isEmpty {
+      clauses.append("label == %@")
+      args.append(label)
+    }
+    guard !clauses.isEmpty else { return nil }
+    let predicate = NSPredicate(format: clauses.joined(separator: " OR "), argumentArray: args)
+    let matches = app.descendants(matching: snapshot.elementType)
+      .matching(predicate)
+      .allElementsBoundByIndex
+    if matches.isEmpty { return nil }
+    if matches.count == 1 { return matches[0] }
+    let target = snapshot.frame
+    return matches.min(by: { a, b in
+      let da = abs(a.frame.midX - target.midX) + abs(a.frame.midY - target.midY)
+      let db = abs(b.frame.midX - target.midX) + abs(b.frame.midY - target.midY)
+      return da < db
+    })
+  }
 
   private func tapElementCenter(app: XCUIApplication, element: XCUIElement) {
     let frame = element.frame

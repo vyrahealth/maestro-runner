@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,14 +101,10 @@ func (m *mockDeviceLabClient) WaitForWindowUpdate(string, int) (bool, error) { r
 var _ DeviceLabClient = (*mockDeviceLabClient)(nil)
 
 func TestScrollUntilVisibleRespectsMaxScrolls(t *testing.T) {
+	captures := 0
 	client := &mockDeviceLabClient{
 		sourceFunc: func() (string, error) {
-			return `<?xml version="1.0" encoding="UTF-8"?>
-<hierarchy rotation="0">
-  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
-    <android.widget.TextView text="Other" bounds="[100,100][300,150]"/>
-  </android.widget.FrameLayout>
-</hierarchy>`, nil
+			return movingList(&captures), nil
 		},
 	}
 
@@ -162,14 +159,10 @@ func TestScrollUntilVisibleRespectsTimeout(t *testing.T) {
 }
 
 func TestScrollUntilVisibleDefaultMaxScrolls(t *testing.T) {
+	captures := 0
 	client := &mockDeviceLabClient{
 		sourceFunc: func() (string, error) {
-			return `<?xml version="1.0" encoding="UTF-8"?>
-<hierarchy rotation="0">
-  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
-    <android.widget.TextView text="Other" bounds="[100,100][300,150]"/>
-  </android.widget.FrameLayout>
-</hierarchy>`, nil
+			return movingList(&captures), nil
 		},
 	}
 
@@ -266,15 +259,21 @@ func TestIsElementNotFoundError(t *testing.T) {
 // short-circuit.
 func TestScrollUntilVisibleSkipsOffScreenMatches(t *testing.T) {
 	// Source XML reports an element below the visible screen height.
-	// On every poll the same off-screen match is returned, so the loop
-	// must exhaust all maxScrolls iterations.
-	source := `<?xml version="1.0" encoding="UTF-8"?>
+	// On every poll an off-screen match is returned, so the loop must
+	// exhaust all maxScrolls iterations.
+	// The match drifts a little on every capture so the list reads as still
+	// moving; the no-progress stop is covered by its own test.
+	captures := 0
+	client := &mockDeviceLabClient{sourceFunc: func() (string, error) {
+		captures++
+		y := 3000 + captures
+		return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <hierarchy rotation="0">
   <android.widget.FrameLayout bounds="[0,0][1080,2400]">
-    <android.view.ViewGroup content-desc="off-screen-target" resource-id="off-screen-target" bounds="[100,3000][800,3400]" displayed="false"/>
+    <android.view.ViewGroup content-desc="off-screen-target" resource-id="off-screen-target" bounds="[100,%d][800,%d]" displayed="false"/>
   </android.widget.FrameLayout>
-</hierarchy>`
-	client := &mockDeviceLabClient{sourceFunc: func() (string, error) { return source, nil }}
+</hierarchy>`, y, y+400), nil
+	}}
 	driver := New(client, &core.PlatformInfo{ScreenWidth: 1080, ScreenHeight: 2400}, nil)
 
 	step := &flow.ScrollUntilVisibleStep{
@@ -291,5 +290,51 @@ func TestScrollUntilVisibleSkipsOffScreenMatches(t *testing.T) {
 	}
 	if client.scrollCalls != 4 {
 		t.Errorf("Expected full %d scroll attempts (no short-circuit on off-screen match), got %d", 4, client.scrollCalls)
+	}
+}
+
+// movingList is a page source whose one row shifts up on every capture — a
+// list that keeps advancing — so a test about maxScrolls or timeouts is not
+// cut short by the no-progress stop.
+func movingList(captures *int) string {
+	*captures++
+	y := 100 + *captures
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
+    <android.widget.TextView text="Other" bounds="[100,%d][300,%d]"/>
+  </android.widget.FrameLayout>
+</hierarchy>`, y, y+50)
+}
+
+func TestScrollUntilVisibleStopsWhenScreenStopsMoving(t *testing.T) {
+	// The same capture on every read: a list at its end. Two scrolls that
+	// change nothing are proof enough — the loop must not spend the other 18.
+	client := &mockDeviceLabClient{
+		sourceFunc: func() (string, error) {
+			return `<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <android.widget.FrameLayout bounds="[0,0][1080,2400]">
+    <android.widget.TextView text="Last row" bounds="[100,2300][300,2350]"/>
+  </android.widget.FrameLayout>
+</hierarchy>`, nil
+		},
+	}
+	driver := New(client, &core.PlatformInfo{ScreenWidth: 1080, ScreenHeight: 2400}, nil)
+
+	result := driver.scrollUntilVisible(&flow.ScrollUntilVisibleStep{
+		Element:   flow.Selector{Text: "NonExistent"},
+		Direction: "down",
+		BaseStep:  flow.BaseStep{TimeoutMs: 60000},
+	})
+
+	if result.Success {
+		t.Fatal("expected failure when the element is not in the list")
+	}
+	if got := client.scrollCalls; got != 2 {
+		t.Errorf("expected 2 scrolls before the no-progress stop, got %d", got)
+	}
+	if !strings.Contains(result.Message, "made no progress") {
+		t.Errorf("message should name the reason, got %q", result.Message)
 	}
 }

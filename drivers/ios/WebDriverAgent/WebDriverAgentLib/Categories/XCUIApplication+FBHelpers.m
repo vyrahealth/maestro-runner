@@ -23,7 +23,7 @@
 #import "FBXCElementSnapshotWrapper+Helpers.h"
 #import "FBXCAXClientProxy.h"
 #import "FBXMLGenerationOptions.h"
-#import "XCTestManager_ManagerInterface-Protocol.h"
+#import "XCTMessagingChannel_RunnerToDaemon-Protocol.h"
 #import "XCTestPrivateSymbols.h"
 #import "XCTRunnerDaemonSession.h"
 #import "XCUIApplication.h"
@@ -33,6 +33,7 @@
 #import "XCUIElement.h"
 #import "XCUIElement+FBCaching.h"
 #import "XCUIElement+FBIsVisible.h"
+#import "XCUIElement+FBUID.h"
 #import "XCUIElement+FBUtilities.h"
 #import "XCUIElement+FBWebDriverAttributes.h"
 #import "XCUIElementQuery.h"
@@ -44,12 +45,20 @@ static NSString* const FBExclusionAttributeFrame = @"frame";
 static NSString* const FBExclusionAttributeEnabled = @"enabled";
 static NSString* const FBExclusionAttributeVisible = @"visible";
 static NSString* const FBExclusionAttributeAccessible = @"accessible";
+static NSString* const FBExclusionAttributeNativeAccessibilityElement = @"nativeAccessibilityElement";
 static NSString* const FBExclusionAttributeFocused = @"focused";
 static NSString* const FBExclusionAttributePlaceholderValue = @"placeholderValue";
 static NSString* const FBExclusionAttributeNativeFrame = @"nativeFrame";
 static NSString* const FBExclusionAttributeTraits = @"traits";
 static NSString* const FBExclusionAttributeMinValue = @"minValue";
 static NSString* const FBExclusionAttributeMaxValue = @"maxValue";
+
+static NSString *FBJsonPrefixedAttributeKey(NSString *key)
+{
+  return [NSString stringWithFormat:@"is%@%@",
+          [[key substringToIndex:1] uppercaseString],
+          [key substringFromIndex:1]];
+}
 
 _Nullable id extractIssueProperty(id issue, NSString *propertyName) {
   SEL selector = NSSelectorFromString(propertyName);
@@ -135,7 +144,7 @@ NSDictionary<NSString *, NSString *> *customExclusionAttributesMap(void) {
 + (NSArray<NSDictionary<NSString *, id> *> *)fb_appsInfoWithAxElements:(NSArray<id<FBXCAccessibilityElement>> *)axElements
 {
   NSMutableArray<NSDictionary<NSString *, id> *> *result = [NSMutableArray array];
-  id<XCTestManager_ManagerInterface> proxy = [FBXCTestDaemonsProxy testRunnerProxy];
+  id<XCTMessagingChannel_RunnerToDaemon> proxy = [FBXCTestDaemonsProxy testRunnerProxy];
   for (id<FBXCAccessibilityElement> axElement in axElements) {
     NSMutableDictionary<NSString *, id> *appInfo = [NSMutableDictionary dictionary];
     pid_t pid = axElement.processIdentifier;
@@ -223,7 +232,7 @@ NSDictionary<NSString *, NSString *> *customExclusionAttributesMap(void) {
           if ([nonPrefixedKeys containsObject:key]) {
               info[key] = value;
           } else {
-              info[[NSString stringWithFormat:@"is%@", [key capitalizedString]]] = value;
+              info[FBJsonPrefixedAttributeKey(key)] = value;
           }
       }
   }
@@ -268,6 +277,9 @@ NSDictionary<NSString *, NSString *> *customExclusionAttributesMap(void) {
   },
     FBExclusionAttributeAccessible: ^{
     return [@([wrappedSnapshot isWDAccessible]) stringValue];
+  },
+    FBExclusionAttributeNativeAccessibilityElement: ^{
+    return [@([wrappedSnapshot isWDNativeAccessibilityElement]) stringValue];
   },
     FBExclusionAttributeFocused: ^{
     return [@([wrappedSnapshot isWDFocused]) stringValue];
@@ -423,6 +435,7 @@ NSDictionary<NSString *, NSString *> *customExclusionAttributesMap(void) {
     }
   }
   
+#if !TARGET_OS_WATCH
   if ([UIDevice.currentDevice userInterfaceIdiom] == UIUserInterfaceIdiomPad) {
     NSPredicate *searchPredicate = [NSPredicate predicateWithFormat:@"elementType IN %@",
                                     @[@(XCUIElementTypeKey), @(XCUIElementTypeButton)]];
@@ -431,6 +444,7 @@ NSDictionary<NSString *, NSString *> *customExclusionAttributesMap(void) {
       [matchedKeys[matchedKeys.count - 1] tap];
     }
   }
+#endif
 #endif
   NSString *errorDescription = @"Did not know how to dismiss the keyboard. Try to dismiss it in the way supported by your application under test.";
   return [[[[FBRunLoopSpinner new]
@@ -640,6 +654,21 @@ NSDictionary<NSString *, NSString *> *customExclusionAttributesMap(void) {
     return NO;
   }
   return self == otherApp || [self.bundleID isEqualToString:(NSString *)otherApp.bundleID];
+}
+
++ (nullable XCUIElement *)fb_elementForSnapshot:(id<FBXCElementSnapshot>)snapshot
+                                    underElement:(XCUIElement *)rootElement
+{
+  NSString *uid = [FBXCElementSnapshotWrapper wdUIDWithSnapshot:snapshot];
+  if (nil == uid) {
+    return nil;
+  }
+  NSPredicate *predicate = [NSPredicate predicateWithFormat:@"%K = %@",
+                             FBStringify(FBXCElementSnapshotWrapper, fb_uid), uid];
+  // Filtering by the snapshot's own type (instead of XCUIElementTypeAny) lets
+  // the query narrow down before the uid predicate is even applied.
+  return [[rootElement.fb_query descendantsMatchingType:snapshot.elementType]
+          matchingPredicate:predicate].allElementsBoundByIndex.firstObject;
 }
 
 @end

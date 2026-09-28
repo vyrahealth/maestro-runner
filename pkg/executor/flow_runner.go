@@ -33,6 +33,9 @@ type FlowRunner struct {
 	stepsSkipped int
 	// Sub-command tracking for compound steps (runFlow, repeat, retry)
 	subCommands []report.Command
+	// nestedArtifactSeq numbers failure artifacts captured for nested steps
+	// (runFlow / repeat / retry), which have no top-level command index.
+	nestedArtifactSeq int
 	// Effective wait-for-idle timeout (0 = disabled, used to skip settle)
 	waitForIdleTimeout int
 	// Active runFlow timeout label (e.g. "3s") for enriching sub-step errors
@@ -96,6 +99,7 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Apply the global condition-check timeout for when:/while: checks. 0 keeps
 	// the engine's fast default; --condition-timeout / config overrides it (#110).
 	fr.script.SetConditionTimeout(fr.config.ConditionTimeout)
+	fr.script.SetInsecureHTTP(fr.config.Insecure)
 
 	// Apply waitForIdleTimeout with priority:
 	// Flow config > CLI flag > Workspace config > Cap file > Default (5000ms)
@@ -390,10 +394,12 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 	// Capture before screenshot if configured
 	var artifacts report.CommandArtifacts
 	if captureAlways {
-		artifacts = fr.captureArtifacts(idx, "before")
+		artifacts = fr.captureArtifacts(idx, "before", false)
 	}
 
-	// Expand variables in step before execution
+	// Expand variables in a copy: the flow keeps the ${...} template for the
+	// next time this step runs (a count: rerun reuses the parsed flow).
+	step = cloneForRun(step)
 	fr.script.ExpandStep(step)
 
 	// Execute step - route to appropriate handler
@@ -549,27 +555,21 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 		}
 
 	case *flow.AssertScreenshotStep:
-		result = fr.executeAssertScreenshot(s)
+		result = fr.executeAssertScreenshot(s, idx)
 
 	// PasteText - use in-memory copiedText first, clipboard as fallback
 	case *flow.PasteTextStep:
-		text := fr.script.GetCopiedText()
-		if text != "" {
-			// Use stored copiedText (like Maestro does)
-			inputStep := &flow.InputTextStep{Text: text}
-			result = fr.driver.Execute(inputStep)
-			if result.Success {
-				result.Message = fmt.Sprintf("Pasted text: %s", text)
-			}
-		} else {
-			// Fallback to clipboard
-			result = fr.driver.Execute(step)
-		}
+		result = fr.executePasteText(s)
 
 	// Tap steps - apply repeat/delay/retry/settle options
 	case *flow.TapOnStep, *flow.DoubleTapOnStep, *flow.LongPressOnStep:
 		opts, _ := extractTapOptions(step)
 		result = fr.executeTapWithOptions(step, opts)
+
+	// Plain time delay - handled here, no driver involved. Honours run
+	// cancellation so Ctrl-C during a long wait stops the run promptly.
+	case *flow.WaitStep:
+		result = fr.executeWait(s)
 
 	// All other steps - delegate to driver
 	default:
@@ -614,11 +614,18 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 		logger.Error("Step %d failed (%dms): %s - Error: %s", idx, stepDuration, step.Describe(), errorMsg)
 	}
 
-	// Capture after screenshot (on failure or always)
+	// Capture after screenshot (on failure or always). The view hierarchy is
+	// only worth the extra device round-trips on a FAILED step — it is the
+	// post-mortem for a failure — so `--artifacts always` no longer dumps a
+	// hierarchy on every passing step.
 	shouldCaptureAfter := captureAlways || (captureOnFailure && !result.Success)
 	if shouldCaptureAfter {
-		afterArtifacts := fr.captureArtifacts(idx, "after")
-		artifacts.ScreenshotAfter = afterArtifacts.ScreenshotAfter
+		afterArtifacts := fr.captureArtifacts(idx, "after", !result.Success)
+		// Don't clobber a screenshot a takeScreenshot step already produced
+		// for this command with the generic after-capture.
+		if artifacts.ScreenshotAfter == "" {
+			artifacts.ScreenshotAfter = afterArtifacts.ScreenshotAfter
+		}
 		artifacts.ViewHierarchy = afterArtifacts.ViewHierarchy
 	}
 
@@ -734,7 +741,20 @@ func (fr *FlowRunner) captureSettledScreenshot(step *flow.AssertScreenshotStep) 
 	return result
 }
 
-func (fr *FlowRunner) executeAssertScreenshot(step *flow.AssertScreenshotStep) *core.CommandResult {
+// assertScreenshotDiffPath returns where an assertScreenshot diff image should
+// be written. For a top-level step (cmdIdx >= 0) it goes into the report
+// assets so it travels with the report; a nested step (cmdIdx < 0) has no
+// report command entry, so it keeps Maestro's sidecar-beside-the-reference
+// location.
+func (fr *FlowRunner) assertScreenshotDiffPath(cmdIdx int, referencePath string) (absDiff, relDiff string) {
+	if cmdIdx >= 0 {
+		return fr.flowWriter.ScreenshotDiffPath(cmdIdx)
+	}
+	p := core.DiffScreenshotPath(referencePath)
+	return p, p
+}
+
+func (fr *FlowRunner) executeAssertScreenshot(step *flow.AssertScreenshotStep, cmdIdx int) *core.CommandResult {
 	result := fr.captureSettledScreenshot(step)
 	if !result.Success {
 		return result
@@ -813,9 +833,14 @@ func (fr *FlowRunner) executeAssertScreenshot(step *flow.AssertScreenshotStep) *
 		// hint then see a picture that looks identical to the capture and
 		// conclude the runner is lying (#138). Clear it so the artifact can't
 		// contradict the error beside it.
-		diffPath := core.DiffScreenshotPath(referencePath)
-		if rmErr := os.Remove(diffPath); rmErr != nil && !os.IsNotExist(rmErr) {
-			logger.Warn("Failed to remove stale screenshot diff %s: %v", diffPath, rmErr)
+		absDiff, _ := fr.assertScreenshotDiffPath(cmdIdx, referencePath)
+		// Clear the managed diff (report assets for a top-level step) and any
+		// legacy sidecar diff beside the reference, so neither location keeps a
+		// stale image contradicting this error.
+		for _, stale := range []string{absDiff, core.DiffScreenshotPath(referencePath)} {
+			if rmErr := os.Remove(stale); rmErr != nil && !os.IsNotExist(rmErr) {
+				logger.Warn("Failed to remove stale screenshot diff %s: %v", stale, rmErr)
+			}
 		}
 		err = fmt.Errorf("compare screenshot with %q: %w", referencePath, err)
 		msg := err.Error()
@@ -836,12 +861,12 @@ func (fr *FlowRunner) executeAssertScreenshot(step *flow.AssertScreenshotStep) *
 	matchPercentage := stats.MatchPercentage
 
 	if matchPercentage < step.ThresholdPercentage {
-		diffPath := core.DiffScreenshotPath(referencePath)
+		absDiff, relDiff := fr.assertScreenshotDiffPath(cmdIdx, referencePath)
 		diffHint := ""
-		if writeErr := core.WriteScreenshotDiff(referenceData, capturedData, diffPath); writeErr != nil {
+		if writeErr := core.WriteScreenshotDiff(referenceData, capturedData, absDiff); writeErr != nil {
 			logger.Warn("Failed to write screenshot diff: %v", writeErr)
 		} else {
-			diffHint = fmt.Sprintf(". Check the diff image at %s", diffPath)
+			diffHint = fmt.Sprintf(". Check the diff image at %s", relDiff)
 		}
 		// Print enough decimals that a near-miss can't render as "100.00% is
 		// below threshold 100.00%", and name the differing pixel count so a
@@ -1353,8 +1378,23 @@ func (fr *FlowRunner) enrichTimeoutError(result *core.CommandResult) *core.Comma
 	return &enriched
 }
 
+// executePasteText pastes the text copyTextFrom saved, as Maestro does, and
+// falls back to the device clipboard when nothing was copied in this flow.
+func (fr *FlowRunner) executePasteText(step *flow.PasteTextStep) *core.CommandResult {
+	text := fr.script.GetCopiedText()
+	if text == "" {
+		return fr.driver.Execute(step)
+	}
+	result := fr.driver.Execute(&flow.InputTextStep{Text: text})
+	if result.Success {
+		result.Message = fmt.Sprintf("Pasted text: %s", text)
+	}
+	return result
+}
+
 // executeNestedStep executes a step without report tracking (for nested execution).
 func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
+	step = cloneForRun(step)
 	start := time.Now()
 	var result *core.CommandResult
 	// Describe before expansion. Top-level commands are described when the
@@ -1435,7 +1475,7 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		result, _ = fr.executeTakeScreenshot(s, len(fr.subCommands))
 	case *flow.AssertScreenshotStep:
 		fr.script.ExpandStep(step)
-		result = fr.executeAssertScreenshot(s)
+		result = fr.executeAssertScreenshot(s, -1)
 	case *flow.EvalBrowserScriptStep:
 		fr.script.ExpandStep(step)
 		result = fr.driver.Execute(step)
@@ -1492,6 +1532,16 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 				fr.script.SetVariable(s.Output, val)
 			}
 		}
+	// runShell and pasteText are handled here, not by the driver, exactly
+	// as at the top level. Without these cases a runShell inside a runFlow
+	// reached the driver and failed as unsupported (#174), and a pasteText
+	// pasted the device clipboard instead of the text copyTextFrom saved.
+	case *flow.RunShellStep:
+		fr.script.ExpandStep(step)
+		result = fr.executeRunShell(s)
+	case *flow.PasteTextStep:
+		fr.script.ExpandStep(step)
+		result = fr.executePasteText(s)
 	case *flow.CopyTextFromStep:
 		// Expand variables before driver execution
 		fr.script.ExpandStep(step)
@@ -1506,6 +1556,9 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		fr.script.ExpandStep(step)
 		opts, _ := extractTapOptions(step)
 		result = fr.executeTapWithOptions(step, opts)
+
+	case *flow.WaitStep:
+		result = fr.executeWait(s)
 
 	default:
 		// Expand variables before driver execution
@@ -1568,6 +1621,23 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 	// Add nested sub-commands for compound steps
 	if isCompoundStep {
 		cmd.SubCommands = nestedSubCommands
+	}
+
+	// A failed nested step (inside runFlow / repeat / retry) now gets its own
+	// screenshot + hierarchy, the same post-mortem a failed top-level step has.
+	if !result.Success {
+		seq := fr.nestedArtifactSeq
+		fr.nestedArtifactSeq++
+		if data, err := fr.driver.Screenshot(); err == nil && len(data) > 0 {
+			if path, saveErr := fr.flowWriter.SaveNestedScreenshot(seq, data); saveErr == nil {
+				cmd.Artifacts.ScreenshotAfter = path
+			}
+		}
+		if data, err := fr.driver.Hierarchy(); err == nil && len(data) > 0 {
+			if path, saveErr := fr.flowWriter.SaveNestedHierarchy(seq, data); saveErr == nil {
+				cmd.Artifacts.ViewHierarchy = path
+			}
+		}
 	}
 
 	fr.subCommands = append(fr.subCommands, cmd)
@@ -1665,8 +1735,12 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, maxRetries int)
 	}
 }
 
-// captureArtifacts captures screenshots and hierarchy.
-func (fr *FlowRunner) captureArtifacts(cmdIdx int, timing string) report.CommandArtifacts {
+// captureArtifacts captures the step screenshot and, when captureHierarchy is
+// set, the view hierarchy. The hierarchy is a per-failure post-mortem, so
+// callers pass captureHierarchy=true only for a failed step — not for every
+// passing step under `--artifacts always`, where it would cost extra device
+// round-trips for a dump nobody reads.
+func (fr *FlowRunner) captureArtifacts(cmdIdx int, timing string, captureHierarchy bool) report.CommandArtifacts {
 	var artifacts report.CommandArtifacts
 
 	// Capture screenshot
@@ -1681,8 +1755,7 @@ func (fr *FlowRunner) captureArtifacts(cmdIdx int, timing string) report.Command
 		}
 	}
 
-	// Capture hierarchy on failure
-	if timing == "after" {
+	if captureHierarchy {
 		if data, err := fr.driver.Hierarchy(); err == nil && len(data) > 0 {
 			path, saveErr := fr.flowWriter.SaveViewHierarchy(cmdIdx, data)
 			if saveErr == nil {
@@ -1747,4 +1820,26 @@ func jsErrorSummary(logs []report.ConsoleLog) string {
 	}
 	return fmt.Sprintf("failOnConsoleError: %d JS error(s) detected:\n%s",
 		len(errs), strings.Join(errs, "\n"))
+}
+
+// executeWait pauses the flow for the step's duration. It waits on the run
+// context so a cancelled run (Ctrl-C) stops the wait immediately instead of
+// blocking for the full duration. A zero duration is a no-op success.
+func (fr *FlowRunner) executeWait(step *flow.WaitStep) *core.CommandResult {
+	if step.DurationMs <= 0 {
+		return &core.CommandResult{Success: true, Message: "wait: 0ms"}
+	}
+	d := time.Duration(step.DurationMs) * time.Millisecond
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return &core.CommandResult{Success: true, Message: fmt.Sprintf("Waited %dms", step.DurationMs)}
+	case <-fr.ctx.Done():
+		return &core.CommandResult{
+			Success: false,
+			Message: fmt.Sprintf("wait interrupted after %dms", step.DurationMs),
+			Error:   fr.ctx.Err(),
+		}
+	}
 }

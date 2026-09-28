@@ -42,7 +42,10 @@ func useAndroidTCPForward(cfg *RunConfig) bool {
 func CreateAndroidDriver(cfg *RunConfig) (core.Driver, func(), error) {
 	driverType := strings.ToLower(cfg.Driver)
 	if driverType == "" {
-		driverType = "uiautomator2"
+		// DeviceLab is the default Android driver: on the TestHive suites it
+		// matched UIAutomator2 on pass rate and ran ~1.5-2x faster. Pass
+		// --driver uiautomator2 to use the older path.
+		driverType = "devicelab"
 	}
 
 	// 1. Connect to device
@@ -290,6 +293,9 @@ func createUIAutomator2Driver(cfg *RunConfig, dev *device.AndroidDevice, info de
 		AppBuild:     appBuild,
 	}
 	driver := uia2driver.New(client, platformInfo, dev)
+	// Typing frequency is applied centrally by the executor (flow_runner) to
+	// every driver that supports it, honouring --typing-frequency and a flow's
+	// typingFrequency:. No per-driver wiring is needed here.
 
 	// Cleanup function (silent)
 	cleanup := func() {

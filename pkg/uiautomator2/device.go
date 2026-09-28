@@ -30,12 +30,27 @@ func (c *Client) PressKeyCode(keyCode int) error {
 // This triggers TextWatcher and onTextChanged events (unlike SendKeys/setText).
 // ASCII only — Unicode characters will not work.
 func (c *Client) SendKeyActions(text string) error {
+	return c.SendKeyActionsWithDelay(text, 0)
+}
+
+// SendKeyActionsWithDelay is SendKeyActions with a pause inserted after each
+// character. perKeyDelayMs > 0 slows typing so apps that debounce or jank on
+// fast key events (some React Native TextInputs) receive every keystroke;
+// 0 types as fast as the device accepts. The pause goes after the keyUp so no
+// trailing pause is added past the last character.
+func (c *Client) SendKeyActionsWithDelay(text string, perKeyDelayMs int) error {
 	var keyActions []map[string]interface{}
-	for _, ch := range text {
+	last := len([]rune(text)) - 1
+	for i, ch := range []rune(text) {
 		keyActions = append(keyActions,
 			map[string]interface{}{"type": "keyDown", "value": string(ch)},
 			map[string]interface{}{"type": "keyUp", "value": string(ch)},
 		)
+		if perKeyDelayMs > 0 && i < last {
+			keyActions = append(keyActions,
+				map[string]interface{}{"type": "pause", "duration": perKeyDelayMs},
+			)
+		}
 	}
 	req := map[string]interface{}{
 		"actions": []map[string]interface{}{

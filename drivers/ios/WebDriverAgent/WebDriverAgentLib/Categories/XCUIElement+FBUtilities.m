@@ -100,9 +100,11 @@
     }
   }
   NSMutableArray<XCUIElement *> *matchedElements = [NSMutableArray array];
-  NSString *uid = nil == self.lastSnapshot
+  // self.lastSnapshot may be stale leftover from an unrelated earlier command.
+  id<FBXCElementSnapshot> selfSnapshot = self.fb_cachedSnapshot;
+  NSString *uid = nil == selfSnapshot
     ? self.fb_uid
-    : [FBXCElementSnapshotWrapper wdUIDWithSnapshot:self.lastSnapshot];
+    : [FBXCElementSnapshotWrapper wdUIDWithSnapshot:selfSnapshot];
   if (nil != uid && [matchedIds containsObject:uid]) {
     XCUIElement *stableSelf = [self fb_stableInstanceWithUid:uid];
     if (1 == snapshots.count) {
@@ -113,7 +115,7 @@
   XCUIElementType type = XCUIElementTypeAny;
   NSArray<NSNumber *> *uniqueTypes = [snapshots valueForKeyPath:[NSString stringWithFormat:@"@distinctUnionOfObjects.%@", FBStringify(XCUIElement, elementType)]];
   if (uniqueTypes && [uniqueTypes count] == 1) {
-    type = [uniqueTypes.firstObject intValue];
+    type = (XCUIElementType)[uniqueTypes.firstObject intValue];
   }
   XCUIElementQuery *query = onlyChildren
     ? [self.fb_query childrenMatchingType:type]
@@ -130,7 +132,7 @@
 
 - (void)fb_waitUntilStable
 {
-  [self fb_waitUntilStableWithTimeout:FBConfiguration.waitForIdleTimeout];
+  [self fb_waitUntilStableWithTimeout:FBConfiguration.sharedInstance.waitForIdleTimeout];
 }
 
 - (void)fb_waitUntilStableWithTimeout:(NSTimeInterval)timeout
@@ -139,9 +141,9 @@
     return;
   }
 
-  NSTimeInterval previousTimeout = FBConfiguration.waitForIdleTimeout;
+  NSTimeInterval previousTimeout = FBConfiguration.sharedInstance.waitForIdleTimeout;
   BOOL previousQuiescence = self.application.fb_shouldWaitForQuiescence;
-  FBConfiguration.waitForIdleTimeout = timeout;
+  FBConfiguration.sharedInstance.waitForIdleTimeout = timeout;
   if (!previousQuiescence) {
     self.application.fb_shouldWaitForQuiescence = YES;
   }
@@ -150,7 +152,7 @@
   if (previousQuiescence != self.application.fb_shouldWaitForQuiescence) {
     self.application.fb_shouldWaitForQuiescence = previousQuiescence;
   }
-  FBConfiguration.waitForIdleTimeout = previousTimeout;
+  FBConfiguration.sharedInstance.waitForIdleTimeout = previousTimeout;
 }
 
 - (void)fb_raiseStaleElementExceptionWithError:(NSError *)error __attribute__((noreturn))

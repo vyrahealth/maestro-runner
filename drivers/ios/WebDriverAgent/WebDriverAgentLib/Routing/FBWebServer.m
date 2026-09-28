@@ -8,17 +8,18 @@
 
 #import "FBWebServer.h"
 
-#import "RoutingConnection.h"
-#import "RoutingHTTPServer.h"
+#import "FBHTTPServer.h"
+#import "FBMjpegServer.h"
+#import "FBTCPSocket.h"
 
 #import "FBCommandHandler.h"
+#import "FBCommandStatus.h"
 #import "FBErrorBuilder.h"
 #import "FBExceptionHandler.h"
-#import "FBMjpegServer.h"
+#import "FBResponsePayload.h"
 #import "FBRouteRequest.h"
 #import "FBRuntimeUtils.h"
 #import "FBSession.h"
-#import "FBTCPSocket.h"
 #import "FBUnknownCommands.h"
 #import "FBConfiguration.h"
 #import "FBLogger.h"
@@ -28,28 +29,20 @@
 static NSString *const FBServerURLBeginMarker = @"ServerURLHere->";
 static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 
-@interface FBHTTPConnection : RoutingConnection
-@end
-
-@implementation FBHTTPConnection
-
-- (void)handleResourceNotFound
-{
-  [FBLogger logFmt:@"Received request for %@ which we do not handle", self.requestURI];
-  [super handleResourceNotFound];
-}
-
-@end
-
-
 @interface FBWebServer ()
 @property (nonatomic, strong) FBExceptionHandler *exceptionHandler;
-@property (nonatomic, strong) RoutingHTTPServer *server;
-@property (atomic, assign) BOOL keepAlive;
+@property (nonatomic, strong) FBHTTPServer *server;
 @property (nonatomic, nullable) FBTCPSocket *screenshotsBroadcaster;
+@property (nonatomic, nullable, strong) FBMjpegServer *mjpegServer;
+@property (atomic, assign) BOOL keepAlive;
 @end
 
 @implementation FBWebServer
+
+- (void)dealloc
+{
+  [self stopScreenshotsBroadcaster];
+}
 
 + (NSArray<Class<FBCommandHandler>> *)collectCommandHandlerClasses
 {
@@ -70,7 +63,9 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 {
   [FBLogger logFmt:@"Built at %s %s", __DATE__, __TIME__];
   self.exceptionHandler = [FBExceptionHandler new];
-  [self startHTTPServer];
+  if (![self startHTTPServer]) {
+    return;
+  }
   [self initScreenshotsBroadcaster];
 
   self.keepAlive = YES;
@@ -79,25 +74,29 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
          [runLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]]);
 }
 
-- (void)startHTTPServer
+- (BOOL)startHTTPServer
 {
-  self.server = [[RoutingHTTPServer alloc] init];
+  self.server = [[FBHTTPServer alloc] init];
   [self.server setRouteQueue:dispatch_get_main_queue()];
   [self.server setDefaultHeader:@"Server" value:@"WebDriverAgent/1.0"];
   [self.server setDefaultHeader:@"Access-Control-Allow-Origin" value:@"*"];
   [self.server setDefaultHeader:@"Access-Control-Allow-Headers" value:@"Content-Type, X-Requested-With"];
-  [self.server setConnectionClass:[FBHTTPConnection self]];
+
+  [NSNotificationCenter.defaultCenter addObserver:self
+                                          selector:@selector(sessionWasKilled:)
+                                              name:FBSessionWasKilledNotification
+                                            object:nil];
 
   [self registerRouteHandlers:[self.class collectCommandHandlerClasses]];
   [self registerServerKeyRouteHandlers];
 
-  NSRange serverPortRange = FBConfiguration.bindingPortRange;
-  NSString *bindingIP = FBConfiguration.bindingIPAddress;
+  NSRange serverPortRange = FBConfiguration.sharedInstance.bindingPortRange;
+  NSString *bindingIP = FBConfiguration.sharedInstance.bindingIPAddress;
   if (bindingIP != nil) {
     [self.server setInterface:bindingIP];
     [FBLogger logFmt:@"Using custom binding IP address: %@", bindingIP];
   }
-  
+
   NSError *error;
   BOOL serverStarted = NO;
 
@@ -115,22 +114,32 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 
   if (!serverStarted) {
     [FBLogger logFmt:@"Last attempt to start web server failed with error %@", [error description]];
+    id<FBWebServerDelegate> delegate = self.delegate;
+    if ([delegate respondsToSelector:@selector(webServer:didFailToStartWithError:)]) {
+      [delegate webServer:self didFailToStartWithError:(NSError * _Nonnull)error];
+      return NO;
+    }
     abort();
   }
-  
+
   NSString *serverHost = bindingIP ?: ([XCUIDevice sharedDevice].fb_wifiIPAddress ?: @"127.0.0.1");
   [FBLogger logFmt:@"%@http://%@:%d%@", FBServerURLBeginMarker, serverHost, [self.server port], FBServerURLEndMarker];
+  return YES;
 }
 
 - (void)initScreenshotsBroadcaster
 {
   [self readMjpegSettingsFromEnv];
+  self.mjpegServer = [[FBMjpegServer alloc] init];
   self.screenshotsBroadcaster = [[FBTCPSocket alloc]
-                                 initWithPort:(uint16_t)FBConfiguration.mjpegServerPort];
-  self.screenshotsBroadcaster.delegate = [[FBMjpegServer alloc] init];
+                                 initWithPort:(uint16_t)FBConfiguration.sharedInstance.mjpegServerPort];
+  self.mjpegServer.socket = self.screenshotsBroadcaster;
+  self.screenshotsBroadcaster.delegate = self.mjpegServer;
   NSError *error;
   if (![self.screenshotsBroadcaster startWithError:&error]) {
-    [FBLogger logFmt:@"Cannot init screenshots broadcaster service on port %@. Original error: %@", @(FBConfiguration.mjpegServerPort), error.description];
+    [FBLogger logFmt:@"Cannot init screenshots broadcaster service on port %@. Original error: %@", @(FBConfiguration.sharedInstance.mjpegServerPort), error.description];
+    [self.mjpegServer stopStreaming];
+    self.mjpegServer = nil;
     self.screenshotsBroadcaster = nil;
   }
 }
@@ -138,10 +147,18 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 - (void)stopScreenshotsBroadcaster
 {
   if (nil == self.screenshotsBroadcaster) {
+    self.mjpegServer = nil;
     return;
   }
 
+  id<FBTCPSocketDelegate> delegate = self.screenshotsBroadcaster.delegate;
+  if ([(NSObject *)delegate respondsToSelector:@selector(stopStreaming)]) {
+    [(FBMjpegServer *)delegate stopStreaming];
+  }
+  self.screenshotsBroadcaster.delegate = nil;
   [self.screenshotsBroadcaster stop];
+  self.screenshotsBroadcaster = nil;
+  self.mjpegServer = nil;
 }
 
 - (void)readMjpegSettingsFromEnv
@@ -149,25 +166,45 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
   NSDictionary *env = NSProcessInfo.processInfo.environment;
   NSString *scalingFactor = [env objectForKey:@"MJPEG_SCALING_FACTOR"];
   if (scalingFactor != nil && [scalingFactor length] > 0) {
-    [FBConfiguration setMjpegScalingFactor:[scalingFactor floatValue]];
+    FBConfiguration.sharedInstance.mjpegScalingFactor = [scalingFactor floatValue];
   }
   NSString *screenshotQuality = [env objectForKey:@"MJPEG_SERVER_SCREENSHOT_QUALITY"];
   if (screenshotQuality != nil && [screenshotQuality length] > 0) {
-    [FBConfiguration setMjpegServerScreenshotQuality:[screenshotQuality integerValue]];
+    FBConfiguration.sharedInstance.mjpegServerScreenshotQuality = [screenshotQuality integerValue];
   }
+}
+
+- (void)sessionWasKilled:(NSNotification *)notification
+{
+  FBSession *session = notification.object;
+  if (![session isKindOfClass:FBSession.class]) {
+    return;
+  }
+  // Same "invalid session id" shape a still-queued request would eventually get anyway, once
+  // -routeQueue drains and FBRoute.decorateRequest: finds the session gone - just delivered now
+  // instead of after however long the request would otherwise have been stuck waiting.
+  NSString *message = [NSString stringWithFormat:@"Session %@ was deleted while this request was still pending", session.identifier];
+  id<FBResponsePayload> payload = FBResponseWithStatus([FBCommandStatus noSuchDriverErrorWithMessage:message
+                                                                                            traceback:nil]);
+  RouteResponse *response = [RouteResponse new];
+  [payload dispatchWithResponse:response];
+  [self.server abandonPendingRequestsForSessionID:session.identifier withResponse:response];
 }
 
 - (void)stopServing
 {
+  [NSNotificationCenter.defaultCenter removeObserver:self name:FBSessionWasKilledNotification object:nil];
   [FBSession.activeSession kill];
   [self stopScreenshotsBroadcaster];
   if (self.server.isRunning) {
     [self.server stop:NO];
   }
+  self.server = nil;
+  self.exceptionHandler = nil;
   self.keepAlive = NO;
 }
 
-- (BOOL)attemptToStartServer:(RoutingHTTPServer *)server onPort:(NSInteger)port withError:(NSError **)error
+- (BOOL)attemptToStartServer:(FBHTTPServer *)server onPort:(NSInteger)port withError:(NSError **)error
 {
   server.port = (UInt16)port;
   NSError *innerError = nil;
@@ -192,10 +229,15 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
 
 - (void)registerRouteHandlers:(NSArray *)commandHandlerClasses
 {
+  __weak typeof(self) weakSelf = self;
   for (Class<FBCommandHandler> commandHandler in commandHandlerClasses) {
     NSArray *routes = [commandHandler routes];
     for (FBRoute *route in routes) {
-      [self.server handleMethod:route.verb withPath:route.path block:^(RouteRequest *request, RouteResponse *response) {
+      [self.server handleMethod:route.verb withPath:route.path standalone:route.isStandalone block:^(RouteRequest *request, RouteResponse *response) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (nil == strongSelf) {
+          return;
+        }
         NSDictionary *arguments = [NSJSONSerialization JSONObjectWithData:request.body options:NSJSONReadingMutableContainers error:NULL];
         FBRouteRequest *routeParams = [FBRouteRequest
           routeRequestWithURL:request.url
@@ -209,7 +251,7 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
           [route mountRequest:routeParams intoResponse:response];
         }
         @catch (NSException *exception) {
-          [self handleException:exception forResponse:response];
+          [strongSelf handleException:exception forResponse:response];
         }
       }];
     }
@@ -227,6 +269,9 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
     [response respondWithString:@"<!DOCTYPE html><html><title>Health Check</title><body><p>I-AM-ALIVE</p></body></html>"];
   }];
 
+  // Deprecated: no longer needed since appium-xcuitest-driver handles calibration
+  // itself (https://github.com/appium/appium-xcuitest-driver/pull/2948). Kept for
+  // backward compatibility; will be removed in a future major release.
   NSString *calibrationPage = @"<html>"
   "<title>{\"x\":null,\"y\":null}</title>"
   "<header>"
@@ -234,12 +279,22 @@ static NSString *const FBServerURLEndMarker = @"<-ServerURLHere";
   "</header>"
   "</html>";
   [self.server get:@"/calibrate" withBlock:^(RouteRequest *request, RouteResponse *response) {
+    [FBLogger logFmt:@"The /calibrate endpoint is deprecated and will be removed in a future release"];
     [response respondWithString:calibrationPage];
   }];
 
+  __weak typeof(self) weakSelf = self;
   [self.server get:@"/wda/shutdown" withBlock:^(RouteRequest *request, RouteResponse *response) {
+    __strong typeof(weakSelf) strongSelf = weakSelf;
+    if (nil == strongSelf) {
+      return;
+    }
     [response respondWithString:@"Shutting down"];
-    [self.delegate webServerDidRequestShutdown:self];
+    // Deferred so the "Shutting down" response is written to the client before
+    // webServerDidRequestShutdown: tears down the server's socket out from under it.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [strongSelf.delegate webServerDidRequestShutdown:strongSelf];
+    });
   }];
 
   [self registerRouteHandlers:@[FBUnknownCommands.class]];

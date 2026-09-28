@@ -3,23 +3,33 @@ package jsengine
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/logger"
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/require"
 )
 
 // Engine wraps goja runtime with Maestro-compatible features
 type Engine struct {
-	runtime    *goja.Runtime
-	variables  map[string]interface{}
-	output     map[string]interface{}
-	copiedText string
-	platform   string
-	timers     *timerRegistry
-	mu         sync.Mutex
+	runtime      *goja.Runtime
+	variables    map[string]interface{}
+	output       map[string]interface{}
+	copiedText   string
+	platform     string
+	timers       *timerRegistry
+	insecureHTTP bool
+	// requireBaseDir is the directory a bare require('./x.js') resolves
+	// against — set to the flow's directory so a runScript can pull in helper
+	// modules that live beside it. Read by the require source loader, which
+	// runs while Eval holds mu, so it has its own lock rather than reusing mu
+	// (mu is not reentrant — reusing it would self-deadlock).
+	requireBaseDir string
+	requireMu      sync.RWMutex
+	mu             sync.Mutex
 }
 
 // timerRegistry manages setTimeout/setInterval timers
@@ -58,6 +68,9 @@ func New() *Engine {
 func (e *Engine) setupBuiltins() {
 	// Console
 	e.setupConsole()
+
+	// CommonJS require
+	e.setupRequire()
 
 	// Timers
 	e.setupTimers()
@@ -118,6 +131,37 @@ func (e *Engine) setupConsole() {
 	if err := e.runtime.Set("console", console); err != nil {
 		logger.Warn("failed to set JS runtime global 'console': %v", err)
 	}
+}
+
+// setupRequire enables CommonJS `require` so a runScript can pull in helper
+// modules (`const h = require('./helpers.js')`). A bare relative path resolves
+// against the flow's directory (set via SetRequireBaseDir); an absolute path is
+// read as given. Only CommonJS is supported — goja has no ES-module loader, so
+// `import` is not available. This is a maestro-runner extension; Maestro's
+// runScript has no module system.
+func (e *Engine) setupRequire() {
+	loader := func(path string) ([]byte, error) {
+		resolved := path
+		if !filepath.IsAbs(path) {
+			e.requireMu.RLock()
+			base := e.requireBaseDir
+			e.requireMu.RUnlock()
+			if base != "" {
+				resolved = filepath.Join(base, path)
+			}
+		}
+		return require.DefaultSourceLoader(resolved)
+	}
+	registry := require.NewRegistryWithLoader(loader)
+	registry.Enable(e.runtime)
+}
+
+// SetRequireBaseDir sets the directory that a relative `require('./x.js')`
+// resolves against — normally the flow's directory.
+func (e *Engine) SetRequireBaseDir(dir string) {
+	e.requireMu.Lock()
+	e.requireBaseDir = dir
+	e.requireMu.Unlock()
 }
 
 // setupTimers adds setTimeout, setInterval, clearTimeout, clearInterval
@@ -517,6 +561,11 @@ func extractUndefinedVarName(errMsg string) string {
 
 // Close cleans up the engine (stops timers, etc.)
 // Safe to call multiple times.
+// SetInsecureHTTP sets the engine-wide default for whether runScript's
+// http.* helpers skip TLS certificate verification. A per-request
+// `insecure: true` option overrides it. Wired from the --insecure CLI flag.
+func (e *Engine) SetInsecureHTTP(v bool) { e.insecureHTTP = v }
+
 func (e *Engine) Close() {
 	e.timers.closeOnce.Do(func() {
 		e.timers.mu.Lock()

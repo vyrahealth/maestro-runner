@@ -21,6 +21,7 @@
 #import "XCUIElement+FBResolve.h"
 #import "FBXPath.h"
 #import "FBXCodeCompatibility.h"
+#import "XCUIElement+FBUtilities.h"
 
 @interface XCUIElementFBFindTests : FBIntegrationTestCase
 @property (nonatomic, strong) XCUIElement *testedView;
@@ -41,13 +42,7 @@
 
 - (void)testDescendantsWithClassName
 {
-  NSSet<NSString *> *expectedLabels = [NSSet setWithArray:@[
-    @"Alerts",
-    @"Attributes",
-    @"Scrolling",
-    @"Deadlock app",
-    @"Touch",
-  ]];
+  NSSet<NSString *> *expectedLabels = [NSSet setWithArray:FBMainViewButtonLabels];
   NSArray<XCUIElement *> *matchingSnapshots = [self.testedView fb_descendantsMatchingClassName:@"XCUIElementTypeButton"
                                                                    shouldReturnAfterFirstMatch:NO];
   XCTAssertEqual(matchingSnapshots.count, expectedLabels.count);
@@ -273,7 +268,7 @@
   NSString *queryString =@"XCUIElementTypeWindow/XCUIElementTypeOther/**/XCUIElementTypeButton";
   matchingSnapshots = [self.testedApplication fb_descendantsMatchingClassChain:queryString
                                                    shouldReturnAfterFirstMatch:NO];
-  XCTAssertEqual(matchingSnapshots.count, 5); // /XCUIElementTypeButton
+  XCTAssertEqual(matchingSnapshots.count, FBMainViewButtonLabels.count); // /XCUIElementTypeButton
   for (XCUIElement *matchingSnapshot in matchingSnapshots) {
     XCTAssertEqual(matchingSnapshot.elementType, XCUIElementTypeButton);
   }
@@ -292,7 +287,7 @@
     matchingSnapshots = [self.testedApplication fb_descendantsMatchingClassChain:queryString
                                                      shouldReturnAfterFirstMatch:NO];
   }
-  XCTAssertEqual(matchingSnapshots.count, 5); // /XCUIElementTypeButton
+  XCTAssertEqual(matchingSnapshots.count, FBMainViewButtonLabels.count); // /XCUIElementTypeButton
   for (XCUIElement *matchingSnapshot in matchingSnapshots) {
     XCTAssertEqual(matchingSnapshot.elementType, XCUIElementTypeButton);
   }
@@ -376,7 +371,7 @@
   
   XCTAssertEqual(matchingSnapshots.count, 1);
   XCTAssertEqual(matchingSnapshots.lastObject.elementType, XCUIElementTypeButton);
-  XCTAssertTrue([matchingSnapshots.lastObject.label isEqualToString:@"Touch"]);
+  XCTAssertEqualObjects(matchingSnapshots.lastObject.label, FBMainViewButtonLabels.lastObject);
   
   matchingSnapshots = [self.testedView fb_descendantsMatchingClassChain:@"XCUIElementTypeButton[-10]"
                                             shouldReturnAfterFirstMatch:YES];
@@ -467,6 +462,99 @@
   XCTAssertGreaterThan(matchingSnapshots.count, 1);
   XCTAssertEqual(matchingSnapshots.lastObject.elementType, XCUIElementTypeStaticText);
   XCTAssertFalse(matchingSnapshots.lastObject.fb_isVisible);
+}
+
+@end
+
+@interface XCUIElementFBFindTests_DeepHierarchyPage : FBIntegrationTestCase
+@end
+@implementation XCUIElementFBFindTests_DeepHierarchyPage
+
+- (void)setUp
+{
+  [super setUp];
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    [self launchApplication];
+    [self goToDeepHierarchyPage];
+  });
+}
+
+// No intermediate segment has a position here (only the final one does), so
+// this exercises the query-based class chain strategy - the fast path for
+// the common case. See fb_hasIntermediatePosition: in XCUIElement+FBClassChain.m.
+- (void)testClassChainWithoutIntermediatePositionOnDeepHierarchy
+{
+  NSString *query = @"**/XCUIElementTypeOther[`label BEGINSWITH \"View 19\"`]/XCUIElementTypeOther[1]";
+  NSArray<XCUIElement *> *matches = [self.testedApplication fb_descendantsMatchingClassChain:query
+                                                                   shouldReturnAfterFirstMatch:NO];
+  XCTAssertEqual(matches.count, 1);
+  XCTAssertEqualObjects(matches.firstObject.label, @"View 20");
+}
+
+// The first segment here has an explicit position and is not the last
+// segment in the chain, so this exercises the snapshot-walk class chain
+// strategy - the one that avoids paying an extra accessibility round trip
+// per intermediate indexed segment.
+- (void)testClassChainWithIntermediatePositionOnDeepHierarchy
+{
+  NSString *query = @"**/XCUIElementTypeOther[`label == \"View 10\"`][1]/**/XCUIElementTypeOther[`label BEGINSWITH \"View 19\"`]";
+  NSArray<XCUIElement *> *matches = [self.testedApplication fb_descendantsMatchingClassChain:query
+                                                                   shouldReturnAfterFirstMatch:NO];
+  XCTAssertEqual(matches.count, 1);
+  XCTAssertEqualObjects(matches.firstObject.label, @"View 19");
+}
+
+// Exercises the snapshot-walk strategy with several intermediate positions
+// (the shape it exists for), as opposed to testPerformanceOfClassChainLookupOnDeepHierarchy
+// above, which only has a position on the final segment and stays on the
+// query-based strategy. Kept within the default snapshotMaxDepth (50)
+// combined with the app's own chrome depth above this fixture's root -
+// going deeper hit a native kAXErrorIllegalArgument even after raising
+// snapshotMaxDepth, which looks like a platform-level limitation
+// independent of this lookup, not something to route around here.
+- (void)testPerformanceOfMultiCheckpointClassChainLookupOnDeepHierarchy
+{
+  NSString *query = @"**/XCUIElementTypeOther[`label == \"View 5\"`][1]/**/XCUIElementTypeOther[`label == \"View 15\"`][1]/**/XCUIElementTypeOther[`label == \"View 25\"`][1]/**/XCUIElementTypeOther[`label BEGINSWITH \"View 30\"`]";
+  [self measureBlock:^{
+    NSArray<XCUIElement *> *matches = [self.testedApplication fb_descendantsMatchingClassChain:query
+                                                                     shouldReturnAfterFirstMatch:NO];
+    XCTAssertEqual(matches.count, 1);
+  }];
+}
+
+// Not a strict pass/fail assertion (timings vary across machines/CI) - this
+// records a measurement baseline so future regressions on this lookup show
+// up in Xcode's test reports.
+- (void)testPerformanceOfClassChainLookupOnDeepHierarchy
+{
+  NSString *query = @"**/XCUIElementTypeOther[`label BEGINSWITH \"View 19\"`]/XCUIElementTypeOther[1]";
+  [self measureBlock:^{
+    NSArray<XCUIElement *> *matches = [self.testedApplication fb_descendantsMatchingClassChain:query
+                                                                     shouldReturnAfterFirstMatch:NO];
+    XCTAssertEqual(matches.count, 1);
+  }];
+}
+
+@end
+
+@interface XCUIElementFBFindTests_StaleAppSnapshot : FBIntegrationTestCase
+@end
+@implementation XCUIElementFBFindTests_StaleAppSnapshot
+
+// Regression test for https://github.com/appium/appium/issues/22672.
+- (void)testClassChainWithIntermediatePositionAfterStaleAppSnapshot
+{
+  [self launchApplication];
+  // Simulates a stale snapshot cached by an earlier, unrelated command (e.g. GET /source).
+  [self.testedApplication fb_customSnapshot];
+  [self goToDeepHierarchyPage];
+
+  NSString *query = @"**/XCUIElementTypeOther[`label == \"View 10\"`][1]/**/XCUIElementTypeOther[`label BEGINSWITH \"View 19\"`]";
+  NSArray<XCUIElement *> *matches = [self.testedApplication fb_descendantsMatchingClassChain:query
+                                                                   shouldReturnAfterFirstMatch:NO];
+  XCTAssertEqual(matches.count, 1);
+  XCTAssertEqualObjects(matches.firstObject.label, @"View 19");
 }
 
 @end

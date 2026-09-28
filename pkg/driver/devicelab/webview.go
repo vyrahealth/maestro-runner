@@ -3,10 +3,12 @@ package devicelab
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -41,6 +43,31 @@ type webViewManager struct {
 	cdpType    string // "webview"
 	socketPath string // local forwarded socket path
 	network    *webViewNetworkTracker
+
+	// Cached cross-origin iframe execution contexts (stable uniqueContextIds).
+	// Discovery churns the Runtime domain and congests the connection, so it is
+	// done once and reused; a failed fill forces one rediscovery. Cleared on
+	// disconnect.
+	ctxMu            sync.Mutex
+	crossOriginUIDs  []string
+	allContextUIDs   []string // every frame context (for finding WebView controls)
+	cachedMainOrigin string
+	lastDiscoveryAt  time.Time // when the context cache was last (re)discovered
+
+	// Dedicated CDP connection used only for cross-origin iframe evals, so they
+	// don't compete with finds/network events on the main connection. Opened
+	// lazily on the same forwarded socket; closed on disconnect.
+	evalBrowser *rod.Browser
+	evalPageRef *rod.Page
+
+	// helperBroken records that the window.__maestro JS helper failed to inject
+	// (Shopify checkout's CSP/cross-origin page). Injecting a ~big helper script
+	// that keeps failing costs a full cdpCallTimeout per find via refreshPage,
+	// congesting the shared connection so the direct iframe evals stall. Once
+	// broken, refreshPage skips the re-inject (the find path is otherwise
+	// unchanged, so its natural throttling is preserved). Guarded by mu; reset on
+	// (re)connect.
+	helperBroken bool
 
 	forwarder CDPForwarder
 }
@@ -146,8 +173,10 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 	if _, err := page.EvalOnNewDocument(webViewJSHelper); err != nil {
 		logger.Warn("[cdp:7-ready] failed to inject JS helper for future navigations: %v", err)
 	}
+	m.helperBroken = false
 	if _, err := page.Evaluate(rod.Eval(webViewJSHelper)); err != nil {
-		logger.Info("[cdp:7-ready] failed to inject JS helper into current page: %v", err)
+		logger.Info("[cdp:7-ready] failed to inject JS helper into current page: %v — will not re-inject", err)
+		m.helperBroken = true
 	}
 
 	m.browser = browser
@@ -160,6 +189,657 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 
 	logger.Info("[cdp:7-ready] WebView CDP connection ready — type=%s socket=%s page=%s", cdpType, cdpInfo.Socket, pageURL)
 	return nil
+}
+
+// discoverCrossOriginContexts enumerates the page's execution contexts and
+// returns those whose origin differs from the main frame — the cross-origin
+// iframes (Shopify's PCI card fields) the JS helper cannot reach. Runtime is
+// already enabled by the helper eval, so existing contexts won't re-announce on
+// their own; this subscribes, toggles Runtime off/on to force a full re-emit,
+// and collects for a short bounded window. A long-lived background subscription
+// proved unreliable on Rod's shared page event stream, so discovery is done per
+// call instead.
+func (m *webViewManager) discoverCrossOriginContexts(page *rod.Page, mainOrigin string) []string {
+	collectCtx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+
+	type ctxInfo struct{ origin, unique string }
+	var mu sync.Mutex
+	seen := make(map[proto.RuntimeExecutionContextID]ctxInfo)
+	wait := page.Context(collectCtx).EachEvent(func(e *proto.RuntimeExecutionContextCreated) {
+		if e.Context == nil {
+			return
+		}
+		mu.Lock()
+		seen[e.Context.ID] = ctxInfo{origin: e.Context.Origin, unique: e.Context.UniqueID}
+		mu.Unlock()
+	})
+	done := make(chan struct{})
+	go func() { wait(); close(done) }()
+
+	// Force a full re-emit of all existing contexts to the subscription above.
+	// This churns the numeric context ids, so eval targets the stable
+	// uniqueContextId collected here rather than the (now-stale) numeric id.
+	_ = proto.RuntimeDisable{}.Call(page.Timeout(cdpCallTimeout))
+	_ = proto.RuntimeEnable{}.Call(page.Timeout(cdpCallTimeout))
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	var uids, all []string
+	for _, ci := range seen {
+		if ci.unique == "" {
+			continue
+		}
+		// Every frame context — the checkout iframe, its nested hosted-field
+		// iframes, same-origin children, and opaque/sandboxed frames (origin "")
+		// — used to find WebView controls like the pay/review button, which can
+		// sit in any of them.
+		all = append(all, ci.unique)
+		// Cross-origin subset — the hosted PCI card iframes we fill/read.
+		if ci.origin != "" && ci.origin != mainOrigin && ci.origin != "://" {
+			uids = append(uids, ci.unique)
+		}
+	}
+	m.ctxMu.Lock()
+	m.allContextUIDs = all
+	m.ctxMu.Unlock()
+	logger.Info("[cdp:iframe] discovered %d contexts (%d cross-origin, %d total-frames) mainOrigin=%s", len(seen), len(uids), len(all), mainOrigin)
+	return uids
+}
+
+// evalPage opens (once, lazily) and returns a page on a dedicated CDP
+// connection to the same forwarded WebView socket, used only for iframe evals so
+// they don't share the congested main connection. Cached; closed on disconnect.
+func (m *webViewManager) evalPage() (*rod.Page, error) {
+	m.mu.Lock()
+	socketPath := m.socketPath
+	if m.evalPageRef != nil {
+		p := m.evalPageRef
+		m.mu.Unlock()
+		return p, nil
+	}
+	m.mu.Unlock()
+
+	if socketPath == "" {
+		return nil, fmt.Errorf("no forwarded socket for eval connection")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ws := &cdp.WebSocket{Dialer: &unixDialer{socketPath: socketPath}}
+	if err := ws.Connect(ctx, "ws://localhost/devtools/browser", nil); err != nil {
+		return nil, fmt.Errorf("eval connection: %w", err)
+	}
+	browser := rod.New().Client(cdp.New().Start(ws)).NoDefaultDevice()
+	if err := browser.Connect(); err != nil {
+		return nil, fmt.Errorf("eval browser connect: %w", err)
+	}
+	pages, err := browser.Timeout(10 * time.Second).Pages()
+	if err != nil || len(pages) == 0 {
+		browser.Close()
+		return nil, fmt.Errorf("eval connection: no pages")
+	}
+	// pages came off a browser clone carrying a 10s timeout context, and the page
+	// inherits it — so every eval on the cached page would start "context deadline
+	// exceeded" once 10s have elapsed since the connection opened (fills early in
+	// the checkout worked; later reads and the submit-button click silently
+	// failed). Re-base the page on a fresh background context so each eval's own
+	// page.Timeout(iframeEvalTimeout) is the only deadline. The connection is torn
+	// down explicitly via browser.Close() on disconnect.
+	page := pages.First().Context(context.Background())
+
+	m.mu.Lock()
+	// Lost a race, or disconnected meanwhile — discard.
+	if m.evalPageRef != nil || m.socketPath != socketPath {
+		existing := m.evalPageRef
+		m.mu.Unlock()
+		browser.Close()
+		if existing != nil {
+			return existing, nil
+		}
+		return nil, fmt.Errorf("eval connection stale")
+	}
+	m.evalBrowser = browser
+	m.evalPageRef = page
+	m.mu.Unlock()
+	logger.Info("[cdp:iframe] opened dedicated eval connection")
+	return page, nil
+}
+
+// closeEvalConnection tears down the dedicated eval connection.
+func (m *webViewManager) closeEvalConnection() {
+	if m.evalBrowser != nil {
+		m.evalBrowser.Close()
+		m.evalBrowser = nil
+	}
+	m.evalPageRef = nil
+}
+
+// jsMatchesText reports whether any input value or the visible body text in the
+// context matches the given regex. Used to read hosted WebView content (card
+// field values, the order-confirmation text) that the native a11y tree and the
+// main-frame JS helper can't see.
+const jsMatchesText = `(function(re){
+  try{
+    var r=new RegExp(re);
+    var ins=document.querySelectorAll('input,textarea');
+    for(var i=0;i<ins.length;i++){var v=ins[i].value; if(v&&r.test(v)) return true;}
+    var t=document.body?document.body.innerText:'';
+    return !!(t&&r.test(t));
+  }catch(e){return false;}
+})(%s)`
+
+// webViewMatchesText reports whether the given regex matches an input value or
+// visible text anywhere in the WebView — main frame and cross-origin iframes —
+// over the dedicated eval connection.
+func (m *webViewManager) webViewMatchesText(pattern string) bool {
+	page, err := m.evalPage()
+	if err != nil || page == nil {
+		return false
+	}
+	// Pick up a navigated frame's new context (e.g. the order-confirmation page
+	// the checkout iframe loads after a successful pay) without per-poll churn.
+	m.refreshContextsIfStale()
+	arg, _ := json.Marshal(pattern)
+	expr := fmt.Sprintf(jsMatchesText, string(arg))
+	truthy := func(res *proto.RuntimeEvaluateResult, err error) bool {
+		return err == nil && res != nil && res.Result != nil && res.ExceptionDetails == nil && res.Result.Value.Bool()
+	}
+	// Main frame first (order confirmation lives here).
+	if truthy(proto.RuntimeEvaluate{Expression: expr, ReturnByValue: true}.Call(page.Timeout(iframeEvalTimeout))) {
+		logger.Info("[cdp:read] matched %q in main frame", pattern)
+		return true
+	}
+	var dead []string
+	for _, uid := range m.getAllContexts(page) {
+		res, err := proto.RuntimeEvaluate{Expression: expr, UniqueContextID: uid, ReturnByValue: true}.Call(page.Timeout(iframeEvalTimeout))
+		if err != nil {
+			if isDeadContextErr(err) {
+				dead = append(dead, uid)
+			}
+			continue
+		}
+		if truthy(res, nil) {
+			m.pruneContexts(dead)
+			logger.Info("[cdp:read] matched %q in iframe ctx", pattern)
+			return true
+		}
+	}
+	m.pruneContexts(dead)
+	logger.Debug("[cdp:read] no match for %q", pattern)
+	return false
+}
+
+// getCrossOriginContexts returns the cross-origin iframe context ids, discovering
+// them (an expensive Runtime toggle) only once and caching the result. Repeating
+// discovery on every inputText congested the connection enough that later evals
+// timed out. Discovery runs on the first hosted-field fill — by which point the
+// card iframes have loaded — and the cache serves the rest of the checkout. It
+// is cleared on disconnect. Empty results are not cached, so a too-early first
+// call retries next time.
+func (m *webViewManager) getCrossOriginContexts(page *rod.Page) []string {
+	m.ctxMu.Lock()
+	if len(m.crossOriginUIDs) > 0 {
+		uids := m.crossOriginUIDs
+		m.ctxMu.Unlock()
+		return uids
+	}
+	m.ctxMu.Unlock()
+
+	mainOrigin := ""
+	if info, err := page.Timeout(cdpCallTimeout).Info(); err == nil && info != nil && info.URL != "" {
+		if u, perr := url.Parse(info.URL); perr == nil {
+			mainOrigin = u.Scheme + "://" + u.Host
+		}
+	}
+	// page.Info().URL comes back empty under connection load; reuse the origin we
+	// resolved on a healthy earlier discovery so the main frame is still excluded
+	// (an empty mainOrigin misclassifies it as cross-origin).
+	m.ctxMu.Lock()
+	if mainOrigin == "" {
+		mainOrigin = m.cachedMainOrigin
+	} else {
+		m.cachedMainOrigin = mainOrigin
+	}
+	m.ctxMu.Unlock()
+
+	uids := m.discoverCrossOriginContexts(page, mainOrigin)
+	m.ctxMu.Lock()
+	m.lastDiscoveryAt = time.Now()
+	if len(uids) > 0 {
+		m.crossOriginUIDs = uids
+	}
+	m.ctxMu.Unlock()
+	return uids
+}
+
+// isDeadContextErr reports whether err means the target execution context is
+// genuinely gone (a detached/re-rendered iframe), as opposed to a transient
+// timeout under connection congestion. Only the former should evict a context
+// from the cache — evicting on a timeout empties the cache, forcing a rediscovery
+// (an expensive Runtime disable/enable toggle) on the very next call, which
+// churns every context and congests the connection further: a death spiral that
+// made mid-checkout reads flaky. A timed-out context is very likely still alive.
+func isDeadContextErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if !strings.Contains(s, "context") {
+		return false
+	}
+	return strings.Contains(s, "not found") ||
+		strings.Contains(s, "cannot find") ||
+		strings.Contains(s, "was destroyed") ||
+		strings.Contains(s, "does not exist") ||
+		strings.Contains(s, "doesn't exist") ||
+		strings.Contains(s, "no execution context")
+}
+
+// getAllContexts returns every frame's execution-context id (main-origin
+// sub-frames included), ensuring discovery has run. Used to find WebView controls
+// (e.g. the checkout's pay/review button) that can live in a same-origin
+// sub-frame the cross-origin-only set omits.
+func (m *webViewManager) getAllContexts(page *rod.Page) []string {
+	m.ctxMu.Lock()
+	if len(m.allContextUIDs) > 0 {
+		all := m.allContextUIDs
+		m.ctxMu.Unlock()
+		return all
+	}
+	m.ctxMu.Unlock()
+	// Discovery populates allContextUIDs as a side effect.
+	m.getCrossOriginContexts(page)
+	m.ctxMu.Lock()
+	all := m.allContextUIDs
+	m.ctxMu.Unlock()
+	return all
+}
+
+// contextRefreshInterval bounds how often the read path re-discovers execution
+// contexts. The cache is sticky (rediscovery is expensive and churns the
+// connection), but a Shopify order finalises by NAVIGATING the checkout iframe to
+// a confirmation page — destroying its old contexts and creating a new one the
+// sticky cache never picks up (the persistent top frame keeps the cache
+// non-empty). So the read path forces a refresh at most this often, catching the
+// confirmation text a few seconds after it appears without the per-poll churn.
+const contextRefreshInterval = 4 * time.Second
+
+// refreshContextsIfStale clears the context cache when it hasn't been rediscovered
+// within contextRefreshInterval, so the next getAllContexts picks up a navigated
+// frame's new context. Called only from the read path (not fills), so it never
+// disturbs contexts mid-input.
+func (m *webViewManager) refreshContextsIfStale() {
+	m.ctxMu.Lock()
+	stale := !m.lastDiscoveryAt.IsZero() && time.Since(m.lastDiscoveryAt) > contextRefreshInterval
+	if stale {
+		m.crossOriginUIDs = nil
+		m.allContextUIDs = nil
+	}
+	m.ctxMu.Unlock()
+}
+
+// clearContextCache drops the cached cross-origin contexts (on disconnect).
+func (m *webViewManager) clearContextCache() {
+	m.ctxMu.Lock()
+	m.crossOriginUIDs = nil
+	m.allContextUIDs = nil
+	m.cachedMainOrigin = ""
+	m.ctxMu.Unlock()
+}
+
+// pruneContexts drops dead context ids from the cache. If that empties it, the
+// next fill rediscovers, picking up the current (live) iframe contexts.
+func (m *webViewManager) pruneContexts(dead []string) {
+	if len(dead) == 0 {
+		return
+	}
+	deadSet := make(map[string]bool, len(dead))
+	for _, d := range dead {
+		deadSet[d] = true
+	}
+	m.ctxMu.Lock()
+	kept := m.crossOriginUIDs[:0]
+	for _, uid := range m.crossOriginUIDs {
+		if !deadSet[uid] {
+			kept = append(kept, uid)
+		}
+	}
+	m.crossOriginUIDs = kept
+	m.ctxMu.Unlock()
+}
+
+// jsFillIframeInput finds an input in the iframe's document, focuses it and
+// appends text through the native value setter (bypassing framework-wrapped
+// setters, so React et al. see the change), then dispatches input/change so the
+// checkout reformats and validates. When label is non-empty it matches the
+// input by its associated label / placeholder / aria-label / name (the same
+// text the flow tapped, e.g. "Card number"); otherwise it uses the focused
+// element. Returns the resulting value, or null when no matching input exists
+// in that context.
+//
+//nolint:unused // kept with fillIframeInput, below
+const jsFillIframeInput = `(function(label,t){
+  function norm(s){return (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');}
+  function fieldText(i){return (i.labels&&i.labels[0]?i.labels[0].textContent:'')||i.placeholder||i.getAttribute('aria-label')||i.name||'';}
+  var target=null;
+  var L=norm(label);
+  if(L){
+    var ins=document.querySelectorAll('input,textarea');
+    for(var k=0;k<ins.length;k++){var ft=norm(fieldText(ins[k])); if(ft&&(ft.indexOf(L)>=0||L.indexOf(ft)>=0)){target=ins[k];break;}}
+  }
+  if(!target){var a=document.activeElement; if(a&&/^(INPUT|TEXTAREA)$/.test(a.tagName)) target=a;}
+  if(!target) return null;
+  target.focus();
+  var proto=target.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+  var set=Object.getOwnPropertyDescriptor(proto,'value').set;
+  set.call(target,(target.value||'')+t);
+  target.dispatchEvent(new Event('input',{bubbles:true}));
+  target.dispatchEvent(new Event('change',{bubbles:true}));
+  return target.value;
+})(%s,%s)`
+
+// jsClickElementByText finds a clickable element whose visible text matches the
+// regex and clicks it. Used to tap WebView buttons (e.g. Shopify checkout's
+// "Review order" / "Pay now") that native a11y exposes as non-clickable text
+// nodes — so the native uiautomator tap, which needs a clickable node, can't
+// reach them. Prefers real controls (button / role=button / links / submit
+// inputs); falls back to the smallest visible element whose text matches, to
+// avoid clicking a huge wrapper. Returns the clicked element's text, or null.
+const jsClickElementByText = `(function(re,controlsOnly){
+  try{
+    var r=new RegExp(re);
+    function txt(e){return (e.innerText||e.value||e.textContent||'').trim();}
+    // Buttons often carry extra lines (a spinner or screen-reader label), so an
+    // anchored /^Label$/ won't match the whole innerText. Match if the regex
+    // tests the full text, the whitespace-collapsed text, or any single line —
+    // and prefer the label the a11y tree exposes (aria-label / value).
+    function matches(e){
+      var full=txt(e); if(r.test(full)) return true;
+      if(r.test(full.replace(/\s+/g,' '))) return true;
+      var lines=full.split('\n'); for(var i=0;i<lines.length;i++){if(r.test(lines[i].trim())) return true;}
+      var al=e.getAttribute&&e.getAttribute('aria-label'); if(al&&r.test(al.trim())) return true;
+      return false;
+    }
+    function vis(e){var b=e.getBoundingClientRect(); return b.width>0&&b.height>0&&e.offsetParent!==null;}
+    var controls=document.querySelectorAll('button,[role="button"],a,input[type="submit"],input[type="button"]');
+    var target=null;
+    for(var i=0;i<controls.length;i++){if(vis(controls[i])&&matches(controls[i])){target=controls[i];break;}}
+    if(!target&&!controlsOnly){
+      // Last-resort: the smallest visible non-wrapper element whose text matches.
+      var all=document.querySelectorAll('*');
+      var best=null,bestArea=Infinity;
+      for(var j=0;j<all.length;j++){var e=all[j]; if(!vis(e)) continue; if(!matches(e)) continue; if(e.querySelector&&e.querySelector('button,[role="button"],a,input')) continue; var b=e.getBoundingClientRect(); var a=b.width*b.height; if(a<bestArea){best=e;bestArea=a;}}
+      target=best;
+    }
+    if(!target){
+      var btns=[];
+      for(var k=0;k<controls.length;k++){if(vis(controls[k])){var s=txt(controls[k]).replace(/\s+/g,' '); if(s) btns.push(s.slice(0,40));}}
+      return JSON.stringify({clicked:null,o:location.origin,btns:btns.slice(0,25)});
+    }
+    target.scrollIntoView({block:'center'});
+    target.click();
+    return JSON.stringify({clicked:txt(target).replace(/\s+/g,' ').slice(0,60)});
+  }catch(e){return JSON.stringify({err:String(e)});}
+})(%s,%s)`
+
+// clickIframeElementByText clicks a WebView button/link whose text matches the
+// pattern, over the dedicated CDP connection, searching the main frame first and
+// then each cross-origin iframe. The click runs in the element's own context, so
+// no cross-frame coordinate translation is needed. Returns true if an element was
+// boolJS renders a Go bool as a JS literal for embedding in an eval expression.
+func boolJS(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// jsFindControlRect finds the control (or, when !controlsOnly, any element)
+// whose text matches, scrolls it into view, and returns its viewport-centre
+// coordinates — for a TRUSTED click via CDP Input.dispatchMouseEvent, which a
+// payment submit (Shopify's "Pay now") needs: a synthetic element.click() is an
+// untrusted event and the order often doesn't finalise. Same matching as
+// jsClickElementByText. Returns {found,x,y,label} or {found:false,btns}.
+const jsFindControlRect = `(function(re,controlsOnly){
+  try{
+    var r=new RegExp(re);
+    function txt(e){return (e.innerText||e.value||e.textContent||'').trim();}
+    function matches(e){
+      var full=txt(e); if(r.test(full)) return true;
+      if(r.test(full.replace(/\s+/g,' '))) return true;
+      var lines=full.split('\n'); for(var i=0;i<lines.length;i++){if(r.test(lines[i].trim())) return true;}
+      var al=e.getAttribute&&e.getAttribute('aria-label'); if(al&&r.test(al.trim())) return true;
+      return false;
+    }
+    function vis(e){var b=e.getBoundingClientRect(); return b.width>0&&b.height>0&&e.offsetParent!==null;}
+    var controls=document.querySelectorAll('button,[role="button"],a,input[type="submit"],input[type="button"]');
+    var target=null;
+    for(var i=0;i<controls.length;i++){if(vis(controls[i])&&matches(controls[i])){target=controls[i];break;}}
+    if(!target&&!controlsOnly){
+      var all=document.querySelectorAll('*');
+      var best=null,bestArea=Infinity;
+      for(var j=0;j<all.length;j++){var e=all[j]; if(!vis(e)) continue; if(!matches(e)) continue; if(e.querySelector&&e.querySelector('button,[role="button"],a,input')) continue; var b=e.getBoundingClientRect(); var a=b.width*b.height; if(a<bestArea){best=e;bestArea=a;}}
+      target=best;
+    }
+    if(!target){
+      var btns=[];
+      for(var k=0;k<controls.length;k++){if(vis(controls[k])){var s=txt(controls[k]).replace(/\s+/g,' '); if(s) btns.push(s.slice(0,40));}}
+      return JSON.stringify({found:false,o:location.origin,btns:btns.slice(0,25)});
+    }
+    target.scrollIntoView({block:'center'});
+    var bb=target.getBoundingClientRect();
+    return JSON.stringify({found:true,x:bb.left+bb.width/2,y:bb.top+bb.height/2,label:txt(target).replace(/\s+/g,' ').slice(0,60)});
+  }catch(e){return JSON.stringify({err:String(e)});}
+})(%s,%s)`
+
+// clickMainFrameControl finds a matching control in the main frame and clicks it
+// with a TRUSTED mouse press/release over CDP (Input.dispatchMouseEvent), at the
+// element's viewport centre. Trusted input is required for a payment submit to
+// finalise. Returns true if a control was found and clicked.
+func (m *webViewManager) clickMainFrameControl(page *rod.Page, pattern string, controlsOnly bool) bool {
+	arg, _ := json.Marshal(pattern)
+	expr := fmt.Sprintf(jsFindControlRect, string(arg), boolJS(controlsOnly))
+	res, err := (proto.RuntimeEvaluate{Expression: expr, ReturnByValue: true}).Call(page.Timeout(iframeEvalTimeout))
+	if err != nil || res == nil || res.Result == nil || res.ExceptionDetails != nil || res.Result.Value.Nil() {
+		return false
+	}
+	var out struct {
+		Found bool     `json:"found"`
+		X     float64  `json:"x"`
+		Y     float64  `json:"y"`
+		Label string   `json:"label"`
+		Btns  []string `json:"btns"`
+	}
+	if json.Unmarshal([]byte(res.Result.Value.Str()), &out) != nil || !out.Found {
+		if len(out.Btns) > 0 {
+			logger.Debug("[cdp:iframe] no control for %q in main frame; controls=%v", pattern, out.Btns)
+		}
+		return false
+	}
+	pressed := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMousePressed, X: out.X, Y: out.Y, Button: proto.InputMouseButtonLeft, ClickCount: 1}
+	released := proto.InputDispatchMouseEvent{Type: proto.InputDispatchMouseEventTypeMouseReleased, X: out.X, Y: out.Y, Button: proto.InputMouseButtonLeft, ClickCount: 1}
+	if err := pressed.Call(page.Timeout(iframeEvalTimeout)); err != nil {
+		return false
+	}
+	if err := released.Call(page.Timeout(iframeEvalTimeout)); err != nil {
+		return false
+	}
+	logger.Info("[cdp:iframe] clicked %q in main frame (trusted) -> %q at (%.0f,%.0f)", pattern, out.Label, out.X, out.Y)
+	return true
+}
+
+// clicked. controlsOnly restricts matching to real controls (button / role=button
+// / link / submit input) — used for the CDP-first attempt on WebView buttons,
+// where clicking a plain text element would be wrong; the last-resort fallback
+// passes false to also match a non-control element by its text.
+func (m *webViewManager) clickIframeElementByText(pattern string, controlsOnly bool) (bool, error) {
+	page, err := m.evalPage()
+	if err != nil || page == nil {
+		return false, err
+	}
+	// Trusted click in the main frame first (payment buttons live there and need
+	// a real gesture to finalise the order).
+	if m.clickMainFrameControl(page, pattern, controlsOnly) {
+		return true, nil
+	}
+	arg, _ := json.Marshal(pattern)
+	expr := fmt.Sprintf(jsClickElementByText, string(arg), boolJS(controlsOnly))
+	// clicked reports whether the eval clicked a matching element, logging the
+	// visible control texts it saw when it didn't (so a label mismatch is
+	// diagnosable).
+	clicked := func(where string, res *proto.RuntimeEvaluateResult, err error) bool {
+		if err != nil || res == nil || res.Result == nil || res.ExceptionDetails != nil || res.Result.Value.Nil() {
+			return false
+		}
+		var out struct {
+			Clicked *string  `json:"clicked"`
+			Origin  string   `json:"o"`
+			Btns    []string `json:"btns"`
+			Err     string   `json:"err"`
+		}
+		_ = json.Unmarshal([]byte(res.Result.Value.Str()), &out)
+		if out.Clicked != nil {
+			logger.Info("[cdp:iframe] clicked %q in %s -> %q", pattern, where, *out.Clicked)
+			return true
+		}
+		logger.Debug("[cdp:iframe] no click for %q in %s (o=%s); controls=%v", pattern, where, out.Origin, out.Btns)
+		return false
+	}
+	// Cross-origin/same-origin sub-frames: fall back to a synthetic click in the
+	// element's own context (coordinates can't cross frame boundaries for a
+	// trusted dispatch). The main frame was already handled trusted above.
+	for _, uid := range m.getAllContexts(page) {
+		res, err := proto.RuntimeEvaluate{Expression: expr, UniqueContextID: uid, ReturnByValue: true}.Call(page.Timeout(iframeEvalTimeout))
+		if err != nil {
+			continue
+		}
+		if clicked("iframe ctx", res, nil) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// jsFocusIframeInput finds the input matching label (or the focused input) in a
+// cross-origin iframe and focuses it, WITHOUT writing a value. The caller then
+// types with real hardware key events so the page's own formatter runs (e.g.
+// Shopify's expiry field inserts the " / " separator only on genuine keystrokes,
+// which a programmatic value-set bypasses). Returns the field's descriptive text
+// on success, or null when no matching input exists in that context.
+const jsFocusIframeInput = `(function(label){
+  function norm(s){return (s||'').toLowerCase().replace(/[^a-z0-9]/g,'');}
+  function fieldText(i){return (i.labels&&i.labels[0]?i.labels[0].textContent:'')||i.placeholder||i.getAttribute('aria-label')||i.name||'';}
+  var target=null;
+  var L=norm(label);
+  if(L){
+    var ins=document.querySelectorAll('input,textarea');
+    for(var k=0;k<ins.length;k++){var ft=norm(fieldText(ins[k])); if(ft&&(ft.indexOf(L)>=0||L.indexOf(ft)>=0)){target=ins[k];break;}}
+  }
+  if(!target){var a=document.activeElement; if(a&&/^(INPUT|TEXTAREA)$/.test(a.tagName)) target=a;}
+  if(!target) return null;
+  target.focus();
+  try{var end=(target.value||'').length; target.setSelectionRange(end,end);}catch(e){}
+  return fieldText(target)||target.name||target.tagName;
+})(%s)`
+
+// typeIntoIframeInput focuses the cross-origin iframe input matching label
+// (Shopify checkout's hosted card fields) over the dedicated CDP connection, then
+// types the text with CDP Input events (Input.insertText). CDP input goes through
+// the browser to the focused frame, so it reaches the iframe input that Android
+// hardware key events can't (they route to the native IME view, not a JS-focused
+// WebView field) AND it fires real beforeinput/input events, so the checkout's
+// own formatter runs (the expiry field inserts " / " between the pairs). The flow
+// chunks input (expiry as "1","2","3","0"), so the formatter runs between chunks.
+// Returns true if a context focused a matching input and the text was inserted.
+func (m *webViewManager) typeIntoIframeInput(label, text string) (bool, error) {
+	page, err := m.evalPage()
+	if err != nil || page == nil {
+		return false, err
+	}
+	labelArg, _ := json.Marshal(label)
+	expr := fmt.Sprintf(jsFocusIframeInput, string(labelArg))
+	var dead []string
+	for _, uid := range m.getCrossOriginContexts(page) {
+		res, err := proto.RuntimeEvaluate{
+			Expression:      expr,
+			UniqueContextID: uid,
+			ReturnByValue:   true,
+		}.Call(page.Timeout(iframeEvalTimeout))
+		if err != nil {
+			if isDeadContextErr(err) {
+				dead = append(dead, uid)
+			}
+			continue
+		}
+		if res == nil || res.Result == nil || res.ExceptionDetails != nil || res.Result.Value.Nil() {
+			continue
+		}
+		m.pruneContexts(dead)
+		// Field focused in this context; type via CDP so the keys reach it and
+		// the page formats them.
+		if terr := (proto.InputInsertText{Text: text}).Call(page.Timeout(iframeEvalTimeout)); terr != nil {
+			return false, terr
+		}
+		logger.Info("[cdp:iframe] typed %q into input (label=%q -> %q)", text, label, res.Result.Value.Str())
+		return true, nil
+	}
+	m.pruneContexts(dead)
+	return false, nil
+}
+
+// fillIframeInput finds the input matching label (or the focused input) inside a
+// cross-origin iframe — Shopify checkout's hosted card fields — and appends text
+// to it entirely over CDP, so it works without the native tap having focused the
+// field and without the JS helper (which can't reach cross-origin frames).
+// Returns true if a context accepted the text.
+//
+// Not called at present: the gated path in commands.go types with real key
+// events instead, so the checkout's own formatter runs. Kept as the
+// value-setter alternative while that path is still being proven.
+//
+//nolint:unused
+func (m *webViewManager) fillIframeInput(label, text string) (bool, error) {
+	// Use a DEDICATED CDP connection for iframe evals. The shared connection is
+	// saturated by element finds and Network-domain events during the checkout,
+	// stalling Runtime.evaluate until it times out; a separate connection is
+	// uncongested (a standalone CDP client eval's these contexts instantly).
+	page, err := m.evalPage()
+	if err != nil || page == nil {
+		return false, err
+	}
+	labelArg, _ := json.Marshal(label)
+	textArg, _ := json.Marshal(text)
+	expr := fmt.Sprintf(jsFillIframeInput, string(labelArg), string(textArg))
+	var dead []string
+	for _, uid := range m.getCrossOriginContexts(page) {
+		res, err := proto.RuntimeEvaluate{
+			Expression:      expr,
+			UniqueContextID: uid,
+			ReturnByValue:   true,
+		}.Call(page.Timeout(iframeEvalTimeout))
+		if err != nil {
+			// A destroyed/detached context (stale isolated world after a
+			// re-render) hangs until the timeout — drop it so it doesn't delay
+			// later fields, and keep trying live contexts.
+			if isDeadContextErr(err) {
+				dead = append(dead, uid)
+			}
+			continue
+		}
+		if res == nil || res.Result == nil || res.ExceptionDetails != nil || res.Result.Value.Nil() {
+			continue
+		}
+		m.pruneContexts(dead)
+		logger.Info("[cdp:iframe] filled input (label=%q) -> %q", label, res.Result.Value.Str())
+		return true, nil
+	}
+	m.pruneContexts(dead)
+	return false, nil
 }
 
 // cdpTarget represents a Chrome DevTools Protocol target from /json endpoint.
@@ -381,6 +1061,8 @@ func (m *webViewManager) disconnectLocked() {
 	}
 	m.page = nil
 	m.network = nil
+	m.clearContextCache()
+	m.closeEvalConnection()
 	if m.socketPath != "" {
 		logger.Info("[cdp:disconnect] removing ADB forward and cleaning up: %s", m.socketPath)
 		_ = m.forwarder.RemoveSocketForward(m.socketPath)
@@ -407,6 +1089,8 @@ func (m *webViewManager) cleanup() {
 	}
 	m.page = nil
 	m.network = nil
+	m.clearContextCache()
+	m.closeEvalConnection()
 
 	if socketPath != "" {
 		logger.Info("[cdp:cleanup] removing ADB forward: %s", socketPath)
@@ -463,10 +1147,16 @@ func (m *webViewManager) refreshPage() error {
 
 	m.page = pages.First()
 
-	// Re-inject JS helper into the new page context
-	page := m.page.Timeout(cdpCallTimeout)
-	if _, err := page.Evaluate(rod.Eval(webViewJSHelper)); err != nil {
-		logger.Debug("[webview] failed to inject JS helper after page refresh: %v", err)
+	// Re-inject JS helper into the new page context — but skip it once injection
+	// is known to fail on this page, since re-injecting a big script that keeps
+	// timing out (a full cdpCallTimeout each) on every find is what congests the
+	// connection. The find path is otherwise unchanged.
+	if !m.helperBroken {
+		page := m.page.Timeout(cdpCallTimeout)
+		if _, err := page.Evaluate(rod.Eval(webViewJSHelper)); err != nil {
+			logger.Debug("[webview] failed to inject JS helper after page refresh: %v — will not re-inject", err)
+			m.helperBroken = true
+		}
 	}
 
 	return nil
@@ -672,6 +1362,11 @@ func (m *webViewManager) waitForPageReady() {
 // cdpCallTimeout is the maximum time any single CDP find attempt can take.
 // Prevents hangs when the WebView is suspended, doing heavy JS, or unresponsive.
 const cdpCallTimeout = 3 * time.Second
+
+// iframeEvalTimeout is longer than cdpCallTimeout: the hosted-checkout page is
+// heavy and, mid-journey, the shared CDP connection is busy, so a 3s eval races
+// the load. The value only gates the CSP-safe iframe fill.
+const iframeEvalTimeout = 3 * time.Second
 
 // findWebOnceInternal performs a single attempt to find an element via Rod/CDP.
 // All Rod calls are bounded by cdpCallTimeout — no CDP call can hang indefinitely.

@@ -41,6 +41,15 @@
   XCTAssertFalse(buttonElement.isWDAccessibilityContainer);
 }
 
+- (void)testNativeAccessibilityElementAttribute
+{
+  // wdNativeAccessibilityElement must expose the raw, native isAccessibilityElement flag
+  // without WebDriverAgent's custom computation applied by wdAccessible
+  XCUIElement *buttonElement = self.testedApplication.buttons[@"Button"];
+  XCTAssertTrue(buttonElement.exists);
+  XCTAssertEqual(buttonElement.wdNativeAccessibilityElement, buttonElement.fb_isAccessibilityElement);
+}
+
 - (void)testContainerAccessibilityAttributes
 {
   // "not_accessible" isn't accessibility element, but contains accessibility elements, so it is accessibility container
@@ -57,7 +66,7 @@
   // Images are neither accessibility elements nor contain them, so both checks should fail
   XCUIElement *imageElement = self.testedApplication.images.allElementsBoundByIndex.firstObject;
   if (nil == imageElement) {
-    return;
+    XCTSkip(@"No image element available to test");
   }
   
   XCTAssertTrue(imageElement.exists);

@@ -2,6 +2,7 @@ package jsengine
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -84,6 +85,7 @@ func (e *Engine) doHTTPRequest(method string, call goja.FunctionCall) goja.Value
 	var body io.Reader
 	headers := make(map[string]string)
 	timeout := 30 * time.Second
+	insecure := e.insecureHTTP
 
 	if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {
 		opts := call.Arguments[1].Export()
@@ -120,6 +122,15 @@ func (e *Engine) doHTTPRequest(method string, call goja.FunctionCall) goja.Value
 					timeout = time.Duration(v) * time.Millisecond
 				}
 			}
+
+			// Insecure — skip TLS certificate verification for this request
+			// (self-signed staging endpoints). Per-request override of the
+			// engine-wide --insecure default.
+			if v, ok := optsMap["insecure"]; ok {
+				if b, ok := v.(bool); ok {
+					insecure = b
+				}
+			}
 		}
 	}
 
@@ -137,6 +148,11 @@ func (e *Engine) doHTTPRequest(method string, call goja.FunctionCall) goja.Value
 	// Create client with timeout
 	client := &http.Client{
 		Timeout: timeout,
+	}
+	if insecure {
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // opt-in via insecure/--insecure for self-signed endpoints
+		}
 	}
 
 	// Execute request

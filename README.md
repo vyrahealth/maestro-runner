@@ -10,13 +10,14 @@
 <br>
 *Supports real iOS devices, simulators, emulators, desktop browsers, and cloud providers.*
 
-![3.6x faster](https://img.shields.io/badge/3.6x_faster-3a9d5c?style=for-the-badge) ![14x less memory](https://img.shields.io/badge/14x_less_memory-3a9d5c?style=for-the-badge)
+![~5x faster vs Maestro CLI](https://img.shields.io/badge/~5x_faster_vs_Maestro_CLI-3a9d5c?style=for-the-badge) ![14x less memory](https://img.shields.io/badge/14x_less_memory-3a9d5c?style=for-the-badge)
+
+[![npm installs/mo](https://img.shields.io/npm/dm/maestro-runner?label=npm%20installs%2Fmo&color=cb3837&style=for-the-badge)](https://www.npmjs.com/package/maestro-runner) [![GitHub downloads](https://img.shields.io/github/downloads/devicelab-dev/maestro-runner/total?label=github%20downloads&color=17a2b8&style=for-the-badge)](https://github.com/devicelab-dev/maestro-runner/releases) [![CI runs](https://img.shields.io/endpoint?url=https://open.devicelab.dev/api/maestro-runner/shield&style=for-the-badge)](https://www.npmjs.com/package/maestro-runner)
 
 [![license](https://img.shields.io/badge/license-Apache_2.0-blue.svg?style=for-the-badge)](LICENSE)
 [![by](https://img.shields.io/badge/by-DeviceLab.dev-17a2b8.svg?style=for-the-badge)](https://devicelab.dev)
 
 [![npm](https://img.shields.io/npm/v/maestro-runner?label=npm&color=cb3837)](https://www.npmjs.com/package/maestro-runner)
-[![npm downloads](https://img.shields.io/npm/dm/maestro-runner)](https://www.npmjs.com/package/maestro-runner)
 [![CI](https://github.com/devicelab-dev/maestro-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/devicelab-dev/maestro-runner/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/devicelab-dev/maestro-runner/branch/main/graph/badge.svg)](https://codecov.io/gh/devicelab-dev/maestro-runner)
 [![Go Report Card](https://goreportcard.com/badge/github.com/devicelab-dev/maestro-runner?v=2)](https://goreportcard.com/report/github.com/devicelab-dev/maestro-runner)
@@ -84,7 +85,7 @@ maestro-runner test --parallel 3 flows/                                 # Parall
 - **DeviceLab driver** — Optional on-device Android driver via WebSocket, ~2x faster than UIAutomator2 and ~5x faster than Maestro CLI. Just add `--driver devicelab`
 - **Parallel execution** — Dynamic work distribution across devices, not static sharding. Faster devices pick up more tests automatically, so no device sits idle
 - **App install built-in** — `--app-file app.apk` installs the app before testing, so you always test the right build
-- **Wide OS compatibility** — Android 5.0+ (API 21+) and iOS 12.0+, no version restrictions
+- **Wide OS compatibility** — Android 5.0+ (API 21+) and iOS 15.0+, no version restrictions
 - **Reports** — HTML, JUnit XML, and Allure-compatible reports out of the box
 - **Clear error messages** — `element not found: text="Login"` instead of `io.grpc.StatusRuntimeException: UNKNOWN`
 - **Pre-flight validation** — Catches flow errors, circular dependencies, and missing files before execution starts

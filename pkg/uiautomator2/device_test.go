@@ -745,6 +745,51 @@ func TestSendKeyActions(t *testing.T) {
 	}
 }
 
+// TestSendKeyActionsWithDelay verifies a pause action is inserted between
+// characters (but not after the last one) when a per-key delay is given.
+func TestSendKeyActionsWithDelay(t *testing.T) {
+	var pauses int
+	var lastDuration float64
+	client, server := newTestClientWithSession(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		actions := req["actions"].([]interface{})
+		source := actions[0].(map[string]interface{})
+		for _, a := range source["actions"].([]interface{}) {
+			m := a.(map[string]interface{})
+			if m["type"] == "pause" {
+				pauses++
+				lastDuration, _ = m["duration"].(float64)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+	})
+	defer server.Close()
+
+	// "Hi" = 2 chars → exactly 1 pause, between them, none trailing.
+	if err := client.SendKeyActionsWithDelay("Hi", 50); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pauses != 1 {
+		t.Errorf("expected 1 pause for 2 chars, got %d", pauses)
+	}
+	if lastDuration != 50 {
+		t.Errorf("expected pause duration 50, got %v", lastDuration)
+	}
+
+	// A zero delay inserts no pauses.
+	pauses = 0
+	if err := client.SendKeyActionsWithDelay("Hi", 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pauses != 0 {
+		t.Errorf("expected 0 pauses at zero delay, got %d", pauses)
+	}
+}
+
 func TestSendKeyActionsEmpty(t *testing.T) {
 	client, server := newTestClientWithSession(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]interface{}

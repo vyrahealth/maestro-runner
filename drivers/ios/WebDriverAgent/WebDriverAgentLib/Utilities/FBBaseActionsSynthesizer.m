@@ -21,7 +21,7 @@
 #import "XCSynthesizedEventRecord.h"
 #import "XCUIElement+FBUtilities.h"
 
-#if !TARGET_OS_TV
+#if !TARGET_OS_TV && !TARGET_OS_WATCH
 @implementation FBBaseActionItem
 
 + (NSString *)actionName
@@ -74,9 +74,9 @@
     return [element coordinateWithNormalizedOffset:CGVectorMake(0.5, 0.5)];
   }
 
-  CGVector offset = CGVectorMake(positionOffset.CGPointValue.x, positionOffset.CGPointValue.y);
   // TODO: Shall we throw an exception if hitPoint is out of the element frame?
-  return [[element coordinateWithNormalizedOffset:CGVectorMake(0, 0)] coordinateWithOffset:offset];
+  CGVector offset = CGVectorMake(positionOffset.CGPointValue.x, positionOffset.CGPointValue.y);
+  return FBCoordinateWithAnchorOffset((XCUIElement *)element, CGVectorMake(0, 0), offset, error);
 }
 
 @end

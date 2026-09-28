@@ -122,6 +122,7 @@ const (
 	// Other
 	StepPressKey              StepType = "pressKey"
 	StepWaitForAnimationToEnd StepType = "waitForAnimationToEnd"
+	StepWait                  StepType = "wait"
 	StepDefineVariables       StepType = "defineVariables"
 )
 
@@ -995,6 +996,22 @@ type PressKeyStep struct {
 // (`timeout:` YAML key); defaults to 15s when unset.
 type WaitForAnimationToEndStep struct {
 	BaseStep `yaml:",inline"`
+}
+
+// WaitStep pauses the flow for a fixed duration. This is a maestro-runner
+// extension: Maestro has no plain wait, only condition waits
+// (extendedWaitUntil, waitForAnimationToEnd), so a flow that uses it will not
+// parse on Maestro. The duration is in milliseconds, matching every other
+// timing field in a flow. Written either as a scalar (`- wait: 2000`) or a
+// mapping (`- wait: { duration: 2000 }`).
+type WaitStep struct {
+	BaseStep   `yaml:",inline"`
+	DurationMs int `yaml:"duration"`
+}
+
+// Describe returns a human-readable description of the wait step.
+func (s *WaitStep) Describe() string {
+	return fmt.Sprintf("wait: %dms", s.DurationMs)
 }
 
 // DefineVariablesStep defines variables.

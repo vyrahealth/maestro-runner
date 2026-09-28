@@ -55,6 +55,14 @@ func (se *ScriptEngine) SetConditionTimeout(ms int) {
 	}
 }
 
+// SetInsecureHTTP toggles TLS verification skipping for runScript http.* calls
+// (the --insecure flag). A per-request `insecure` option still overrides it.
+func (se *ScriptEngine) SetInsecureHTTP(v bool) {
+	if se.js != nil {
+		se.js.SetInsecureHTTP(v)
+	}
+}
+
 // Close cleans up the script engine.
 func (se *ScriptEngine) Close() {
 	if se.js != nil {
@@ -65,6 +73,9 @@ func (se *ScriptEngine) Close() {
 // SetFlowDir sets the current flow directory for relative path resolution.
 func (se *ScriptEngine) SetFlowDir(dir string) {
 	se.flowDir = dir
+	if se.js != nil {
+		se.js.SetRequireBaseDir(dir)
+	}
 }
 
 // FlowDir returns the current flow directory used for relative path resolution.
