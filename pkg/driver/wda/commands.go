@@ -982,6 +982,16 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 	return successResult("Swipe completed", nil)
 }
 
+// maestroSwipeDurationMs is the duration Maestro gives a swipe that sets none
+// (YamlSwipe.kt:58).
+const maestroSwipeDurationMs = 400
+
+// timedSwipes reports whether MAESTRO_WDA_TIMED_SWIPE is set, which makes
+// swipes W3C pointer gestures timed as Maestro times them.
+func timedSwipes() bool {
+	return os.Getenv("MAESTRO_WDA_TIMED_SWIPE") != ""
+}
+
 // swipeGesture performs a swipe step's gesture.
 //
 // By default a swipe is dragfromtoforduration, whose duration is how long the
@@ -990,9 +1000,13 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 // `duration` is a finger that takes that long to travel from start to end, as
 // in Maestro: a short one is a fling that carries on momentum, a long one a
 // slow drag. A flow written for Maestro that throws a ruler to its end needs
-// the fling. A swipe without a duration is the drag either way.
+// the fling. With the switch, a swipe without a duration takes Maestro's
+// default 400 ms; without it, that swipe is the drag.
 func (d *Driver) swipeGesture(fromX, fromY, toX, toY float64, durationMs int) error {
-	if durationMs > 0 && os.Getenv("MAESTRO_WDA_TIMED_SWIPE") != "" {
+	if timedSwipes() {
+		if durationMs <= 0 {
+			durationMs = maestroSwipeDurationMs
+		}
 		return d.client.PointerSwipe(fromX, fromY, toX, toY, durationMs)
 	}
 	duration := 0.1
