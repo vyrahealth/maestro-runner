@@ -790,20 +790,44 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	// list should not cost every scroll the step allows.
 	var progress core.ScrollProgress
 
+	// centerElement, as in Maestro (Orchestra.kt:799-821): a found element
+	// more than 10% on screen must also be near the middle of the screen, and
+	// is scrolled on until it is, for five looks. After that, or at 10% or
+	// less, the plain visibility test decides.
+	centerTries := 0
+
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		info, err := d.findElement(step.Element, true, 1000)
+		visibleOffCenter := false
 		if err == nil && info != nil {
 			// Found in the tree is not enough: an element half-hidden behind
 			// the fold satisfies a bare find, and the tap that follows lands
 			// wrong. Keep scrolling until enough of it is actually on screen.
 			// With no screen size to compare against, accept the find as before.
 			w, h, sizeErr := d.screenSize()
-			if sizeErr != nil || core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage) {
+			if sizeErr != nil {
+				return successResult("Element found after scrolling", info)
+			}
+			visible := core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage)
+			if step.CenterElement && core.ScreenVisibleFraction(info.Bounds, w, h) > core.CenterElementMinVisible &&
+				centerTries <= core.CenterElementRetries {
+				if core.NearScreenCenter(info.Bounds, direction, w, h) {
+					return successResult("Element found after scrolling", info)
+				}
+				centerTries++
+				visibleOffCenter = visible
+			} else if visible {
 				return successResult("Element found after scrolling", info)
 			}
 		}
 
 		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+			// A list at its end cannot bring the element any nearer the
+			// middle. Maestro would spend its remaining looks and then take
+			// an element the plain test passes, as this one does.
+			if visibleOffCenter {
+				return successResult("Element found after scrolling", info)
+			}
 			return errorResult(fmt.Errorf("element not found after scrolling"), fmt.Sprintf("Element not found: %s — scrolling %s made no progress after %d scrolls (end of content?)", selectorDesc(step.Element), direction, i))
 		}
 
