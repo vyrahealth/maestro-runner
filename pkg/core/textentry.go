@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"os"
+	"strings"
+)
 
 // TextEntryVerdict is what a read-back of a text field after typing tells us.
 type TextEntryVerdict int
@@ -162,7 +165,8 @@ func ConfirmTypedText(field TextField, typed, before string, warn func(format st
 	}
 
 	after, err := field.Text()
-	if VerifyTypedText(typed, before, after, err == nil) != TextEntryDropped {
+	verdict := VerifyTypedText(typed, before, after, err == nil)
+	if !worthRetyping(verdict) {
 		return ""
 	}
 
@@ -181,8 +185,36 @@ func ConfirmTypedText(field TextField, typed, before string, warn func(format st
 	}
 
 	retyped, retypedErr := field.Text()
-	if VerifyTypedText(typed, before, retyped, retypedErr == nil) == TextEntryDropped {
+	again := VerifyTypedText(typed, before, retyped, retypedErr == nil)
+	if again == TextEntryDropped {
 		return " (warning: characters are still missing after retyping)"
 	}
+	if verdict == TextEntryTransformed {
+		if again == TextEntryTransformed {
+			// Retyping reproduced it, so the app rewrites this field: left as it is.
+			return " (warning: the field still differs from what was typed after retyping)"
+		}
+		return " (retyped: the field held more than was typed)"
+	}
 	return " (retyped after dropped characters)"
+}
+
+// worthRetyping reports whether a read-back verdict calls for one clear and
+// retype. A loss always does. A field that holds more than, or something other
+// than, what was typed is left alone, because that is what a formatter, a mask
+// or an autocomplete does, unless MAESTRO_STRICT_TYPING is set: then it is
+// retyped once, and a field the app really rewrites comes back the same and is
+// reported, not failed. For suites whose fields hold exactly what is typed. On a
+// real iPhone the XCUITest keyboard now and then adds a character (measured: a
+// second "@" after a typed email, about one sign-in in eight), which reads as
+// rewritten.
+func worthRetyping(v TextEntryVerdict) bool {
+	switch v {
+	case TextEntryDropped:
+		return true
+	case TextEntryTransformed:
+		return os.Getenv("MAESTRO_STRICT_TYPING") != ""
+	default:
+		return false
+	}
 }
