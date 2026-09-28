@@ -757,14 +757,7 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 	// screen to 10% of its height, taking 333 ms (IOSDriver.kt:240-250), and
 	// the same swipe mirrored for the other directions.
 	if timedSwipes() {
-		sx, sy, ex, ey, err := maestroScrollSwipe(dir, width, height)
-		if err != nil {
-			return errorResult(err, "Invalid scroll direction")
-		}
-		if err := d.client.PointerSwipe(sx, sy, ex, ey, core.ScrollDurationOrDefault(step.Speed, maestroScrollDurationMs)); err != nil {
-			return errorResult(err, "Scroll failed")
-		}
-		return successResult(fmt.Sprintf("Scrolled %s", step.Direction), nil)
+		return d.timedScroll(step.Direction, core.ScrollDurationOrDefault(step.Speed, maestroScrollDurationMs))
 	}
 
 	// WDA's swipe duration is in seconds; the Maestro speed inverts to ms.
@@ -775,6 +768,39 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 	}
 
 	return successResult(fmt.Sprintf("Scrolled %s", step.Direction), nil)
+}
+
+// timedScroll makes the swipe Maestro scrolls with (maestroScrollSwipe) as a
+// W3C pointer gesture taking durationMs.
+func (d *Driver) timedScroll(direction string, durationMs int) *core.CommandResult {
+	width, height, err := d.screenSize()
+	if err != nil {
+		return errorResult(err, "Failed to get screen size")
+	}
+	sx, sy, ex, ey, err := maestroScrollSwipe(strings.ToLower(direction), width, height)
+	if err != nil {
+		return errorResult(err, "Invalid scroll direction")
+	}
+	if err := d.client.PointerSwipe(sx, sy, ex, ey, durationMs); err != nil {
+		return errorResult(err, "Scroll failed")
+	}
+	return successResult(fmt.Sprintf("Scrolled %s", direction), nil)
+}
+
+// maestroSpeedToDurationMs is how long each of Maestro's scrollUntilVisible
+// swipes takes at a `speed:` (Commands.kt:151-156): 10 ms for every point
+// below 100, plus 1, so the default speed 40 (Commands.kt:177) takes 601 ms
+// and 100 takes 1 ms. Above 100 the result is negative, and Maestro puts its
+// default speed in its place, "40", which it then reads as 40 ms. A speed of
+// 0 cannot be told from no speed here, so it takes the default.
+func maestroSpeedToDurationMs(speed int) int {
+	if speed == 0 {
+		speed = 40
+	}
+	if d := 1000*(100-speed)/100 + 1; d >= 0 {
+		return d
+	}
+	return 40
 }
 
 func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.CommandResult {
@@ -845,9 +871,15 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			return errorResult(fmt.Errorf("element not found after scrolling"), fmt.Sprintf("Element not found: %s — scrolling %s made no progress after %d scrolls (end of content?)", selectorDesc(step.Element), direction, i))
 		}
 
-		// Scroll
-		scrollStep := &flow.ScrollStep{Direction: direction, Speed: step.Speed}
-		result := d.scroll(scrollStep)
+		// Scroll. With timed swipes, as Maestro does it (Orchestra.kt:825-829):
+		// the swipe from the middle that `scroll` makes, 40% of the screen,
+		// taking as long as the step's speed says.
+		var result *core.CommandResult
+		if timedSwipes() {
+			result = d.timedScroll(direction, maestroSpeedToDurationMs(step.Speed))
+		} else {
+			result = d.scroll(&flow.ScrollStep{Direction: direction, Speed: step.Speed})
+		}
 		if !result.Success {
 			return result
 		}
