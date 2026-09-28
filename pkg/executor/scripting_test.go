@@ -794,6 +794,29 @@ func TestScriptEngine_ExecuteRunScript_File(t *testing.T) {
 	}
 }
 
+// A script file's own template literals are plain JavaScript: they must see the script's local
+// variables, not be expanded ahead of the script against the flow's variables.
+func TestScriptEngine_ExecuteRunScript_FileTemplateLiteral(t *testing.T) {
+	se := NewScriptEngine()
+	defer se.Close()
+
+	tmpDir := t.TempDir()
+	src := "const who = EMAIL;\nconst state = 'onboarded';\n" +
+		"output.url = `/v1/x?email=${encodeURIComponent(who)}&state=${state}`;\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "tl.js"), []byte(src), 0o644); err != nil {
+		t.Fatalf("Failed to create test script: %v", err)
+	}
+	se.SetFlowDir(tmpDir)
+
+	step := &flow.RunScriptStep{Script: "tl.js", Env: map[string]string{"EMAIL": "a+b@x.io"}}
+	if result := se.ExecuteRunScript(step); !result.Success {
+		t.Fatalf("ExecuteRunScript() success = false, error = %v", result.Error)
+	}
+	if got, want := se.GetVariable("url"), "/v1/x?email=a%2Bb%40x.io&state=onboarded"; got != want {
+		t.Errorf("url = %q, want %q", got, want)
+	}
+}
+
 func TestScriptEngine_ExecuteRunScript_FileNotFound(t *testing.T) {
 	se := NewScriptEngine()
 	defer se.Close()
