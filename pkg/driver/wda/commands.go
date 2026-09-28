@@ -1213,7 +1213,10 @@ func (d *Driver) launchApp(step *flow.LaunchAppStep) *core.CommandResult {
 		"waitForIdleTimeout":      0,
 		"defaultAlertAction":      d.alertAction,
 	}
-	if d.alertAction == "accept" {
+	if permissionAlertsOnly() {
+		sessionSettings["defaultAlertAction"] = ""
+		sessionSettings["autoClickAlertSelector"] = permissionAlertSelector(d.alertAction)
+	} else if d.alertAction == "accept" {
 		sessionSettings["acceptAlertButtonSelector"] = "**/XCUIElementTypeButton[`label BEGINSWITH[c] 'Allow' OR label ==[c] 'OK'`]"
 	} else if d.alertAction == "dismiss" {
 		sessionSettings["dismissAlertButtonSelector"] = "**/XCUIElementTypeButton[`label CONTAINS[c] 'Don't Allow' OR label CONTAINS[c] 'Dont Allow'`]"

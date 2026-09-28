@@ -48,7 +48,7 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 		"shouldWaitForQuiescence": false,
 		"waitForIdleTimeout":      0,
 	}
-	if alertAction != "" {
+	if alertAction != "" && !permissionAlertsOnly() {
 		alwaysMatch["defaultAlertAction"] = alertAction
 	}
 	// The session's first launch of the app gets the extra launch environment too.
@@ -92,6 +92,10 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 		// process, such as the StoreKit payment sheet, is invisible to a flow
 		// without it.
 		settings["defaultActiveApplication"] = app
+	}
+	if permissionAlertsOnly() {
+		settings["defaultAlertAction"] = ""
+		settings["autoClickAlertSelector"] = permissionAlertSelector(alertAction)
 	}
 	_ = c.UpdateSettings(settings)
 
