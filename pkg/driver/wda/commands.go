@@ -882,11 +882,7 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 					if perr != nil {
 						return errorResult(perr, fmt.Sprintf("Invalid swipe: %v", perr))
 					}
-					duration := 0.1
-					if step.Duration > 0 {
-						duration = float64(step.Duration) / 1000.0
-					}
-					if err := d.client.Swipe(float64(sx), float64(sy), float64(ex), float64(ey), duration); err != nil {
+					if err := d.swipeGesture(float64(sx), float64(sy), float64(ex), float64(ey), step.Duration); err != nil {
 						return errorResult(err, "Swipe failed")
 					}
 					return successResult("Swipe completed", info)
@@ -955,16 +951,31 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 		}
 	}
 
-	duration := 0.1
-	if step.Duration > 0 {
-		duration = float64(step.Duration) / 1000.0
-	}
-
-	if err := d.client.Swipe(fromX, fromY, toX, toY, duration); err != nil {
+	if err := d.swipeGesture(fromX, fromY, toX, toY, step.Duration); err != nil {
 		return errorResult(err, "Swipe failed")
 	}
 
 	return successResult("Swipe completed", nil)
+}
+
+// swipeGesture performs a swipe step's gesture.
+//
+// By default a swipe is dragfromtoforduration, whose duration is how long the
+// finger is held before a drag XCUITest paces itself, so every swipe comes out
+// as the same drag. With MAESTRO_WDA_TIMED_SWIPE set, a swipe that sets
+// `duration` is a finger that takes that long to travel from start to end, as
+// in Maestro: a short one is a fling that carries on momentum, a long one a
+// slow drag. A flow written for Maestro that throws a ruler to its end needs
+// the fling. A swipe without a duration is the drag either way.
+func (d *Driver) swipeGesture(fromX, fromY, toX, toY float64, durationMs int) error {
+	if durationMs > 0 && os.Getenv("MAESTRO_WDA_TIMED_SWIPE") != "" {
+		return d.client.PointerSwipe(fromX, fromY, toX, toY, durationMs)
+	}
+	duration := 0.1
+	if durationMs > 0 {
+		duration = float64(durationMs) / 1000.0
+	}
+	return d.client.Swipe(fromX, fromY, toX, toY, duration)
 }
 
 // Navigation commands

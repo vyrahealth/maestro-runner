@@ -223,6 +223,25 @@ func (c *Client) Swipe(fromX, fromY, toX, toY float64, durationSec float64) erro
 	return err
 }
 
+// PointerSwipe is a one-finger swipe as W3C pointer actions: down at the start,
+// a move to the end that takes durationMs, then up. The move's duration is the
+// swipe's speed, which dragfromtoforduration cannot set.
+func (c *Client) PointerSwipe(fromX, fromY, toX, toY float64, durationMs int) error {
+	finger := map[string]interface{}{
+		"type":       "pointer",
+		"id":         "finger1",
+		"parameters": map[string]interface{}{"pointerType": "touch"},
+		"actions": []interface{}{
+			map[string]interface{}{"type": "pointerMove", "duration": 0, "x": fromX, "y": fromY},
+			map[string]interface{}{"type": "pointerDown", "button": 0},
+			map[string]interface{}{"type": "pointerMove", "duration": durationMs, "x": toX, "y": toY},
+			map[string]interface{}{"type": "pointerUp", "button": 0},
+		},
+	}
+	_, err := c.post(c.sessionPath("/actions"), map[string]interface{}{"actions": []interface{}{finger}})
+	return err
+}
+
 // DragFromTo presses at the start point, holds, then drags to the end point.
 // The endpoint maps to XCUITest's press(forDuration:thenDragTo:), so
 // pressDurationSec is the hold before the move — the lift gesture reorder UIs
