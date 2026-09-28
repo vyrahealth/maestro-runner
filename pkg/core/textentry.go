@@ -242,20 +242,26 @@ var (
 // back as typed, and the keyboard added an "@" about a second later, so the
 // check passed and the flow failed further on, on the wrong value. A field
 // still changing at the limit is judged on its last read. Unset, it is one
-// read.
+// read. A field that cannot be read is not waited on: a code box that hands
+// focus to the next one after its digit is gone once typed, and re-reading it
+// until the limit only cost seconds per digit. A read that fails after good
+// ones keeps the last good one.
 func readBack(field TextField) (string, error) {
 	text, err := field.Text()
-	if !strictTyping() {
+	if !strictTyping() || err != nil {
 		return text, err
 	}
 	start := time.Now()
 	for time.Since(start) < typedReadLimit {
 		time.Sleep(typedReadWait)
 		next, nextErr := field.Text()
-		if err == nil && nextErr == nil && next == text {
+		if nextErr != nil {
+			return text, nil
+		}
+		if next == text {
 			return next, nil
 		}
-		text, err = next, nextErr
+		text = next
 	}
-	return text, err
+	return text, nil
 }
