@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
+	"github.com/devicelab-dev/maestro-runner/pkg/flow"
 )
 
 func TestIsAppDeathError(t *testing.T) {
@@ -21,7 +22,9 @@ func TestIsAppDeathError(t *testing.T) {
 		{"app not running", &core.CommandResult{Message: "Application is not running"}, true},
 		{"session lost", &core.CommandResult{Error: fmt.Errorf("session does not exist")}, true},
 		{"invalid session", &core.CommandResult{Error: fmt.Errorf("invalid session id")}, true},
-		{"connection refused", &core.CommandResult{Message: "post failed: connection refused"}, true},
+		// A dropped or refused connection is WDA or the link, not the app.
+		{"connection refused", &core.CommandResult{Message: "post failed: connection refused"}, false},
+		{"connection reset", &core.CommandResult{Error: fmt.Errorf("read tcp: connection reset by peer")}, false},
 		{"unrelated error", &core.CommandResult{Message: "element not found: id=submit"}, false},
 		{"successful result", &core.CommandResult{Success: true, Message: "Tapped on element"}, false},
 		{"case insensitive", &core.CommandResult{Message: "APPLICATION DIED unexpectedly"}, true},
@@ -122,5 +125,32 @@ func TestTrackCrashLoop_UnrelatedErrorsDoNotCount(t *testing.T) {
 	}
 	if d.crashAbortReason != "" {
 		t.Errorf("unrelated errors should not trip crash-loop; got reason: %s", d.crashAbortReason)
+	}
+}
+
+// The latch belongs to the flow that tripped it. Maestro has nothing like
+// it, and with it set for the life of the process every step of every later
+// flow failed at once, whatever that flow did.
+func TestPrepareForFlowResetsCrashLoop(t *testing.T) {
+	server := mockWDAServerForDriver()
+	defer server.Close()
+	d := createTestDriver(server)
+
+	for i := 0; i < crashLoopThreshold; i++ {
+		d.trackCrashLoop(&core.CommandResult{Message: "Application is not running"})
+	}
+	if d.crashAbortReason == "" {
+		t.Fatal("setup: the latch should have tripped")
+	}
+	if res := d.Execute(&flow.TapOnPointStep{X: 10, Y: 10}); res.Success {
+		t.Fatal("setup: a tripped latch should fail the step")
+	}
+
+	d.PrepareForFlow(nil)
+	if d.crashAbortReason != "" || d.appDeathCount != 0 {
+		t.Fatalf("PrepareForFlow left the latch set: %q, %d deaths", d.crashAbortReason, d.appDeathCount)
+	}
+	if res := d.Execute(&flow.TapOnPointStep{X: 10, Y: 10}); !res.Success {
+		t.Errorf("the next flow's first step failed: %s", res.Message)
 	}
 }
