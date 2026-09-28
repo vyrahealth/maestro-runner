@@ -110,6 +110,10 @@ func (s *strictQueryServer) start(t *testing.T) *httptest.Server {
 					return
 				}
 			}
+			if strings.HasSuffix(p, "/elements") {
+				jsonResponse(w, map[string]interface{}{"value": []interface{}{}})
+				return
+			}
 			w.WriteHeader(http.StatusNotFound)
 			jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{"error": "no such element"}})
 		case strings.HasSuffix(p, "/rect"):
