@@ -1,0 +1,118 @@
+package wda
+
+import (
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+
+	"golang.org/x/text/unicode/norm"
+
+	"github.com/devicelab-dev/maestro-runner/pkg/core"
+	"github.com/devicelab-dev/maestro-runner/pkg/flow"
+)
+
+// strictSelectors reports whether selectors match the way Maestro's do
+// (MAESTRO_STRICT_SELECTORS).
+//
+// Maestro reads every text and id selector as a regex that must match the
+// whole of an attribute, ignoring case, with . matching a newline and ^ $ at
+// line ends (Orchestra.kt:1570, 1576 and 1841). The runner's own matching is
+// looser: a literal text matches as a case-insensitive substring, so a
+// selector for "Resend code" also matched "Resend code in 0:42".
+func strictSelectors() bool {
+	return os.Getenv("MAESTRO_STRICT_SELECTORS") != ""
+}
+
+// maestroRegexes caches compiled selector regexes: the page-source matcher
+// asks for one per element.
+var maestroRegexes sync.Map
+
+// maestroRegex compiles a text or id selector the way Maestro does, as a
+// regex over the whole string with IGNORE_CASE, DOT_MATCHES_ALL and
+// MULTILINE. A pattern that does not compile is matched as a literal, as
+// Maestro's toRegexSafe does (StringUtils.kt:7-13). Go's regex syntax is
+// not Java's: a pattern only Java accepts (a lookahead, say) is a literal
+// here.
+func maestroRegex(pattern string) *regexp.Regexp {
+	if re, ok := maestroRegexes.Load(pattern); ok {
+		return re.(*regexp.Regexp)
+	}
+	// The pattern must compile on its own before it is wrapped: `a)|(b` does
+	// not, and wrapped in (?:...) it would.
+	body := pattern
+	if _, err := regexp.Compile(pattern); err != nil {
+		body = regexp.QuoteMeta(pattern)
+	}
+	re, err := regexp.Compile(`(?ism)\A(?:` + body + `)\z`)
+	if err != nil {
+		re = regexp.MustCompile(`(?ism)\A(?:` + regexp.QuoteMeta(pattern) + `)\z`)
+	}
+	maestroRegexes.Store(pattern, re)
+	return re
+}
+
+// maestroTextMatches is Maestro's text match (Filters.textMatches,
+// Filters.kt:58-108) over the texts of an element: the regex matches the
+// whole text, or the text equals the pattern as written, each also tried
+// with the text's newlines read as spaces. Empty texts are tried too, as
+// Maestro tries them. Both sides are NFC-normalized, as matchesText does.
+func maestroTextMatches(pattern string, texts ...string) bool {
+	pattern = norm.NFC.String(pattern)
+	re := maestroRegex(pattern)
+	for _, text := range texts {
+		text = norm.NFC.String(text)
+		stripped := strings.ReplaceAll(text, "\n", " ")
+		if re.MatchString(text) || pattern == text || re.MatchString(stripped) || pattern == stripped {
+			return true
+		}
+	}
+	return false
+}
+
+// meansItself reports whether s, read as Maestro reads a selector, matches
+// the literal string s. Then an exact, case-insensitive WDA comparison
+// finds only elements Maestro's regex also matches: a plain literal, or one
+// whose dots stand for themselves ("mastodon.social"). "Continue?" is not:
+// its ? makes the "e" optional, and it goes to the page source.
+func meansItself(s string) bool {
+	return maestroRegex(s).MatchString(s)
+}
+
+// predicateLiteral quotes s as an NSPredicate string. ok is false for text a
+// query cannot carry: control characters, or a backtick, which would end a
+// class-chain predicate.
+func predicateLiteral(s string) (string, bool) {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || r == '`' {
+			return "", false
+		}
+	}
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'", true
+}
+
+// strictQueryable reports whether a WDA query can decide sel. The queries
+// know nothing of size or of index, which Maestro resolves over every match
+// on screen; those selectors go to the page source.
+func strictQueryable(sel flow.Selector) bool {
+	return sel.Width == 0 && sel.Height == 0 && sel.Index == ""
+}
+
+// strictTextByWDA is findElementByWDA's text query with
+// MAESTRO_STRICT_SELECTORS set: an exact, case-insensitive comparison with
+// the label, value or placeholder, run only for text that means itself (see
+// meansItself). Every other text is left to the page source, where the
+// matcher applies Maestro's regex.
+func (d *Driver) strictTextByWDA(sel flow.Selector, stateFilter string) (*core.ElementInfo, error) {
+	lit, ok := predicateLiteral(sel.Text)
+	if !ok || !strictQueryable(sel) || !meansItself(sel.Text) {
+		return nil, fmt.Errorf("text %q is matched in the page source", sel.Text)
+	}
+	predicate := fmt.Sprintf("(label ==[c] %s OR value ==[c] %s OR placeholderValue ==[c] %s)%s", lit, lit, lit, stateFilter)
+	elemID, err := d.client.FindElement("predicate string", predicate)
+	if err != nil || elemID == "" {
+		return nil, fmt.Errorf("element not found via WDA")
+	}
+	return d.getElementInfo(elemID)
+}

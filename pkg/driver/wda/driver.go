@@ -582,6 +582,13 @@ func (d *Driver) findElementWithContext(ctx context.Context, sel flow.Selector) 
 // For text selectors, it tries interactive element types first (TextField, SecureTextField, Button),
 // then falls back to generic text matching with clickable parent lookup via page source.
 func (d *Driver) findElementForTap(sel flow.Selector, optional bool, stepTimeoutMs int) (*core.ElementInfo, error) {
+	// Maestro finds the element a tap goes to the way it finds any other
+	// (Orchestra.kt:1325-1331). The tap strategies below are the runner's:
+	// a text field that merely contains the text outranks an exact button.
+	if strictSelectors() {
+		return d.findElement(sel, optional, stepTimeoutMs)
+	}
+
 	// For relative selectors, use page source which handles them correctly
 	if sel.HasRelativeSelector() {
 		timeout := d.calculateTimeout(optional, stepTimeoutMs)
@@ -939,6 +946,9 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 	}
 
 	if sel.Text != "" {
+		if strictSelectors() {
+			return d.strictTextByWDA(sel, stateFilter)
+		}
 		// Try generic predicate first — most assertions target StaticText/labels,
 		// so this avoids 3 wasted type-specific queries (TextField, SecureTextField, Button)
 		predicateBase := fmt.Sprintf("label CONTAINS[c] '%s' OR value CONTAINS[c] '%s'",

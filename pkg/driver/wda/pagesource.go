@@ -325,6 +325,9 @@ func matchesID(pattern, id string) bool {
 // and accessibility labels can disagree on composed vs decomposed accents
 // (e.g. "É" as U+00C9 vs "E"+U+0301), which a byte-wise compare misses.
 func matchesText(pattern string, texts ...string) bool {
+	if strictSelectors() {
+		return maestroTextMatches(pattern, texts...)
+	}
 	pattern = norm.NFC.String(pattern)
 	if looksLikeRegex(pattern) {
 		// Case-sensitive, deliberately. Compiling with (?i) meant an anchored
