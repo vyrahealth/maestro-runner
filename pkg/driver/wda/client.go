@@ -270,9 +270,24 @@ func (c *Client) Swipe(fromX, fromY, toX, toY float64, durationSec float64) erro
 	return err
 }
 
-// PointerSwipe is a one-finger swipe as W3C pointer actions: down at the start,
-// a move to the end that takes durationMs, then up. The move's duration is the
-// swipe's speed, which dragfromtoforduration cannot set.
+// maestroSwipeMoveMs is how long the finger travels in Maestro's iOS swipe,
+// whatever the swipe's duration (EventRecord.swift:31-38).
+const maestroSwipeMoveMs = 100
+
+// PointerSwipe is Maestro's iOS swipe as W3C pointer actions: down at the
+// start, at the end 100 ms later, and up durationMs after that.
+//
+// Maestro's XCTest runner builds every swipe as one XCTest pointer path: down
+// at the start, a move to the end at 100 ms, the lift at 100 ms plus the
+// swipe's duration (EventRecord.swift:31-38). A move in such a path is where
+// the finger is at that time, and XCTest carries the finger there in a
+// straight line from the point before. So the finger crosses in 100 ms, and
+// the swipe's duration is how long it then rests on the end before it lifts.
+//
+// WDA turns a pointerMove into a point the finger reaches when the move's
+// duration has passed, and a pause into nothing but time
+// (FBW3CActionsSynthesizer.m), so a 100 ms move and then a pause of
+// durationMs hand XCTest the same path Maestro hands it.
 func (c *Client) PointerSwipe(fromX, fromY, toX, toY float64, durationMs int) error {
 	finger := map[string]interface{}{
 		"type":       "pointer",
@@ -281,7 +296,8 @@ func (c *Client) PointerSwipe(fromX, fromY, toX, toY float64, durationMs int) er
 		"actions": []interface{}{
 			map[string]interface{}{"type": "pointerMove", "duration": 0, "x": fromX, "y": fromY},
 			map[string]interface{}{"type": "pointerDown", "button": 0},
-			map[string]interface{}{"type": "pointerMove", "duration": durationMs, "x": toX, "y": toY},
+			map[string]interface{}{"type": "pointerMove", "duration": maestroSwipeMoveMs, "x": toX, "y": toY},
+			map[string]interface{}{"type": "pause", "duration": durationMs},
 			map[string]interface{}{"type": "pointerUp", "button": 0},
 		},
 	}

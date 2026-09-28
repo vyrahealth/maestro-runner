@@ -754,8 +754,9 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 	}
 
 	// With timed swipes, a scroll is Maestro's: a swipe from the middle of the
-	// screen to 10% of its height, taking 333 ms (IOSDriver.kt:240-250), and
-	// the same swipe mirrored for the other directions.
+	// screen to 10% of its height, with a duration of 333 ms
+	// (IOSDriver.kt:240-250), and the same swipe mirrored for the other
+	// directions.
 	if timedSwipes() {
 		return d.timedScroll(step.Direction, core.ScrollDurationOrDefault(step.Speed, maestroScrollDurationMs))
 	}
@@ -771,7 +772,7 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 }
 
 // timedScroll makes the swipe Maestro scrolls with (maestroScrollSwipe) as a
-// W3C pointer gesture taking durationMs.
+// W3C pointer gesture with a duration of durationMs.
 func (d *Driver) timedScroll(direction string, durationMs int) *core.CommandResult {
 	width, height, err := d.screenSize()
 	if err != nil {
@@ -787,12 +788,13 @@ func (d *Driver) timedScroll(direction string, durationMs int) *core.CommandResu
 	return successResult(fmt.Sprintf("Scrolled %s", direction), nil)
 }
 
-// maestroSpeedToDurationMs is how long each of Maestro's scrollUntilVisible
-// swipes takes at a `speed:` (Commands.kt:151-156): 10 ms for every point
-// below 100, plus 1, so the default speed 40 (Commands.kt:177) takes 601 ms
-// and 100 takes 1 ms. Above 100 the result is negative, and Maestro puts its
-// default speed in its place, "40", which it then reads as 40 ms. A speed of
-// 0 cannot be told from no speed here, so it takes the default.
+// maestroSpeedToDurationMs is the duration Maestro gives each of
+// scrollUntilVisible's swipes at a `speed:` (Commands.kt:151-156): 10 ms for
+// every point below 100, plus 1, so the default speed 40 (Commands.kt:177)
+// gives 601 ms and 100 gives 1 ms. Above 100 the result is negative, and
+// Maestro puts its default speed in its place, "40", which it then reads as
+// 40 ms. A speed of 0 cannot be told from no speed here, so it gets the
+// default.
 func maestroSpeedToDurationMs(speed int) int {
 	if speed == 0 {
 		speed = 40
@@ -873,7 +875,7 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 
 		// Scroll. With timed swipes, as Maestro does it (Orchestra.kt:825-829):
 		// the swipe from the middle that `scroll` makes, 40% of the screen,
-		// taking as long as the step's speed says.
+		// with the duration the step's speed gives it.
 		var result *core.CommandResult
 		if timedSwipes() {
 			result = d.timedScroll(direction, maestroSpeedToDurationMs(step.Speed))
@@ -1117,7 +1119,7 @@ func maestroSwipeFrom(direction string, b core.Bounds, point string, screenW, sc
 		maestroOnScreen(endX, screenW), maestroOnScreen(endY, screenH), nil
 }
 
-// maestroScrollDurationMs is how long Maestro's `scroll` swipe takes
+// maestroScrollDurationMs is the duration of Maestro's `scroll` swipe
 // (IOSDriver.kt:248).
 const maestroScrollDurationMs = 333
 
@@ -1138,12 +1140,12 @@ func maestroScrollSwipe(scrollDirection string, screenW, screenH int) (sx, sy, e
 //
 // By default a swipe is dragfromtoforduration, whose duration is how long the
 // finger is held before a drag XCUITest paces itself, so every swipe comes out
-// as the same drag. With MAESTRO_WDA_TIMED_SWIPE set, a swipe that sets
-// `duration` is a finger that takes that long to travel from start to end, as
-// in Maestro: a short one is a fling that carries on momentum, a long one a
-// slow drag. A flow written for Maestro that throws a ruler to its end needs
-// the fling. With the switch, a swipe without a duration takes Maestro's
-// default 400 ms; without it, that swipe is the drag.
+// as the same drag. With MAESTRO_WDA_TIMED_SWIPE set, a swipe is Maestro's
+// gesture (Client.PointerSwipe): the finger crosses in 100 ms and rests on the
+// end for the swipe's duration, Maestro's default 400 ms when the flow sets
+// none, before it lifts. The shorter the rest, the more of the move's speed a
+// list keeps when the finger lifts. Without the switch, a swipe without a
+// duration is the drag.
 func (d *Driver) swipeGesture(fromX, fromY, toX, toY float64, durationMs int) error {
 	if timedSwipes() {
 		if durationMs <= 0 {

@@ -44,11 +44,21 @@ func swipeServer(t *testing.T, log *gestureLog) *httptest.Server {
 	}))
 }
 
-// The move's own duration, from the W3C body the fake WDA received.
-func moveDuration(t *testing.T, body map[string]interface{}) float64 {
+// The swipe's duration, from the W3C body the fake WDA received: the rest on
+// the end after the 100 ms move, which must be Maestro's shape.
+func swipeDuration(t *testing.T, body map[string]interface{}) float64 {
 	t.Helper()
 	actions := body["actions"].([]interface{})[0].(map[string]interface{})["actions"].([]interface{})
-	return actions[2].(map[string]interface{})["duration"].(float64)
+	var shape []string
+	for _, a := range actions {
+		item := a.(map[string]interface{})
+		shape = append(shape, fmt.Sprintf("%v %v", item["type"], item["duration"]))
+	}
+	if len(actions) != 5 || shape[0] != "pointerMove 0" || shape[1] != "pointerDown <nil>" ||
+		shape[2] != "pointerMove 100" || !strings.HasPrefix(shape[3], "pause ") || shape[4] != "pointerUp <nil>" {
+		t.Fatalf("gesture %v, want a 100 ms move and then a pause", shape)
+	}
+	return actions[3].(map[string]interface{})["duration"].(float64)
 }
 
 // Where the W3C gesture the fake WDA received starts and ends.
@@ -59,10 +69,11 @@ func gesturePoints(t *testing.T, body map[string]interface{}) [4]float64 {
 	return [4]float64{start["x"].(float64), start["y"].(float64), end["x"].(float64), end["y"].(float64)}
 }
 
-// A flow's 80 ms swipe is a fling (a ruler it throws should travel to its end);
-// its 600 ms swipe a slow drag. Both need the finger's travel time to be the
-// duration, which W3C pointer actions give and dragfromtoforduration does not.
-func TestTimedSwipeIsAPointerGestureOfThatLength(t *testing.T) {
+// Maestro's swipe crosses in 100 ms whatever its duration, and the duration
+// is how long the finger then rests on the end before it lifts
+// (EventRecord.swift:31-38). An 80 ms swipe and a 600 ms one differ only in
+// that rest, which dragfromtoforduration cannot give.
+func TestTimedSwipeIsMaestrosGesture(t *testing.T) {
 	t.Setenv("MAESTRO_WDA_TIMED_SWIPE", "1")
 	for _, ms := range []int{80, 600} {
 		log := &gestureLog{}
@@ -75,8 +86,8 @@ func TestTimedSwipeIsAPointerGestureOfThatLength(t *testing.T) {
 		if strings.Join(log.paths, ",") != "actions" {
 			t.Fatalf("%d ms: gesture endpoints %v, want the W3C actions alone", ms, log.paths)
 		}
-		if got := moveDuration(t, log.body); got != float64(ms) {
-			t.Errorf("%d ms: the move took %v ms", ms, got)
+		if got := swipeDuration(t, log.body); got != float64(ms) {
+			t.Errorf("%d ms: the finger rested %v ms", ms, got)
 		}
 	}
 }
@@ -101,8 +112,8 @@ func TestTimedSwipeWithoutDurationTakesMaestrosDefault(t *testing.T) {
 			t.Fatalf("switch %q: gesture endpoints %v, want %s alone", c.env, log.paths, c.paths)
 		}
 		if c.env != "" {
-			if got := moveDuration(t, log.body); got != 400 {
-				t.Errorf("the swipe took %v ms, want Maestro's 400", got)
+			if got := swipeDuration(t, log.body); got != 400 {
+				t.Errorf("the swipe's duration is %v ms, want Maestro's 400", got)
 			}
 		}
 	}
@@ -164,7 +175,8 @@ func TestTimedSwipeFromAnElementRunsToTheScreenEdge(t *testing.T) {
 }
 
 // With the switch, a scroll is Maestro's: from the middle of the screen
-// (195, 422) to 10% of its height, taking 333 ms (IOSDriver.kt:240-250), and
+// (195, 422) to 10% of its height, with a duration of 333 ms
+// (IOSDriver.kt:240-250), and
 // the same swipe mirrored for the other directions. It was a 0.3 s hold and a
 // drag from 66.7% to 33.3% of the height. A `speed:` still sets the duration.
 func TestTimedScrollIsMaestrosSwipeFromTheMiddle(t *testing.T) {
@@ -195,8 +207,8 @@ func TestTimedScrollIsMaestrosSwipeFromTheMiddle(t *testing.T) {
 		if got := gesturePoints(t, log.body); got != c.want {
 			t.Errorf("%s: scroll %v, want %v", c.direction, got, c.want)
 		}
-		if got := moveDuration(t, log.body); got != c.ms {
-			t.Errorf("%s at speed %d: took %v ms, want %v", c.direction, c.speed, got, c.ms)
+		if got := swipeDuration(t, log.body); got != c.ms {
+			t.Errorf("%s at speed %d: duration %v ms, want %v", c.direction, c.speed, got, c.ms)
 		}
 	}
 	server := swipeServer(t, &gestureLog{})
@@ -207,8 +219,8 @@ func TestTimedScrollIsMaestrosSwipeFromTheMiddle(t *testing.T) {
 }
 
 // With the switch, each of scrollUntilVisible's scrolls is Maestro's
-// (Orchestra.kt:825-829): the swipe from the middle, 40% of the screen, taking
-// the step's speed as Maestro converts it (Commands.kt:151-156): 601 ms at the
+// (Orchestra.kt:825-829): the swipe from the middle, 40% of the screen, with
+// the duration Maestro makes of the speed (Commands.kt:151-156): 601 ms at the
 // default speed 40, 1 ms at 100, and Maestro's fallback of 40 ms above 100.
 // It was the runner's 1/3-screen drag after a 0.3 s hold.
 func TestTimedScrollUntilVisibleScrollsLikeMaestro(t *testing.T) {
@@ -243,8 +255,8 @@ func TestTimedScrollUntilVisibleScrollsLikeMaestro(t *testing.T) {
 		if got := gesturePoints(t, log.body); got != c.want {
 			t.Errorf("%s: scroll %v, want %v", c.direction, got, c.want)
 		}
-		if got := moveDuration(t, log.body); got != c.ms {
-			t.Errorf("%s at speed %d: took %v ms, want %v", c.direction, c.speed, got, c.ms)
+		if got := swipeDuration(t, log.body); got != c.ms {
+			t.Errorf("%s at speed %d: duration %v ms, want %v", c.direction, c.speed, got, c.ms)
 		}
 	}
 }
