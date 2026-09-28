@@ -127,6 +127,65 @@ func strictQueryable(sel flow.Selector) bool {
 	return sel.Width == 0 && sel.Height == 0 && sel.Index == ""
 }
 
+// maestroOnScreen reports whether Maestro keeps an element on the strength
+// of its own bounds: at least 10% of it on screen (UiElement.kt:31-47,
+// ViewHierarchy.kt:115). A 0x0 element scores 0 and is dropped. One with a
+// zero width or a zero height, not both, scores 0/0, which is NaN and not
+// below 0.1, so it is kept wherever it is. Maestro never asks XCUITest
+// whether an element is visible.
+func maestroOnScreen(b core.Bounds, screenW, screenH int) bool {
+	if b.Width == 0 && b.Height == 0 {
+		return false
+	}
+	if b.Width == 0 || b.Height == 0 {
+		return true
+	}
+	return b.VisiblePercentage(screenW, screenH) >= 0.1
+}
+
+// maestroVisibleTree is Maestro's filterOutOfBounds (ViewHierarchy.kt:102-128)
+// over a parsed page source: an element stays when it is on screen by its
+// own bounds (maestroOnScreen) or has a descendant that stays. It returns
+// copies, in tree order, whose Parent and Children link only elements that
+// stay, and leaves the parse as it was. A page source that would lose every
+// element is kept whole, as Maestro then keeps its root unfiltered
+// (ViewHierarchy.kt:29-35).
+func maestroVisibleTree(elements []*ParsedElement, screenW, screenH int) []*ParsedElement {
+	keep := make(map[*ParsedElement]bool, len(elements))
+	// A child comes after its parent in the flattened list, so walking the
+	// list backwards settles every child before its parent.
+	for i := len(elements) - 1; i >= 0; i-- {
+		e := elements[i]
+		if keep[e] || maestroOnScreen(e.Bounds, screenW, screenH) {
+			keep[e] = true
+			if e.Parent != nil {
+				keep[e.Parent] = true
+			}
+		}
+	}
+	if len(keep) == 0 {
+		for _, e := range elements {
+			keep[e] = true
+		}
+	}
+
+	copies := make(map[*ParsedElement]*ParsedElement, len(keep))
+	out := make([]*ParsedElement, 0, len(keep))
+	for _, e := range elements {
+		if !keep[e] {
+			continue
+		}
+		c := *e
+		c.Parent, c.Children = copies[e.Parent], nil
+		if c.Parent != nil {
+			c.Parent.Children = append(c.Parent.Children, &c)
+		}
+		copies[e] = &c
+		out = append(out, &c)
+	}
+	return out
+}
+
 // strictTextByWDA is findElementByWDA's text query with
 // MAESTRO_STRICT_SELECTORS set: an exact, case-insensitive comparison with
 // the label, value or placeholder, run only for text that means itself (see
