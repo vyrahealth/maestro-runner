@@ -4864,7 +4864,14 @@ func TestInputTextTapError(t *testing.T) {
 func TestAssertNotVisibleWithTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// Return error to indicate element not found
+		// The screen reads, and holds nothing matching. (An error from
+		// /source would not mean "not found"; see notvisible_test.go.)
+		if strings.HasSuffix(r.URL.Path, "/source") {
+			jsonResponse(w, map[string]interface{}{
+				"value": `<AppiumAUT><XCUIElementTypeApplication type="XCUIElementTypeApplication" x="0" y="0" width="390" height="844"/></AppiumAUT>`,
+			})
+			return
+		}
 		jsonResponse(w, map[string]interface{}{
 			"value": map[string]interface{}{"error": "not found"},
 		})
