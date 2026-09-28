@@ -28,10 +28,12 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// ordinary buttons: an alert's Delete, a form's Return. Tap such an
 	// element when one is on screen, and send the key only when none is and
 	// a keyboard is up. Sending the key first made tapOn: Delete a backspace
-	// that dismissed nothing and still reported success (#179).
+	// that dismissed nothing and still reported success (#179). With
+	// MAESTRO_STRICT_SELECTORS a tapOn is only ever an element lookup, as in
+	// Maestro (Orchestra.kt:1325-1331); pressKey sends keys.
 	var info *core.ElementInfo
 	var err error
-	if keyChar := iosKeyboardKey(step.Selector.Text); keyChar != "" && step.Selector.ID == "" {
+	if keyChar := iosKeyboardKey(step.Selector.Text); keyChar != "" && step.Selector.ID == "" && !strictSelectors() {
 		if found, findErr := d.findElementForTap(step.Selector, true, keyboardKeyProbeMs); findErr == nil && found != nil {
 			info = found
 		} else if shown, _ := d.keyboardVisible(); shown {
