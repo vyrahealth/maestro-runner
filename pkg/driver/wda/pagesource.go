@@ -263,7 +263,8 @@ func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
 	// Size matching with tolerance
 	if sel.Width > 0 || sel.Height > 0 {
 		tolerance := sel.Tolerance
-		if tolerance == 0 {
+		// Maestro's default tolerance is 0 (Filters.kt:146).
+		if tolerance == 0 && !strictSelectors() {
 			tolerance = 5
 		}
 		if sel.Width > 0 && !withinTolerance(elem.Bounds.Width, sel.Width, tolerance) {
