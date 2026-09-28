@@ -216,6 +216,12 @@ func CountVisibleMatches(elements []*ParsedElement, sel flow.Selector, screenW, 
 	if screenW > 0 && screenH > 0 {
 		elements = FilterOutOfBounds(elements, screenW, screenH)
 	}
+	if strictSelectors() {
+		// What Maestro's lookup chooses from: the deepest matches, without
+		// their matching ancestors.
+		matches, _ := maestroFilter(elements, sel)
+		return len(matches)
+	}
 	return len(FilterBySelector(elements, sel))
 }
 
