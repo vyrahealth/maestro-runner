@@ -99,6 +99,11 @@ func NewDriver(client *Client, info *core.PlatformInfo, udid string) *Driver {
 // at "", which means no monitor is registered and in-app dialogs aren't
 // auto-handled.
 func (d *Driver) PrepareForFlow(steps []flow.Step) {
+	// A crash loop is diagnosed for the flow it happened in. The next flow
+	// launches the app again and gets its own chance.
+	d.crashAbortReason = ""
+	d.appDeathCount = 0
+
 	for _, s := range steps {
 		launchApp, ok := s.(*flow.LaunchAppStep)
 		if !ok {
@@ -456,7 +461,8 @@ func (d *Driver) trackCrashLoop(result *core.CommandResult) {
 
 // isAppDeathError matches result messages / error texts that indicate the
 // app under test is no longer running. Patterns drawn from real WDA failure
-// modes observed in #38 and similar repros.
+// modes observed in #38 and similar repros. A reset or refused connection is
+// not one: that is WDA or the link to it, with the app possibly fine.
 func isAppDeathError(result *core.CommandResult) bool {
 	if result == nil {
 		return false
@@ -478,8 +484,6 @@ func isAppDeathError(result *core.CommandResult) bool {
 		"could not start app",
 		"failed to launch",
 		"no such session",
-		"connection reset",
-		"connection refused",
 	}
 	for _, s := range signals {
 		if strings.Contains(combined, s) {
