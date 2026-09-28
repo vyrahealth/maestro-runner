@@ -783,7 +783,7 @@ func (d *Driver) calculateTimeout(optional bool, stepTimeoutMs int) time.Duratio
 			timeoutMs = d.optionalFindTimeout
 		}
 	} else {
-		timeoutMs = DefaultFindTimeout
+		timeoutMs = requiredFindTimeoutMs()
 		if d.findTimeout > 0 {
 			timeoutMs = d.findTimeout
 		}

@@ -352,7 +352,7 @@ func (d *Driver) assertVisible(step *flow.AssertVisibleStep) *core.CommandResult
 		return d.assertVisibleCount(step, want)
 	}
 
-	info, err := d.findElement(step.Selector, step.IsOptional(), step.TimeoutMs)
+	info, err := d.findElement(step.Selector, assertionOptional(step.IsOptional()), step.TimeoutMs)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Element not visible: %s", selectorDesc(step.Selector)))
 	}
@@ -374,7 +374,7 @@ func (d *Driver) assertVisibleCount(step *flow.AssertVisibleStep, want int) *cor
 		return errorResult(err, err.Error())
 	}
 
-	timeout := d.calculateTimeout(step.IsOptional(), step.TimeoutMs)
+	timeout := d.calculateTimeout(assertionOptional(step.IsOptional()), step.TimeoutMs)
 	ctx, cancel := context.WithTimeout(d.parentContext(), timeout)
 	defer cancel()
 
@@ -438,7 +438,7 @@ func (d *Driver) assertNotVisible(step *flow.AssertNotVisibleStep) *core.Command
 	// element is still visible, and the step fails at timeout.
 	timeoutMs := step.TimeoutMs
 	if timeoutMs <= 0 {
-		timeoutMs = 5000
+		timeoutMs = notVisibleTimeoutMs()
 	}
 
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
@@ -1705,7 +1705,9 @@ func (d *Driver) clearAppStateDevice(bundleID string) *core.CommandResult {
 // Clipboard
 
 func (d *Driver) copyTextFrom(step *flow.CopyTextFromStep) *core.CommandResult {
-	info, err := d.findElement(step.Selector, false, step.TimeoutMs)
+	// Maestro gives an optional copyTextFrom the optional lookup timeout
+	// (Orchestra.kt:1773).
+	info, err := d.findElement(step.Selector, step.IsOptional() && parityTimeouts(), step.TimeoutMs)
 	if err != nil {
 		return errorResult(err, fmt.Sprintf("Element not found: %s", selectorDesc(step.Selector)))
 	}
@@ -1894,7 +1896,9 @@ func (d *Driver) openBrowser(step *flow.OpenBrowserStep) *core.CommandResult {
 func (d *Driver) waitUntil(step *flow.WaitUntilStep) *core.CommandResult {
 	timeoutMs := step.TimeoutMs
 	if timeoutMs <= 0 {
-		timeoutMs = DefaultFindTimeout
+		// Maestro's extendedWaitUntil without a timeout is an assertion with
+		// the full lookup timeout (YamlFluentCommand.kt:751-769).
+		timeoutMs = requiredFindTimeoutMs()
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
