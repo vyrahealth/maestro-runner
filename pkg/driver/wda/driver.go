@@ -1158,6 +1158,9 @@ func (d *Driver) findElementRelativeOnce(sel flow.Selector) (*core.ElementInfo, 
 		allElements = FilterOutOfBounds(allElements, w, h)
 	}
 
+	if strictSelectors() {
+		return d.strictMatch(sel, allElements)
+	}
 	return d.resolveRelativeSelector(sel, allElements)
 }
 
@@ -1257,6 +1260,9 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 		allElements = FilterOutOfBounds(allElements, w, h)
 	}
 
+	if strictSelectors() {
+		return d.strictMatch(sel, allElements)
+	}
 	candidates := FilterBySelector(allElements, sel)
 
 	// XCUITest's `visible="false"` is unreliable on React Native testID-bearing
