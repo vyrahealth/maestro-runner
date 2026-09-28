@@ -552,29 +552,30 @@ func (d *Driver) findElementWithContext(ctx context.Context, sel flow.Selector) 
 	// All other selectors - try WDA strategies with page source fallback
 	var lastErr error
 
-	for {
-		select {
-		case <-ctx.Done():
+	// The first attempt runs whatever the deadline, as Maestro's timer always
+	// looks once (MaestroTimer.kt): a condition checked after a long step has
+	// almost no budget left and must still look at the screen.
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil && attempt > 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("%s: %w", ctx.Err(), lastErr)
+				return nil, fmt.Errorf("%s: %w", err, lastErr)
 			}
-			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), ctx.Err())
-		default:
-			// Try WDA strategies first (skip for index selectors — WDA returns single match)
-			if !sel.HasNonZeroIndex() {
-				if info, err := d.findElementByWDA(sel); err == nil {
-					return info, nil
-				}
-			}
-
-			// Fallback to page source parsing
-			if info, err := d.findElementByPageSourceOnce(sel); err == nil {
-				return info, nil
-			} else {
-				lastErr = err
-			}
-			time.Sleep(50 * time.Millisecond)
+			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), err)
 		}
+		// Try WDA strategies first (skip for index selectors — WDA returns single match)
+		if !sel.HasNonZeroIndex() {
+			if info, err := d.findElementByWDA(sel); err == nil {
+				return info, nil
+			}
+		}
+
+		// Fallback to page source parsing
+		if info, err := d.findElementByPageSourceOnce(sel); err == nil {
+			return info, nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -1123,21 +1124,20 @@ func (d *Driver) onScreenOf(ids []string) (*core.ElementInfo, error) {
 func (d *Driver) findElementRelativeWithContext(ctx context.Context, sel flow.Selector) (*core.ElementInfo, error) {
 	var lastErr error
 
-	for {
-		select {
-		case <-ctx.Done():
+	// As in findElementWithContext, the first attempt runs whatever the deadline.
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil && attempt > 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("%s: %w", ctx.Err(), lastErr)
+				return nil, fmt.Errorf("%s: %w", err, lastErr)
 			}
-			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), ctx.Err())
-		default:
-			info, err := d.findElementRelativeOnce(sel)
-			if err == nil {
-				return info, nil
-			}
-			lastErr = err
-			// HTTP round-trip is natural rate limit, no sleep needed
+			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), err)
 		}
+		info, err := d.findElementRelativeOnce(sel)
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+		// HTTP round-trip is natural rate limit, no sleep needed
 	}
 }
 
