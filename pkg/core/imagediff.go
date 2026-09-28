@@ -99,6 +99,59 @@ func CheckImageDifference(a, b []byte) (float64, error) {
 	return float64(differing) / float64(total), nil
 }
 
+// ScreenChangePercent measures two screenshots the way Maestro's tap decides
+// whether the tap changed the screen (Maestro.kt:486-495, through
+// image-comparison 4.4.0): 0 when no pixel differs by more than Maestro's
+// per-pixel tolerance, otherwise the summed channel difference as a percentage
+// (0 to 100) of the largest one possible. Maestro compares that with 0.005, so
+// on a phone screenshot a patch about a dozen pixels square that changes colour
+// outright is a change. ok is false when the two cannot be compared (either fails to decode, or the
+// sizes differ), which Maestro treats as no evidence of a change.
+func ScreenChangePercent(a, b []byte) (percent float64, ok bool) {
+	imgA, _, err := image.Decode(bytes.NewReader(a))
+	if err != nil {
+		return 0, false
+	}
+	imgB, _, err := image.Decode(bytes.NewReader(b))
+	if err != nil {
+		return 0, false
+	}
+	boundsA, boundsB := imgA.Bounds(), imgB.Bounds()
+	width, height := boundsA.Dx(), boundsA.Dy()
+	if width != boundsB.Dx() || height != boundsB.Dy() || width == 0 || height == 0 {
+		return 0, false
+	}
+
+	maxColorDistance := math.Sqrt(255.0 * 255.0 * 3)
+	differenceLimit := math.Pow(maestroPixelTolerance*maxColorDistance, 2)
+	var sum int64
+	beyondTolerance := false
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			r1, g1, b1, _ := imgA.At(boundsA.Min.X+x, boundsA.Min.Y+y).RGBA()
+			r2, g2, b2, _ := imgB.At(boundsB.Min.X+x, boundsB.Min.Y+y).RGBA()
+			dr := int64(r1>>8) - int64(r2>>8)
+			dg := int64(g1>>8) - int64(g2>>8)
+			db := int64(b1>>8) - int64(b2>>8)
+			sum += absInt64(dr) + absInt64(dg) + absInt64(db)
+			if float64(dr*dr+dg*dg+db*db) > differenceLimit {
+				beyondTolerance = true
+			}
+		}
+	}
+	if !beyondTolerance {
+		return 0, true
+	}
+	return 100 * float64(sum) / float64(int64(3*255)*int64(width)*int64(height)), true
+}
+
+func absInt64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
 // ImageMatchStats describes an assertScreenshot comparison: the match
 // percentage plus the raw pixel counts behind it. The counts matter because a
 // handful of differing pixels in a multi-megapixel screenshot rounds to

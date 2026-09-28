@@ -259,3 +259,75 @@ func TestWriteScreenshotDiff_DrawsRectangleOverlay(t *testing.T) {
 		t.Error("expected a red rectangle border around the differing region")
 	}
 }
+
+// pngWithPixel renders a w×h image of fill with the pixel at (px, py) set to dot.
+func pngWithPixel(t *testing.T, w, h int, fill color.Color, px, py int, dot color.Color) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, fill)
+		}
+	}
+	img.Set(px, py, dot)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// Maestro's tap asks image-comparison whether a tap changed the screen: nothing
+// counts until one pixel differs beyond the colour tolerance, and then every
+// pixel's difference counts, as a percentage of the largest possible.
+func TestScreenChangePercent_MeasuresLikeMaestro(t *testing.T) {
+	gray := color.RGBA{R: 100, G: 100, B: 100, A: 255}
+	slightlyRed := color.RGBA{R: 110, G: 100, B: 100, A: 255}
+	base := encodePNG(t, 100, 100, gray)
+
+	for _, tc := range []struct {
+		name  string
+		other []byte
+		want  float64
+	}{
+		{"identical", encodePNG(t, 100, 100, gray), 0},
+		// One pixel 10 levels off is inside the tolerance: no change at all.
+		{"one pixel within tolerance", pngWithPixel(t, 100, 100, gray, 5, 5, slightlyRed), 0},
+		// One pixel from gray to white: 3×155 of 3×255×10000 levels.
+		{"one pixel beyond tolerance", pngWithPixel(t, 100, 100, gray, 5, 5, color.White), 100 * 465.0 / 7650000},
+		// Once one pixel is beyond it, the ones within it count too.
+		{"within-tolerance pixels count once one is beyond", pngWithPixel(t, 100, 100, slightlyRed, 5, 5, color.White), 100 * (9999*10 + 465.0) / 7650000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ScreenChangePercent(base, tc.other)
+			if !ok {
+				t.Fatal("the screenshots should be comparable")
+			}
+			if diff := got - tc.want; diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("percent = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// One pixel turning from black to white on a 100×100 screen is 0.01%, over
+// Maestro's 0.005.
+func TestScreenChangePercent_OnePixelInTenThousandIsAChange(t *testing.T) {
+	got, _ := ScreenChangePercent(encodePNG(t, 100, 100, color.Black), pngWithPixel(t, 100, 100, color.Black, 0, 0, color.White))
+	if got <= 0.005 {
+		t.Errorf("percent = %v, want over 0.005", got)
+	}
+}
+
+func TestScreenChangePercent_IncomparableScreenshots(t *testing.T) {
+	a := encodePNG(t, 10, 10, color.Black)
+	if _, ok := ScreenChangePercent(a, encodePNG(t, 20, 10, color.Black)); ok {
+		t.Error("different sizes should not be comparable")
+	}
+	if _, ok := ScreenChangePercent(a, []byte("garbage")); ok {
+		t.Error("an undecodable screenshot should not be comparable")
+	}
+	if _, ok := ScreenChangePercent(nil, a); ok {
+		t.Error("a missing screenshot should not be comparable")
+	}
+}
