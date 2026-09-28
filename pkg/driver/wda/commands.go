@@ -897,6 +897,19 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 				return errorResult(err, fmt.Sprintf("Element not found for swipe: %s", step.Selector.Describe()))
 			}
 			if info != nil && info.Bounds.Width > 0 {
+				// With timed swipes, a swipe from an element runs as in
+				// Maestro, to the screen's edge (maestroSwipeFrom). The
+				// runner's own `distance:` keeps its meaning.
+				if timedSwipes() && step.Distance == 0 {
+					sx, sy, ex, ey, perr := maestroSwipeFrom(strings.ToLower(step.Direction), info.Bounds, step.Selector.Point, width, height)
+					if perr != nil {
+						return errorResult(perr, fmt.Sprintf("Invalid swipe: %v", perr))
+					}
+					if err := d.swipeGesture(sx, sy, ex, ey, step.Duration); err != nil {
+						return errorResult(err, "Swipe failed")
+					}
+					return successResult("Swipe completed", info)
+				}
 				// An element-relative `point:` re-aims where the swipe
 				// starts (upstream #3470). It was parsed into the selector
 				// and ignored here while the Android drivers honoured it.
@@ -990,6 +1003,46 @@ const maestroSwipeDurationMs = 400
 // swipes W3C pointer gestures timed as Maestro times them.
 func timedSwipes() bool {
 	return os.Getenv("MAESTRO_WDA_TIMED_SWIPE") != ""
+}
+
+// maestroPercentOf is a fraction of a screen dimension cut to a whole point,
+// as Maestro's asPercentOf computes it (IOSDriver.kt:700-702).
+func maestroPercentOf(fraction float64, total int) int {
+	return int(fraction * float64(total))
+}
+
+// maestroOnScreen keeps either end of a swipe within [0, limit], as Maestro's
+// Point.coerceIn does before every iOS swipe (IOSDriver.kt:265-266, 704-709).
+func maestroOnScreen(v, limit int) float64 {
+	return float64(min(max(v, 0), limit))
+}
+
+// maestroSwipeFrom is where Maestro's swipe from an element starts and ends on
+// iOS. It starts at the element's center, or at its `point:`
+// (Orchestra.kt:1727-1737), and runs to 10% or 90% of the screen along the
+// swipe (IOSDriver.kt:339-367), however small the element. The runner's own
+// swipe from an element spans 10% to 90% of the element instead (20% to 90%
+// going down), which barely moves a list from a short row.
+func maestroSwipeFrom(direction string, b core.Bounds, point string, screenW, screenH int) (sx, sy, ex, ey float64, err error) {
+	x, y, err := core.PointInBounds(point, b)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	endX, endY := x, y
+	switch direction {
+	case "up":
+		endY = maestroPercentOf(0.1, screenH)
+	case "down":
+		endY = maestroPercentOf(0.9, screenH)
+	case "right":
+		endX = maestroPercentOf(0.9, screenW)
+	case "left":
+		endX = maestroPercentOf(0.1, screenW)
+	default:
+		return 0, 0, 0, 0, fmt.Errorf("invalid swipe direction: %q", direction)
+	}
+	return maestroOnScreen(x, screenW), maestroOnScreen(y, screenH),
+		maestroOnScreen(endX, screenW), maestroOnScreen(endY, screenH), nil
 }
 
 // swipeGesture performs a swipe step's gesture.
