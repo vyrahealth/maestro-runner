@@ -1248,7 +1248,12 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 	if err != nil {
 		return nil, err
 	}
+	return d.findInPageSource(pageSource, sel)
+}
 
+// findInPageSource matches a selector against a page source already read, so a
+// caller that needs the source for something else as well reads it once.
+func (d *Driver) findInPageSource(pageSource string, sel flow.Selector) (*core.ElementInfo, error) {
 	allElements, err := ParsePageSource(pageSource)
 	if err != nil {
 		return nil, err

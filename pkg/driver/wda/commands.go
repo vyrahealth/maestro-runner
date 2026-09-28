@@ -878,7 +878,22 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	centerTries := 0
 
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
-		info, err := d.findElement(step.Element, true, 1000)
+		// One page source a pass, for the lookup and for the end-of-content check:
+		// on a real phone a page source takes 2 to 3 s, and a pass read two.
+		// Relative selectors keep their own lookup, which reads its own.
+		var info *core.ElementInfo
+		var err error
+		source, sourceOK := "", false
+		if !step.Element.HasRelativeSelector() {
+			if src, srcErr := d.client.Source(); srcErr == nil && src != "" {
+				source, sourceOK = src, true
+			}
+		}
+		if sourceOK {
+			info, err = d.findInPageSource(source, step.Element)
+		} else {
+			info, err = d.findElement(step.Element, true, 1000)
+		}
 		visibleOffCenter := false
 		if err == nil && info != nil {
 			// Found in the tree is not enough: an element half-hidden behind
@@ -902,7 +917,11 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			}
 		}
 
-		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+		sig, ok := core.ScrollSignature(source), sourceOK
+		if !sourceOK {
+			sig, ok = d.scrollSurfaceSignature()
+		}
+		if ok && progress.Observe(sig) {
 			// A list at its end cannot bring the element any nearer the
 			// middle. Maestro would spend its remaining looks and then take
 			// an element the plain test passes, as this one does.

@@ -18,6 +18,7 @@ import (
 type listFake struct {
 	mu      sync.Mutex
 	scrolls int
+	sources int
 	targetY func(scrolls int) int
 	targetH int
 	moving  bool
@@ -35,6 +36,7 @@ func (f *listFake) server(t *testing.T) *httptest.Server {
 			f.scrolls++
 			jsonResponse(w, map[string]interface{}{"status": 0})
 		case strings.HasSuffix(path, "/source"):
+			f.sources++
 			other := 0
 			if f.moving {
 				other = f.scrolls
@@ -149,5 +151,23 @@ func TestScrollUntilVisibleCenterElementLeavesASliverToThePlainTest(t *testing.T
 	}
 	if scrolls != 0 {
 		t.Errorf("%d scrolls, want 0", scrolls)
+	}
+}
+
+// On a real phone a page source takes 2 to 3 s, and each pass used to read
+// two: one for the lookup and one to tell whether the list still moves. One
+// serves both now.
+func TestScrollUntilVisibleReadsOnePageSourceAPass(t *testing.T) {
+	f := &listFake{targetY: func(int) int { return 2000 }, targetH: 50, moving: true}
+	step := centerStep(false)
+	step.MaxScrolls = 4
+	ok, _, scrolls := f.run(t, step)
+	if ok {
+		t.Fatal("a row below the screen was taken as found")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if scrolls != 4 || f.sources != 4 {
+		t.Errorf("%d scrolls read %d page sources, want 4 and 4", scrolls, f.sources)
 	}
 }
