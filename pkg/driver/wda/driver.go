@@ -592,6 +592,12 @@ func (d *Driver) findElementForTap(sel flow.Selector, optional bool, stepTimeout
 		return d.findElement(sel, optional, stepTimeoutMs)
 	}
 
+	// checked is only known from the page source, which findElement reaches;
+	// the text strategies below would tap a switch in either state.
+	if sel.Checked != nil {
+		return d.findElement(sel, optional, stepTimeoutMs)
+	}
+
 	// For ID-based selectors, use standard findElement (IDs are usually unique)
 	if sel.ID != "" {
 		return d.findElement(sel, optional, stepTimeoutMs)
@@ -896,6 +902,11 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 	if sel.ID != "" && sel.Text != "" {
 		return nil, fmt.Errorf("combined id+text selector requires page-source AND matching")
 	}
+	// checked is read from the page source (type and value); the queries
+	// below would match a switch in either state.
+	if sel.Checked != nil {
+		return nil, fmt.Errorf("checked selector requires page-source matching")
+	}
 
 	// Try class chain for accessibility ID
 	if sel.ID != "" {
@@ -1133,7 +1144,7 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector, allElements []*Parse
 
 	// Get candidates
 	var candidates []*ParsedElement
-	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 {
+	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 || baseSel.Checked != nil {
 		candidates = FilterBySelector(allElements, baseSel)
 	} else {
 		candidates = allElements

@@ -26,6 +26,7 @@ type ParsedElement struct {
 	Displayed        bool // visible
 	Selected         bool
 	Focused          bool
+	Checked          bool // a Switch, CheckBox or Toggle whose value is "1" (see isCheckableType)
 	Children         []*ParsedElement
 	Parent           *ParsedElement // parent element for clickable lookup
 	Depth            int
@@ -111,6 +112,10 @@ func ParsePageSource(xmlData string) ([]*ParsedElement, error) {
 						}
 					}
 				}
+
+				// WDA's source has no checked attribute. Maestro derives it the
+				// same way, from the element's type and value (IOSDriver.kt:223).
+				elem.Checked = isCheckableType(elem.Type) && elem.Value == "1"
 
 				// Parse children recursively
 				for {
@@ -264,8 +269,22 @@ func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
 	if sel.Focused != nil && elem.Focused != *sel.Focused {
 		return false
 	}
+	if sel.Checked != nil && elem.Checked != *sel.Checked {
+		return false
+	}
 
 	return true
+}
+
+// isCheckableType reports the element types Maestro reads checked from:
+// XCUIElementType CheckBox (12), Switch (40) and Toggle (41), in
+// IOSDriver.kt:680-690. For a Switch WDA reports the value as "1" or "0".
+func isCheckableType(elemType string) bool {
+	switch elemType {
+	case "XCUIElementTypeCheckBox", "XCUIElementTypeSwitch", "XCUIElementTypeToggle":
+		return true
+	}
+	return false
 }
 
 // withinTolerance checks if actual is within tolerance of expected.
