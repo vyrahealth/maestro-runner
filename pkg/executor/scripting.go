@@ -658,17 +658,11 @@ func conditionTimeout(cond flow.Condition, sel *flow.Selector, fallback int) int
 
 // withEnvVars applies environment variables and returns a restore function.
 // Values are expanded through ExpandVariables to support ${VAR || "default"} syntax.
+// The restore puts back what each key held and removes a key that was not set
+// before, as Maestro's leaveEnvScope does (GraalJsEngine.kt:223-238), rather
+// than leaving it set to "".
 func (se *ScriptEngine) withEnvVars(env map[string]string) func() {
-	oldVars := make(map[string]string)
-	for k, v := range env {
-		oldVars[k] = se.GetVariable(k)
-		se.SetVariable(k, se.ExpandVariables(v))
-	}
-	return func() {
-		for k, v := range oldVars {
-			se.SetVariable(k, v)
-		}
-	}
+	return se.applyScopedEnv(env)
 }
 
 // parseBoolExpr converts the resolved value of an `enabled:` argument into a
