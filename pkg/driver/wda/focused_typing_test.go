@@ -21,6 +21,11 @@ type focusedFieldServer struct {
 	garble  func(string) string
 	clears  int
 	retyped int
+
+	// late is added to the field on its second read after typing, as the
+	// keyboard added an "@" about a second after the read-back on the phone.
+	late      string
+	sinceKeys int
 }
 
 func (f *focusedFieldServer) handler(t *testing.T) http.HandlerFunc {
@@ -40,9 +45,14 @@ func (f *focusedFieldServer) handler(t *testing.T) http.HandlerFunc {
 		case strings.HasSuffix(path, "/element/active"):
 			jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{"ELEMENT": "field-1"}})
 		case strings.HasSuffix(path, "/element/field-1/text"):
+			if f.sinceKeys++; f.sinceKeys == 2 && f.late != "" {
+				f.value += f.late
+				f.late = ""
+			}
 			jsonResponse(w, map[string]interface{}{"value": f.value})
 		case strings.HasSuffix(path, "/wda/keys"):
 			f.value += f.garble(keys())
+			f.sinceKeys = 0
 			jsonResponse(w, map[string]interface{}{"value": nil})
 		case strings.HasSuffix(path, "/element/field-1/clear"):
 			f.clears++
@@ -115,11 +125,31 @@ func TestInputTextFocusedFieldExtraCharacter(t *testing.T) {
 	})
 }
 
-// A clean entry costs two reads and nothing else.
+// A clean entry is read back and nothing else.
 func TestInputTextFocusedFieldThatLandedIsNotRetyped(t *testing.T) {
 	t.Setenv("MAESTRO_STRICT_TYPING", "1")
 	f, _ := typeIntoFocusedField(t, func(s string) string { return s })
 	if f.value != focusedEmail || f.clears != 0 || f.retyped != 0 {
 		t.Fatalf("field %q, %d clears, %d retypes: want the text as typed and no retype", f.value, f.clears, f.retyped)
+	}
+}
+
+// The "@" that came about a second after a read-back that matched: with
+// MAESTRO_STRICT_TYPING the read-back waits for two reads that agree, sees
+// it, and retypes the field.
+func TestInputTextFocusedFieldLateCharacterWithStrictTyping(t *testing.T) {
+	t.Setenv("MAESTRO_STRICT_TYPING", "1")
+	f := &focusedFieldServer{garble: func(s string) string { return s }, late: "@"}
+	server := httptest.NewServer(f.handler(t))
+	defer server.Close()
+	result := createTestDriver(server).inputText(&flow.InputTextStep{Text: focusedEmail})
+	if !result.Success {
+		t.Fatalf("inputText failed: %s", result.Message)
+	}
+	if f.value != focusedEmail || f.retyped != 1 {
+		t.Fatalf("field holds %q after %d retypes, want %q after one", f.value, f.retyped, focusedEmail)
+	}
+	if !strings.Contains(result.Message, "held more than was typed") {
+		t.Errorf("message %q does not say why it retyped", result.Message)
 	}
 }
