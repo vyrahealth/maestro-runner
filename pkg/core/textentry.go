@@ -227,11 +227,13 @@ func strictTyping() bool {
 }
 
 // A strict read-back waits typedReadWait between reads of the field, and gives
-// up waiting for two to agree after about typedReadLimit. Variables so tests
+// up waiting for two to agree after about typedReadLimit. The wait is longer
+// than the keyboard's late character took to arrive (about a second after the
+// text was typed), so two reads that agree have seen it. Variables so tests
 // can shorten them.
 var (
-	typedReadWait  = 500 * time.Millisecond
-	typedReadLimit = 1500 * time.Millisecond
+	typedReadWait  = 1200 * time.Millisecond
+	typedReadLimit = 3 * time.Second
 )
 
 // readBack reads the field back after typing. With MAESTRO_STRICT_TYPING set
