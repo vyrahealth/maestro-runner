@@ -142,9 +142,15 @@ func (fr *FlowRunner) waitForSettle(timeoutMs int) []byte {
 //     b. hierarchyAfter = waitForSettle(waitToSettleTimeoutMs)
 //     c. if hierarchy changed → return
 //  3. return last result
+//
+// A driver that settles the way Maestro's iOS driver does gets Maestro's iOS
+// tap instead (executeScreenshotBasedTap).
 func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *core.CommandResult {
 	if !opts.hasTapOptions() {
 		return fr.driver.Execute(step)
+	}
+	if settler, ok := core.Unwrap(fr.driver).(screenshotSettler); ok {
+		return fr.executeScreenshotBasedTap(step, opts, settler)
 	}
 
 	settleTimeout := opts.WaitToSettleTimeoutMs
@@ -161,16 +167,6 @@ func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *co
 		retryCount = 2
 	}
 
-	repeatCount := opts.Repeat
-	if repeatCount <= 0 {
-		repeatCount = 1
-	}
-
-	delayMs := opts.DelayMs
-	if delayMs <= 0 && repeatCount > 1 {
-		delayMs = defaultRepeatDelay
-	}
-
 	var lastResult *core.CommandResult
 
 	for attempt := 0; attempt < retryCount; attempt++ {
@@ -183,20 +179,9 @@ func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *co
 		}
 
 		// Execute tap (possibly repeated)
-		for i := 0; i < repeatCount; i++ {
-			tapStart := time.Now()
-			lastResult = fr.driver.Execute(step)
-			if !lastResult.Success {
-				return lastResult
-			}
-
-			// Delay between repeated taps (not after the last one)
-			if repeatCount > 1 && i < repeatCount-1 {
-				sleepTime := time.Duration(delayMs)*time.Millisecond - time.Since(tapStart)
-				if sleepTime > 0 {
-					time.Sleep(sleepTime)
-				}
-			}
+		lastResult = fr.repeatTap(step, opts)
+		if !lastResult.Success {
+			return lastResult
 		}
 
 		// Check if UI changed (for retry and settle logic)
@@ -213,5 +198,122 @@ func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *co
 		}
 	}
 
+	return lastResult
+}
+
+// repeatTap executes the tap the step's repeat count of times, delay apart,
+// and stops at the first that fails.
+func (fr *FlowRunner) repeatTap(step flow.Step, opts tapOptions) *core.CommandResult {
+	repeatCount := opts.Repeat
+	if repeatCount <= 0 {
+		repeatCount = 1
+	}
+
+	delayMs := opts.DelayMs
+	if delayMs <= 0 && repeatCount > 1 {
+		delayMs = defaultRepeatDelay
+	}
+
+	var lastResult *core.CommandResult
+	for i := 0; i < repeatCount; i++ {
+		tapStart := time.Now()
+		lastResult = fr.driver.Execute(step)
+		if !lastResult.Success {
+			return lastResult
+		}
+
+		// Delay between repeated taps (not after the last one)
+		if repeatCount > 1 && i < repeatCount-1 {
+			sleepTime := time.Duration(delayMs)*time.Millisecond - time.Since(tapStart)
+			if sleepTime > 0 {
+				time.Sleep(sleepTime)
+			}
+		}
+	}
+	return lastResult
+}
+
+// screenshotSettler is a driver that waits for the screen to hold still the
+// way Maestro's iOS driver does, until two screenshots in a row are the same
+// (IOSDriver.kt:490-507), and reports whether that happened in time.
+type screenshotSettler interface {
+	WaitUntilScreenIsStatic(timeoutMs int) bool
+}
+
+const (
+	// screenStaticTimeoutMs is how long Maestro's iOS driver lets the screen
+	// take to hold still (IOSDriver.kt:692).
+	screenStaticTimeoutMs = 3000
+	// screenChangeThreshold is Maestro's SCREENSHOT_DIFF_THRESHOLD
+	// (Maestro.kt:783), in the percent core.ScreenChangePercent reports.
+	screenChangeThreshold = 0.005
+	// hierarchySettleMs stands in for Maestro's hierarchy settle when the flow
+	// sets no waitToSettleTimeoutMs: ten reads 200 ms apart
+	// (ScreenshotUtils.kt:57-71).
+	hierarchySettleMs = 2000
+)
+
+// executeScreenshotBasedTap is Maestro's tap on iOS (screenshotBasedTap,
+// Maestro.kt:438-502). After the tap the screen gets up to 3 s to hold still,
+// and when it does the tap counts as having changed something: Maestro's
+// settle then returns no hierarchy, which never equals the one from before the
+// tap (IOSDriver.kt:500-507, Maestro.kt:470-475). So retryTapIfNoChange only
+// taps again when the screen never held still and neither the hierarchy nor
+// the screenshot changed, and waitToSettleTimeoutMs only bounds the hierarchy
+// settle after those 3 s (ScreenshotUtils.kt:38-74). Without
+// retryTapIfNoChange: true (Maestro's default is false, YamlFluentCommand.kt:802
+// and Orchestra.kt:393) the tap costs nothing more than itself.
+func (fr *FlowRunner) executeScreenshotBasedTap(step flow.Step, opts tapOptions, settler screenshotSettler) *core.CommandResult {
+	if opts.RetryTapIfNoChange == nil || !*opts.RetryTapIfNoChange {
+		return fr.repeatTap(step, opts)
+	}
+
+	hierarchyBefore, err := fr.driver.Hierarchy()
+	if err != nil {
+		logger.Debug("retryTapIfNoChange: hierarchy before the tap: %v", err)
+	}
+	screenshotBefore, _ := fr.driver.Screenshot()
+	settleTimeout := opts.WaitToSettleTimeoutMs
+	if settleTimeout <= 0 {
+		settleTimeout = hierarchySettleMs
+	}
+
+	var lastResult *core.CommandResult
+	for attempt := 1; attempt <= 2; attempt++ {
+		if fr.ctx.Err() != nil {
+			return &core.CommandResult{
+				Success: false,
+				Error:   fr.ctx.Err(),
+				Message: "Tap cancelled",
+			}
+		}
+
+		lastResult = fr.repeatTap(step, opts)
+		if !lastResult.Success {
+			return lastResult
+		}
+		if settler.WaitUntilScreenIsStatic(screenStaticTimeoutMs) {
+			return lastResult
+		}
+
+		// A hierarchy that cannot be read proves nothing, and a second tap
+		// on a tap that worked is worse than none.
+		hierarchyAfter := fr.waitForSettle(settleTimeout)
+		if hierarchyBefore == nil || hierarchyAfter == nil || !bytes.Equal(hierarchyBefore, hierarchyAfter) {
+			logger.Debug("Tap caused UI change (attempt %d)", attempt)
+			return lastResult
+		}
+		// Screenshots that cannot be compared are no evidence of a change,
+		// as in Maestro.
+		if screenshotAfter, err := fr.driver.Screenshot(); err == nil {
+			if diff, ok := core.ScreenChangePercent(screenshotBefore, screenshotAfter); ok && diff > screenChangeThreshold {
+				logger.Debug("Tap changed the screenshot (%.4f%%, attempt %d)", diff, attempt)
+				return lastResult
+			}
+		}
+		if attempt == 1 {
+			logger.Debug("Tap had no UI change, retrying (attempt %d/2)", attempt)
+		}
+	}
 	return lastResult
 }

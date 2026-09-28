@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -330,5 +331,155 @@ func TestExecuteTapWithOptions_ContextCancelled(t *testing.T) {
 	result := fr.executeTapWithOptions(&flow.TapOnStep{}, opts)
 	if result.Success {
 		t.Error("expected failure due to context cancellation")
+	}
+}
+
+// --- executeScreenshotBasedTap (a driver that settles like Maestro's iOS driver) ---
+
+// iosTapDriver is a mockDriver that waits for the screen the way the WDA driver
+// does. WaitUntilScreenIsStatic answers static, and it counts what the tap cost.
+type iosTapDriver struct {
+	mockDriver
+	static      bool
+	taps        int
+	hierarchies int
+	screenshots int
+	settles     int
+}
+
+func (d *iosTapDriver) WaitUntilScreenIsStatic(int) bool {
+	d.settles++
+	return d.static
+}
+
+// newIOSTapDriver makes the hierarchy and the screenshot what before and after
+// return, before until the first tap and after from then on.
+func newIOSTapDriver(t *testing.T, static bool, hierarchyBefore, hierarchyAfter string, shotBefore, shotAfter []byte) *iosTapDriver {
+	t.Helper()
+	d := &iosTapDriver{static: static}
+	d.executeFunc = func(flow.Step) *core.CommandResult {
+		d.taps++
+		return &core.CommandResult{Success: true}
+	}
+	d.hierarchyFunc = func() ([]byte, error) {
+		d.hierarchies++
+		if d.taps == 0 {
+			return []byte(hierarchyBefore), nil
+		}
+		return []byte(hierarchyAfter), nil
+	}
+	d.screenshotFunc = func() ([]byte, error) {
+		d.screenshots++
+		if d.taps == 0 {
+			return shotBefore, nil
+		}
+		return shotAfter, nil
+	}
+	return d
+}
+
+// retryTapIfNoChange false, or waitToSettleTimeoutMs alone, costs nothing on
+// iOS: Maestro only compares anything when the retry is on. A flow typing a
+// six-digit code a tap per digit with `retryTapIfNoChange: false,
+// waitToSettleTimeoutMs: 500` paid four page sources a digit.
+func TestScreenshotBasedTap_FalseOrAbsentCostsNothing(t *testing.T) {
+	for _, opts := range []tapOptions{
+		{RetryTapIfNoChange: boolPtr(false), WaitToSettleTimeoutMs: 500},
+		{RetryTapIfNoChange: boolPtr(false)},
+		{WaitToSettleTimeoutMs: 500},
+	} {
+		d := newIOSTapDriver(t, true, "same", "same", nil, nil)
+		fr := &FlowRunner{ctx: context.Background(), driver: d}
+		if res := fr.executeTapWithOptions(&flow.TapOnStep{}, opts); !res.Success {
+			t.Fatalf("%+v: tap failed", opts)
+		}
+		if d.taps != 1 || d.hierarchies != 0 || d.screenshots != 0 || d.settles != 0 {
+			t.Errorf("%+v: %d taps, %d hierarchies, %d screenshots, %d settles; want one tap and nothing else",
+				opts, d.taps, d.hierarchies, d.screenshots, d.settles)
+		}
+	}
+}
+
+func TestScreenshotBasedTap_RepeatStillRepeats(t *testing.T) {
+	d := newIOSTapDriver(t, true, "same", "same", nil, nil)
+	fr := &FlowRunner{ctx: context.Background(), driver: d}
+	fr.executeTapWithOptions(&flow.TapOnStep{}, tapOptions{Repeat: 3, DelayMs: 1})
+	if d.taps != 3 || d.hierarchies != 0 {
+		t.Errorf("%d taps and %d hierarchies, want 3 taps and none", d.taps, d.hierarchies)
+	}
+}
+
+// When the screen holds still after the tap, Maestro's settle returns no
+// hierarchy, which never equals the one from before: the tap counts as a
+// change and is not repeated, even though nothing else changed.
+func TestScreenshotBasedTap_NoRetryOnceTheScreenHoldsStill(t *testing.T) {
+	shot := solidPNG(t, 0)
+	d := newIOSTapDriver(t, true, "same", "same", shot, shot)
+	fr := &FlowRunner{ctx: context.Background(), driver: d}
+	fr.executeTapWithOptions(&flow.TapOnStep{}, tapOptions{RetryTapIfNoChange: boolPtr(true)})
+	if d.taps != 1 {
+		t.Errorf("taps = %d, want 1", d.taps)
+	}
+	if d.settles != 1 {
+		t.Errorf("settles = %d, want 1", d.settles)
+	}
+}
+
+func TestScreenshotBasedTap_RetriesOnlyWhenNothingChanged(t *testing.T) {
+	still, changed := solidPNG(t, 0), solidPNG(t, 255)
+	for _, tc := range []struct {
+		name                string
+		hierarchyAfter      string
+		shotAfter           []byte
+		wantTaps            int
+		wantScreenshotAfter bool
+	}{
+		{"nothing changed", "before", still, 2, true},
+		{"the hierarchy changed", "after", still, 1, false},
+		{"the screenshot changed", "before", changed, 1, true},
+		// Maestro skips a comparison it cannot make and taps again.
+		{"the screenshot after cannot be read", "before", []byte("not a png"), 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newIOSTapDriver(t, false, "before", tc.hierarchyAfter, still, tc.shotAfter)
+			fr := &FlowRunner{ctx: context.Background(), driver: d}
+			res := fr.executeTapWithOptions(&flow.TapOnStep{}, tapOptions{RetryTapIfNoChange: boolPtr(true), WaitToSettleTimeoutMs: 1})
+			if !res.Success {
+				t.Fatal("tap failed")
+			}
+			if d.taps != tc.wantTaps {
+				t.Errorf("taps = %d, want %d", d.taps, tc.wantTaps)
+			}
+			if tookAfter := d.screenshots > 1; tookAfter != tc.wantScreenshotAfter {
+				t.Errorf("%d screenshots: a screenshot after the tap taken = %v, want %v", d.screenshots, tookAfter, tc.wantScreenshotAfter)
+			}
+		})
+	}
+}
+
+// A hierarchy that cannot be read is no reason to tap twice.
+func TestScreenshotBasedTap_UnreadableHierarchyDoesNotRetap(t *testing.T) {
+	shot := solidPNG(t, 0)
+	d := newIOSTapDriver(t, false, "", "", shot, shot)
+	d.hierarchyFunc = func() ([]byte, error) { return nil, errors.New("source failed") }
+	fr := &FlowRunner{ctx: context.Background(), driver: d}
+	fr.executeTapWithOptions(&flow.TapOnStep{}, tapOptions{RetryTapIfNoChange: boolPtr(true)})
+	if d.taps != 1 {
+		t.Errorf("taps = %d, want 1", d.taps)
+	}
+}
+
+func TestScreenshotBasedTap_FailedTapIsNotRetried(t *testing.T) {
+	d := newIOSTapDriver(t, false, "same", "same", nil, nil)
+	d.executeFunc = func(flow.Step) *core.CommandResult {
+		d.taps++
+		return &core.CommandResult{Success: false, Message: "element not found"}
+	}
+	fr := &FlowRunner{ctx: context.Background(), driver: d}
+	if res := fr.executeTapWithOptions(&flow.TapOnStep{}, tapOptions{RetryTapIfNoChange: boolPtr(true)}); res.Success {
+		t.Fatal("expected the failure to come back")
+	}
+	if d.taps != 1 || d.settles != 0 {
+		t.Errorf("%d taps and %d settles, want one tap and no settle", d.taps, d.settles)
 	}
 }
