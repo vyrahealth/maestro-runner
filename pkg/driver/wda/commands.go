@@ -910,7 +910,18 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 	var fromX, fromY, toX, toY float64
 
 	// Handle coordinate-based swipe
-	if step.Start != "" && step.End != "" {
+	if step.Start != "" && step.End != "" && !strings.Contains(step.Start+step.End, "%") {
+		// Without a % sign Maestro reads start and end as points on the
+		// screen (YamlSwipe.kt:158-160, YamlFluentCommand.kt:880-908), kept
+		// on it (IOSDriver.kt:265-266). Read as percentages, "100, 200" meant
+		// 100% and 200% of the screen.
+		if fromX, fromY, err = maestroScreenPoint(step.Start, width, height); err != nil {
+			return errorResult(err, "Invalid start coordinates")
+		}
+		if toX, toY, err = maestroScreenPoint(step.End, width, height); err != nil {
+			return errorResult(err, "Invalid end coordinates")
+		}
+	} else if step.Start != "" && step.End != "" {
 		startX, startY, err := parsePercentageCoords(step.Start)
 		if err != nil {
 			return errorResult(err, "Invalid start coordinates")
@@ -1061,6 +1072,21 @@ func maestroPercentOf(fraction float64, total int) int {
 // Point.coerceIn does before every iOS swipe (IOSDriver.kt:265-266, 704-709).
 func maestroOnScreen(v, limit int) float64 {
 	return float64(min(max(v, 0), limit))
+}
+
+// maestroScreenPoint reads a swipe's "x, y" start or end given in points, as
+// Maestro reads one without a % sign: whole numbers, kept on the screen.
+func maestroScreenPoint(coord string, screenW, screenH int) (x, y float64, err error) {
+	parts := strings.Split(coord, ",")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid coordinate format: %s", coord)
+	}
+	px, errX := strconv.Atoi(strings.TrimSpace(parts[0]))
+	py, errY := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errX != nil || errY != nil {
+		return 0, 0, fmt.Errorf("invalid coordinate: %s", coord)
+	}
+	return maestroOnScreen(px, screenW), maestroOnScreen(py, screenH), nil
 }
 
 // maestroSwipeFrom is where Maestro's swipe from an element starts and ends on
