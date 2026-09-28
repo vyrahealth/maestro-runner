@@ -2160,7 +2160,7 @@ func checkDeviceAvailable(deviceID, platform string) error {
 	if platform == "ios" {
 		// Check iOS device/simulator availability via port
 		port := wdadriver.PortFromUDID(deviceID)
-		if isPortInUse(port) {
+		if !wdadriver.ExternalForward() && isPortInUse(port) {
 			return fmt.Errorf("device is in use (port %d already bound)", port)
 		}
 	} else {
