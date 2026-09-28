@@ -239,6 +239,28 @@ func (c *Client) Tap(x, y float64) error {
 	return err
 }
 
+// TouchTap is a tap as Maestro makes one on iOS: a finger down at the point,
+// held 100 ms and lifted (EventRecord.swift:7, 24-29), sent as W3C pointer
+// actions. WDA builds the same pointer path from them: the first move opens
+// the touch at the point, the pause adds 100 ms, pointerUp lifts it
+// (FBW3CActionsSynthesizer.m). /wda/tap is XCUICoordinate's tap instead, which
+// holds for as long as XCTest decides.
+func (c *Client) TouchTap(x, y float64) error {
+	finger := map[string]interface{}{
+		"type":       "pointer",
+		"id":         "finger1",
+		"parameters": map[string]interface{}{"pointerType": "touch"},
+		"actions": []interface{}{
+			map[string]interface{}{"type": "pointerMove", "duration": 0, "x": x, "y": y},
+			map[string]interface{}{"type": "pointerDown", "button": 0},
+			map[string]interface{}{"type": "pause", "duration": 100},
+			map[string]interface{}{"type": "pointerUp", "button": 0},
+		},
+	}
+	_, err := c.post(c.sessionPath("/actions"), map[string]interface{}{"actions": []interface{}{finger}})
+	return err
+}
+
 // DoubleTap performs a double tap at coordinates.
 func (c *Client) DoubleTap(x, y float64) error {
 	_, err := c.post(c.sessionPath("/wda/doubleTap"), map[string]interface{}{

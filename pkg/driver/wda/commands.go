@@ -88,9 +88,10 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// Strategy: ElementClick first (WDA's internal element targeting handles z-order),
 	// then coordinate tap as fallback. For text fields, verify focus after each attempt
 	// because ElementClick can return success without actually focusing the field.
+	// With MAESTRO_WDA_COORDINATE_TAP there is no click (see coordinateTapOn).
 	tapped := false
 	clickFailed := false
-	if info.ID != "" {
+	if info.ID != "" && !coordinateTapOn() {
 		if err := d.client.ElementClick(info.ID); err == nil {
 			tapped = true
 			if isTextField {
@@ -120,13 +121,33 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 				info.Bounds.X, info.Bounds.Y, info.Bounds.Width, info.Bounds.Height),
 				fmt.Sprintf("Element not on screen: %s", selectorDesc(step.Selector)))
 		}
-		if err := d.client.Tap(x, y); err != nil {
+		if err := d.tapAt(x, y); err != nil {
 			return errorResult(err, "Tap failed")
 		}
 	}
 
 	d.lastTapID = info.ID
 	return successResult("Tapped element", info)
+}
+
+// coordinateTapOn reports whether MAESTRO_WDA_COORDINATE_TAP is set. An element
+// tap is then what Maestro's is: a touch at the centre of the element's bounds,
+// with no XCUITest element logic (Maestro.kt:244-255, IOSDriver.kt:152-156,
+// TouchRouteHandler.swift:34-41). The click is XCUIElement's tap, which works
+// out its own hit point and can scroll the view first, even for an element
+// kept only because its bounds are on screen. The touch goes to the centre of
+// the part of the bounds that is on screen (tapPoint), as the fallback's has.
+func coordinateTapOn() bool {
+	return os.Getenv("MAESTRO_WDA_COORDINATE_TAP") != ""
+}
+
+// tapAt taps a point: with MAESTRO_WDA_COORDINATE_TAP set, Maestro's 100 ms
+// touch (TouchTap), else WDA's coordinate tap.
+func (d *Driver) tapAt(x, y float64) error {
+	if coordinateTapOn() {
+		return d.client.TouchTap(x, y)
+	}
+	return d.client.Tap(x, y)
 }
 
 const (
