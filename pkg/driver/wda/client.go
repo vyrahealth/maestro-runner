@@ -51,6 +51,10 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 	if alertAction != "" {
 		alwaysMatch["defaultAlertAction"] = alertAction
 	}
+	// The session's first launch of the app gets the extra launch environment too.
+	if env := wdaLaunchEnv(); len(env) > 0 {
+		alwaysMatch["environment"] = env
+	}
 	caps := map[string]interface{}{
 		"capabilities": map[string]interface{}{
 			"alwaysMatch": alwaysMatch,
@@ -84,6 +88,25 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 	_ = c.UpdateSettings(map[string]interface{}{"snapshotMaxDepth": wdaSnapshotMaxDepth()})
 
 	return nil
+}
+
+// wdaLaunchEnv is environment added to every launch of an app, read from
+// MAESTRO_WDA_LAUNCH_ENV as a JSON object of strings, e.g. {"NAME":"value"}.
+// It is for what every launch in a run needs and a flow cannot say, such as a
+// library search path on a real device. A flow's own launchApp environment
+// wins for the same name. A value that is not such an object is ignored with a
+// warning, because a half-read environment would be harder to spot.
+func wdaLaunchEnv() map[string]string {
+	v := os.Getenv("MAESTRO_WDA_LAUNCH_ENV")
+	if v == "" {
+		return nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(v), &env); err != nil {
+		logger.Warn("MAESTRO_WDA_LAUNCH_ENV is not a JSON object of strings, so it is ignored: %v", err)
+		return nil
+	}
+	return env
 }
 
 // wdaSnapshotMaxDepth is the WebDriverAgent accessibility-snapshot depth cap.
@@ -159,6 +182,16 @@ func (c *Client) LaunchAppWithArgs(bundleID string, arguments []string, environm
 	}
 	if len(arguments) > 0 {
 		body["arguments"] = arguments
+	}
+	if extra := wdaLaunchEnv(); len(extra) > 0 {
+		merged := make(map[string]string, len(extra)+len(environment))
+		for k, v := range extra {
+			merged[k] = v
+		}
+		for k, v := range environment {
+			merged[k] = v
+		}
+		environment = merged
 	}
 	if len(environment) > 0 {
 		body["environment"] = environment
