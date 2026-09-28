@@ -85,7 +85,15 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 	// even though stock Maestro's XCTest traversal (no such cap) sees them
 	// (#171). Applied here so every session — the primary one and the one
 	// launchApp recreates — gets it.
-	_ = c.UpdateSettings(map[string]interface{}{"snapshotMaxDepth": wdaSnapshotMaxDepth()})
+	settings := map[string]interface{}{"snapshotMaxDepth": wdaSnapshotMaxDepth()}
+	if app := os.Getenv("MAESTRO_WDA_DEFAULT_ACTIVE_APP"); app != "" {
+		// WebDriverAgent reads this app's screen whenever it is in the foreground,
+		// and the app under test's otherwise. A system sheet that runs in its own
+		// process, such as the StoreKit payment sheet, is invisible to a flow
+		// without it.
+		settings["defaultActiveApplication"] = app
+	}
+	_ = c.UpdateSettings(settings)
 
 	return nil
 }

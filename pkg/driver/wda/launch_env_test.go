@@ -57,13 +57,32 @@ func TestCreateSessionSendsTheLaunchEnv(t *testing.T) {
 	}
 }
 
-func TestCreateSessionWithoutTheSwitchSendsNoEnvironment(t *testing.T) {
+func TestCreateSessionWithoutTheSwitchesSendsNeither(t *testing.T) {
 	client, body := recordingServer(t)
 	if err := client.CreateSession("com.example.app", ""); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	if _, ok := sessionCaps(body("/session"))["environment"]; ok {
 		t.Error("environment sent without MAESTRO_WDA_LAUNCH_ENV")
+	}
+	settings, _ := body("/appium/settings")["settings"].(map[string]interface{})
+	if _, ok := settings["defaultActiveApplication"]; ok {
+		t.Error("defaultActiveApplication sent without MAESTRO_WDA_DEFAULT_ACTIVE_APP")
+	}
+}
+
+func TestCreateSessionSetsTheDefaultActiveApp(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_DEFAULT_ACTIVE_APP", "com.example.sheet")
+	client, body := recordingServer(t)
+	if err := client.CreateSession("com.example.app", ""); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	settings, _ := body("/appium/settings")["settings"].(map[string]interface{})
+	if settings["defaultActiveApplication"] != "com.example.sheet" {
+		t.Errorf("settings = %v, want defaultActiveApplication=com.example.sheet", settings)
+	}
+	if settings["snapshotMaxDepth"] == nil {
+		t.Error("snapshotMaxDepth is no longer sent with it")
 	}
 }
 
