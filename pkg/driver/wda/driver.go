@@ -59,6 +59,10 @@ type Driver struct {
 	// The last step could have set the screen moving (a tap, a swipe, a
 	// scroll), so the next action waits for it to settle first
 	screenMayMove bool
+
+	// A swipe or scroll has run since the last tap, so with MAESTRO_WDA_SETTLE
+	// the next element tap waits for the element to stop moving (settle.go)
+	recentScroll bool
 }
 
 // Crash-loop detection thresholds.
@@ -259,11 +263,13 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 	// push was still running (#179), while a list was still coasting after a
 	// scroll (iOS takes that tap as "stop scrolling"), or while a menu was
 	// still animating in — and WDA reported success for a tap that did
-	// nothing. Maestro settles before every tap in the same way.
-	if d.screenMayMove && actsOnScreen(step) && !flow.RepeatTapAfterFirst(step) {
+	// nothing. Maestro settles before every tap in the same way. With
+	// MAESTRO_WDA_SETTLE the screen settle after every step does this.
+	if !settleOn() && d.screenMayMove && actsOnScreen(step) && !flow.RepeatTapAfterFirst(step) {
 		d.settleScreen()
 	}
 	d.screenMayMove = movesScreen(step)
+	d.settleBefore(step)
 
 	var result *core.CommandResult
 	switch s := step.(type) {
@@ -385,6 +391,7 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 		}
 	}
 
+	d.settleAfter(step, result)
 	result.Duration = time.Since(start)
 	d.trackCrashLoop(result)
 	return result
