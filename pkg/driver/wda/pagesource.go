@@ -175,6 +175,11 @@ func flattenElement(elem *ParsedElement, depth int) []*ParsedElement {
 // This matches Maestro's filterOutOfBounds behavior — page source XML includes
 // elements from the full accessibility tree, not just the visible viewport.
 func FilterOutOfBounds(elements []*ParsedElement, screenWidth, screenHeight int) []*ParsedElement {
+	if strictSelectors() {
+		// Also keeps an element with a descendant on screen, and one with a
+		// zero width or height (see maestroVisibleTree).
+		return maestroVisibleTree(elements, screenWidth, screenHeight)
+	}
 	result := make([]*ParsedElement, 0, len(elements))
 	for _, e := range elements {
 		if e.Bounds.VisiblePercentage(screenWidth, screenHeight) >= 0.1 {

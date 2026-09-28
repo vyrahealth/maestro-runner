@@ -1014,7 +1014,8 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 	if rectErr != nil {
 		return nil, fmt.Errorf("element bounds unavailable: %w", rectErr)
 	}
-	if w <= 0 || h <= 0 {
+	strict := strictSelectors()
+	if !strict && (w <= 0 || h <= 0) {
 		return nil, fmt.Errorf("element has invalid bounds: %dx%d", w, h)
 	}
 	info.Bounds = core.Bounds{X: x, Y: y, Width: w, Height: h}
@@ -1026,6 +1027,22 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 		info.Class = elemName
 	}
 	info.Visible = dispErr == nil && displayed
+
+	if strict {
+		// Maestro goes by bounds alone (maestroOnScreen): displayed=true is no
+		// pass, and neither is a displayed read that failed. XCUITest's flag
+		// only breaks ties between same-id elements (onScreenOf). An element
+		// under 10% on screen may still have a descendant on it, which the
+		// page source, where this lookup goes next, can see.
+		onScreen := w >= 0 && h >= 0 && (w > 0 || h > 0)
+		if screenW, screenH, err := d.screenSize(); err == nil {
+			onScreen = maestroOnScreen(info.Bounds, screenW, screenH)
+		}
+		if !onScreen {
+			return nil, fmt.Errorf("element exists but is not visible on screen (bounds %d,%d %dx%d)", x, y, w, h)
+		}
+		return info, nil
+	}
 
 	if dispErr == nil && !displayed {
 		// XCUITest says off-screen. Check bounds geometrically — if they're
