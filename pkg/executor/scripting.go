@@ -35,6 +35,11 @@ type ScriptEngine struct {
 	variables          map[string]string
 	flowDir            string // Directory of current flow (for resolving relative paths)
 	conditionTimeoutMs int    // default timeout for when/while condition checks
+
+	// conditionBudget, when set, replaces conditionTimeoutMs for a when/while
+	// visibility check that sets no timeout of its own. The flow runner sets
+	// it for MAESTRO_PARITY_TIMEOUTS.
+	conditionBudget func() int
 }
 
 // NewScriptEngine creates a new script engine.
@@ -354,9 +359,9 @@ func (se *ScriptEngine) EvalCondition(script string) (bool, error) {
 	// Expand any remaining $VAR style variables
 	script = se.expandDollarVars(script)
 
-	// Pre-define potential env variables as undefined to avoid ReferenceError
-	matches := envVarPattern.FindAllString(script, -1)
-	for _, name := range matches {
+	// An undeclared name is undefined, not a ReferenceError, as in Maestro's
+	// JS engine (GraalJsEngine.kt:198-204).
+	for _, name := range referencedIdentifiers(script) {
 		se.js.DefineUndefinedIfMissing(name)
 	}
 
@@ -370,7 +375,7 @@ func (se *ScriptEngine) EvalCondition(script string) (bool, error) {
 	case bool:
 		return v, nil
 	case string:
-		return v == "true", nil
+		return maestroTruthy(v), nil
 	case int64:
 		return v != 0, nil
 	case float64:
@@ -378,6 +383,42 @@ func (se *ScriptEngine) EvalCondition(script string) (bool, error) {
 	default:
 		return result != nil, nil
 	}
+}
+
+// maestroTruthy is how Maestro reads the value of a `true:` condition or an
+// assertTrue: false when it is blank, "false" in any case, "undefined",
+// "null" or a number equal to zero, and true otherwise, so "abc" is true
+// (Orchestra.kt:1030-1052).
+func maestroTruthy(value string) bool {
+	if strings.TrimSpace(value) == "" || strings.EqualFold(value, "false") ||
+		value == "undefined" || value == "null" {
+		return false
+	}
+	if f, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil && f == 0 {
+		return false
+	}
+	return true
+}
+
+// isWholeExpression reports whether text is one ${...} and nothing else.
+func isWholeExpression(text string) bool {
+	s := strings.TrimSpace(text)
+	if !strings.HasPrefix(s, "${") {
+		return false
+	}
+	depth := 0
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i == len(s)-1
+			}
+		}
+	}
+	return false
 }
 
 // ResolvePath resolves a relative path against the flow directory.
@@ -595,7 +636,7 @@ func (se *ScriptEngine) CheckCondition(ctx context.Context, cond flow.Condition,
 	if cond.Visible != nil {
 		visibleStep := &flow.AssertVisibleStep{Selector: *cond.Visible}
 		// when/while: an unmet condition should fail fast (#110).
-		visibleStep.TimeoutMs = conditionTimeout(cond, cond.Visible, se.conditionTimeoutMs)
+		visibleStep.TimeoutMs = conditionTimeout(cond, cond.Visible, se.conditionFallbackMs())
 		visibleStep.Optional = true
 		result := driver.Execute(visibleStep)
 		if !result.Success {
@@ -606,7 +647,7 @@ func (se *ScriptEngine) CheckCondition(ctx context.Context, cond flow.Condition,
 	// Check notVisible
 	if cond.NotVisible != nil {
 		notVisibleStep := &flow.AssertNotVisibleStep{Selector: *cond.NotVisible}
-		notVisibleStep.TimeoutMs = conditionTimeout(cond, cond.NotVisible, se.conditionTimeoutMs)
+		notVisibleStep.TimeoutMs = conditionTimeout(cond, cond.NotVisible, se.conditionFallbackMs())
 		notVisibleStep.Optional = true
 		result := driver.Execute(notVisibleStep)
 		if !result.Success {
@@ -623,6 +664,16 @@ func (se *ScriptEngine) CheckCondition(ctx context.Context, cond flow.Condition,
 	}
 
 	return true
+}
+
+// conditionFallbackMs is the timeout of a when/while visibility check whose
+// condition and selector set none. It is read for each check, so a budget that
+// shrinks with time is as small as it is at that moment.
+func (se *ScriptEngine) conditionFallbackMs() int {
+	if se.conditionBudget != nil {
+		return se.conditionBudget()
+	}
+	return se.conditionTimeoutMs
 }
 
 // conditionTimeout returns the timeout to use for a condition check.
@@ -643,17 +694,11 @@ func conditionTimeout(cond flow.Condition, sel *flow.Selector, fallback int) int
 
 // withEnvVars applies environment variables and returns a restore function.
 // Values are expanded through ExpandVariables to support ${VAR || "default"} syntax.
+// The restore puts back what each key held and removes a key that was not set
+// before, as Maestro's leaveEnvScope does (GraalJsEngine.kt:223-238), rather
+// than leaving it set to "".
 func (se *ScriptEngine) withEnvVars(env map[string]string) func() {
-	oldVars := make(map[string]string)
-	for k, v := range env {
-		oldVars[k] = se.GetVariable(k)
-		se.SetVariable(k, se.ExpandVariables(v))
-	}
-	return func() {
-		for k, v := range oldVars {
-			se.SetVariable(k, v)
-		}
-	}
+	return se.applyScopedEnv(env)
 }
 
 // parseBoolExpr converts the resolved value of an `enabled:` argument into a
@@ -861,7 +906,10 @@ func (se *ScriptEngine) ExpandCondition(cond *flow.Condition) {
 	if cond.NotVisible != nil {
 		cond.NotVisible = se.expandSelector(cond.NotVisible)
 	}
-	if cond.Script != "" {
+	// A script that is one ${...} is left for EvalCondition, which judges its
+	// value as Maestro does. Expanded here, the value was then run as JS
+	// itself: "abc" became a ReferenceError, and "" no condition at all.
+	if cond.Script != "" && !isWholeExpression(cond.Script) {
 		cond.Script = se.ExpandVariables(cond.Script)
 	}
 	if cond.Platform != "" {

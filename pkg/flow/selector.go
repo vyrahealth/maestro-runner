@@ -331,7 +331,7 @@ var platformSupportedFields = map[string]map[string]bool{
 	"ios": {
 		"text": true, "id": true,
 		"width": true, "height": true, "tolerance": true,
-		"enabled": true, "selected": true, "focused": true,
+		"enabled": true, "selected": true, "checked": true, "focused": true,
 		"index":   true,
 		"childOf": true, "below": true, "above": true,
 		"leftOf": true, "rightOf": true,

@@ -983,10 +983,11 @@ func TestCheckUnsupportedFields(t *testing.T) {
 			unsupported: []string{"css"},
 		},
 		{
-			name:        "checked on ios - unsupported",
+			// The WDA driver reads checked from a switch's type and value.
+			name:        "checked on ios - supported",
 			selector:    Selector{Checked: boolPtr(true)},
 			platform:    "ios",
-			unsupported: []string{"checked"},
+			unsupported: nil,
 		},
 		{
 			name:        "width on web - unsupported",

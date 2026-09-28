@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
@@ -46,8 +48,12 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 		"shouldWaitForQuiescence": false,
 		"waitForIdleTimeout":      0,
 	}
-	if alertAction != "" {
+	if alertAction != "" && !permissionAlertsOnly() {
 		alwaysMatch["defaultAlertAction"] = alertAction
+	}
+	// The session's first launch of the app gets the extra launch environment too.
+	if env := wdaLaunchEnv(); len(env) > 0 {
+		alwaysMatch["environment"] = env
 	}
 	caps := map[string]interface{}{
 		"capabilities": map[string]interface{}{
@@ -79,9 +85,40 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 	// even though stock Maestro's XCTest traversal (no such cap) sees them
 	// (#171). Applied here so every session — the primary one and the one
 	// launchApp recreates — gets it.
-	_ = c.UpdateSettings(map[string]interface{}{"snapshotMaxDepth": wdaSnapshotMaxDepth()})
+	settings := map[string]interface{}{"snapshotMaxDepth": wdaSnapshotMaxDepth()}
+	if app := os.Getenv("MAESTRO_WDA_DEFAULT_ACTIVE_APP"); app != "" {
+		// WebDriverAgent reads this app's screen whenever it is in the foreground,
+		// and the app under test's otherwise. A system sheet that runs in its own
+		// process, such as the StoreKit payment sheet, is invisible to a flow
+		// without it.
+		settings["defaultActiveApplication"] = app
+	}
+	if permissionAlertsOnly() {
+		settings["defaultAlertAction"] = ""
+		settings["autoClickAlertSelector"] = permissionAlertSelector(alertAction)
+	}
+	_ = c.UpdateSettings(settings)
 
 	return nil
+}
+
+// wdaLaunchEnv is environment added to every launch of an app, read from
+// MAESTRO_WDA_LAUNCH_ENV as a JSON object of strings, e.g. {"NAME":"value"}.
+// It is for what every launch in a run needs and a flow cannot say, such as a
+// library search path on a real device. A flow's own launchApp environment
+// wins for the same name. A value that is not such an object is ignored with a
+// warning, because a half-read environment would be harder to spot.
+func wdaLaunchEnv() map[string]string {
+	v := os.Getenv("MAESTRO_WDA_LAUNCH_ENV")
+	if v == "" {
+		return nil
+	}
+	var env map[string]string
+	if err := json.Unmarshal([]byte(v), &env); err != nil {
+		logger.Warn("MAESTRO_WDA_LAUNCH_ENV is not a JSON object of strings, so it is ignored: %v", err)
+		return nil
+	}
+	return env
 }
 
 // wdaSnapshotMaxDepth is the WebDriverAgent accessibility-snapshot depth cap.
@@ -158,6 +195,16 @@ func (c *Client) LaunchAppWithArgs(bundleID string, arguments []string, environm
 	if len(arguments) > 0 {
 		body["arguments"] = arguments
 	}
+	if extra := wdaLaunchEnv(); len(extra) > 0 {
+		merged := make(map[string]string, len(extra)+len(environment))
+		for k, v := range extra {
+			merged[k] = v
+		}
+		for k, v := range environment {
+			merged[k] = v
+		}
+		environment = merged
+	}
 	if len(environment) > 0 {
 		body["environment"] = environment
 	}
@@ -192,6 +239,28 @@ func (c *Client) Tap(x, y float64) error {
 	return err
 }
 
+// TouchTap is a tap as Maestro makes one on iOS: a finger down at the point,
+// held 100 ms and lifted (EventRecord.swift:7, 24-29), sent as W3C pointer
+// actions. WDA builds the same pointer path from them: the first move opens
+// the touch at the point, the pause adds 100 ms, pointerUp lifts it
+// (FBW3CActionsSynthesizer.m). /wda/tap is XCUICoordinate's tap instead, which
+// holds for as long as XCTest decides.
+func (c *Client) TouchTap(x, y float64) error {
+	finger := map[string]interface{}{
+		"type":       "pointer",
+		"id":         "finger1",
+		"parameters": map[string]interface{}{"pointerType": "touch"},
+		"actions": []interface{}{
+			map[string]interface{}{"type": "pointerMove", "duration": 0, "x": x, "y": y},
+			map[string]interface{}{"type": "pointerDown", "button": 0},
+			map[string]interface{}{"type": "pause", "duration": 100},
+			map[string]interface{}{"type": "pointerUp", "button": 0},
+		},
+	}
+	_, err := c.post(c.sessionPath("/actions"), map[string]interface{}{"actions": []interface{}{finger}})
+	return err
+}
+
 // DoubleTap performs a double tap at coordinates.
 func (c *Client) DoubleTap(x, y float64) error {
 	_, err := c.post(c.sessionPath("/wda/doubleTap"), map[string]interface{}{
@@ -223,9 +292,24 @@ func (c *Client) Swipe(fromX, fromY, toX, toY float64, durationSec float64) erro
 	return err
 }
 
-// PointerSwipe is a one-finger swipe as W3C pointer actions: down at the start,
-// a move to the end that takes durationMs, then up. The move's duration is the
-// swipe's speed, which dragfromtoforduration cannot set.
+// maestroSwipeMoveMs is how long the finger travels in Maestro's iOS swipe,
+// whatever the swipe's duration (EventRecord.swift:31-38).
+const maestroSwipeMoveMs = 100
+
+// PointerSwipe is Maestro's iOS swipe as W3C pointer actions: down at the
+// start, at the end 100 ms later, and up durationMs after that.
+//
+// Maestro's XCTest runner builds every swipe as one XCTest pointer path: down
+// at the start, a move to the end at 100 ms, the lift at 100 ms plus the
+// swipe's duration (EventRecord.swift:31-38). A move in such a path is where
+// the finger is at that time, and XCTest carries the finger there in a
+// straight line from the point before. So the finger crosses in 100 ms, and
+// the swipe's duration is how long it then rests on the end before it lifts.
+//
+// WDA turns a pointerMove into a point the finger reaches when the move's
+// duration has passed, and a pause into nothing but time
+// (FBW3CActionsSynthesizer.m), so a 100 ms move and then a pause of
+// durationMs hand XCTest the same path Maestro hands it.
 func (c *Client) PointerSwipe(fromX, fromY, toX, toY float64, durationMs int) error {
 	finger := map[string]interface{}{
 		"type":       "pointer",
@@ -234,7 +318,8 @@ func (c *Client) PointerSwipe(fromX, fromY, toX, toY float64, durationMs int) er
 		"actions": []interface{}{
 			map[string]interface{}{"type": "pointerMove", "duration": 0, "x": fromX, "y": fromY},
 			map[string]interface{}{"type": "pointerDown", "button": 0},
-			map[string]interface{}{"type": "pointerMove", "duration": durationMs, "x": toX, "y": toY},
+			map[string]interface{}{"type": "pointerMove", "duration": maestroSwipeMoveMs, "x": toX, "y": toY},
+			map[string]interface{}{"type": "pause", "duration": durationMs},
 			map[string]interface{}{"type": "pointerUp", "button": 0},
 		},
 	}
@@ -281,6 +366,24 @@ func (c *Client) ElementSendKeys(elementID, text string, frequency int) error {
 	}
 	_, err := c.post(c.sessionPath(fmt.Sprintf("/element/%s/value", elementID)), body)
 	return err
+}
+
+// isDroppedConnection reports a request that died on its connection before any
+// response came back: an EOF, a reset or a broken pipe. Over a forwarded WDA port
+// this happens. On a real iPhone reached through usbmux and an SSH tunnel, WDA
+// began dropping about one request in fourteen, 90 minutes into a suite, each
+// within about 10 ms and nearly all of them element reads sent in parallel; one
+// such dropped text read made a copyTextFrom come back empty.
+func isDroppedConnection(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
+// isLookupPath reports a POST that only finds elements, from the root or from an
+// element (/element, /elements, /element/{id}/element(s)), so repeating it changes
+// nothing on the device.
+func isLookupPath(path string) bool {
+	return strings.HasSuffix(path, "/element") || strings.HasSuffix(path, "/elements")
 }
 
 // ElementClear clears an element's text.
@@ -601,6 +704,11 @@ func (c *Client) get(path string) (map[string]interface{}, error) {
 	logger.Debug("WDA GET %s", path)
 
 	resp, err := c.httpClient.Get(c.baseURL + path)
+	if err != nil && isDroppedConnection(err) {
+		// A read is safe to send twice.
+		logger.Warn("WDA GET %s: the connection dropped before a response (%v), sending it again", path, err)
+		resp, err = c.httpClient.Get(c.baseURL + path)
+	}
 	duration := time.Since(start).Milliseconds()
 
 	if err != nil {
@@ -619,23 +727,35 @@ func (c *Client) get(path string) (map[string]interface{}, error) {
 
 func (c *Client) post(path string, body interface{}) (map[string]interface{}, error) {
 	start := time.Now()
-	var reqBody io.Reader
+	var data []byte
 	bodyStr := ""
 	if body != nil {
-		data, err := json.Marshal(body)
+		var err error
+		data, err = json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		reqBody = bytes.NewReader(data)
 		bodyStr = string(data)
 		if len(bodyStr) > 100 {
 			bodyStr = bodyStr[:100] + "..."
 		}
 	}
+	newBody := func() io.Reader {
+		if data == nil {
+			return nil
+		}
+		return bytes.NewReader(data)
+	}
 
 	logger.Debug("WDA POST %s body=%s", path, core.RedactTypedText(path, bodyStr))
 
-	resp, err := c.httpClient.Post(c.baseURL+path, "application/json", reqBody)
+	resp, err := c.httpClient.Post(c.baseURL+path, "application/json", newBody())
+	if err != nil && isDroppedConnection(err) && isLookupPath(path) {
+		// A lookup changes nothing, so it is as safe to repeat as a GET. An action is
+		// not sent twice: it may have reached WDA before the connection went.
+		logger.Warn("WDA POST %s: the connection dropped before a response (%v), sending it again", path, err)
+		resp, err = c.httpClient.Post(c.baseURL+path, "application/json", newBody())
+	}
 	duration := time.Since(start).Milliseconds()
 
 	if err != nil {

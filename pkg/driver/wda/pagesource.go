@@ -26,6 +26,7 @@ type ParsedElement struct {
 	Displayed        bool // visible
 	Selected         bool
 	Focused          bool
+	Checked          bool // a Switch, CheckBox or Toggle whose value is "1" (see isCheckableType)
 	Children         []*ParsedElement
 	Parent           *ParsedElement // parent element for clickable lookup
 	Depth            int
@@ -112,6 +113,10 @@ func ParsePageSource(xmlData string) ([]*ParsedElement, error) {
 					}
 				}
 
+				// WDA's source has no checked attribute. Maestro derives it the
+				// same way, from the element's type and value (IOSDriver.kt:223).
+				elem.Checked = isCheckableType(elem.Type) && elem.Value == "1"
+
 				// Parse children recursively
 				for {
 					child, err := parseElement()
@@ -170,6 +175,11 @@ func flattenElement(elem *ParsedElement, depth int) []*ParsedElement {
 // This matches Maestro's filterOutOfBounds behavior — page source XML includes
 // elements from the full accessibility tree, not just the visible viewport.
 func FilterOutOfBounds(elements []*ParsedElement, screenWidth, screenHeight int) []*ParsedElement {
+	if strictSelectors() {
+		// Also keeps an element with a descendant on screen, and one with a
+		// zero width or height (see maestroVisibleTree).
+		return maestroVisibleTree(elements, screenWidth, screenHeight)
+	}
 	result := make([]*ParsedElement, 0, len(elements))
 	for _, e := range elements {
 		if e.Bounds.VisiblePercentage(screenWidth, screenHeight) >= 0.1 {
@@ -206,6 +216,12 @@ func CountVisibleMatches(elements []*ParsedElement, sel flow.Selector, screenW, 
 	if screenW > 0 && screenH > 0 {
 		elements = FilterOutOfBounds(elements, screenW, screenH)
 	}
+	if strictSelectors() {
+		// What Maestro's lookup chooses from: the deepest matches, without
+		// their matching ancestors.
+		matches, _ := maestroFilter(elements, sel)
+		return len(matches)
+	}
 	return len(FilterBySelector(elements, sel))
 }
 
@@ -235,7 +251,11 @@ func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
 
 	// ID matching (accessibility identifier, supports regex)
 	if sel.ID != "" {
-		if !matchesID(sel.ID, elem.Name) {
+		if strictSelectors() {
+			if !maestroIDMatches(sel.ID, elementIdentifier(elem)) {
+				return false
+			}
+		} else if !matchesID(sel.ID, elem.Name) {
 			return false
 		}
 	}
@@ -243,7 +263,8 @@ func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
 	// Size matching with tolerance
 	if sel.Width > 0 || sel.Height > 0 {
 		tolerance := sel.Tolerance
-		if tolerance == 0 {
+		// Maestro's default tolerance is 0 (Filters.kt:146).
+		if tolerance == 0 && !strictSelectors() {
 			tolerance = 5
 		}
 		if sel.Width > 0 && !withinTolerance(elem.Bounds.Width, sel.Width, tolerance) {
@@ -264,8 +285,36 @@ func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
 	if sel.Focused != nil && elem.Focused != *sel.Focused {
 		return false
 	}
+	if sel.Checked != nil && elem.Checked != *sel.Checked {
+		return false
+	}
 
 	return true
+}
+
+// elementText is the text Maestro's copyTextFrom takes from an element: its
+// value, else its placeholder, else its label (Orchestra.kt:1791-1804, with
+// IOSDriver.kt:212-216 naming the iOS attributes).
+func elementText(e *ParsedElement) string {
+	switch {
+	case e.Value != "":
+		return e.Value
+	case e.PlaceholderValue != "":
+		return e.PlaceholderValue
+	default:
+		return e.Label
+	}
+}
+
+// isCheckableType reports the element types Maestro reads checked from:
+// XCUIElementType CheckBox (12), Switch (40) and Toggle (41), in
+// IOSDriver.kt:680-690. For a Switch WDA reports the value as "1" or "0".
+func isCheckableType(elemType string) bool {
+	switch elemType {
+	case "XCUIElementTypeCheckBox", "XCUIElementTypeSwitch", "XCUIElementTypeToggle":
+		return true
+	}
+	return false
 }
 
 // withinTolerance checks if actual is within tolerance of expected.
@@ -292,6 +341,9 @@ func matchesID(pattern, id string) bool {
 // and accessibility labels can disagree on composed vs decomposed accents
 // (e.g. "É" as U+00C9 vs "E"+U+0301), which a byte-wise compare misses.
 func matchesText(pattern string, texts ...string) bool {
+	if strictSelectors() {
+		return maestroTextMatches(pattern, texts...)
+	}
 	pattern = norm.NFC.String(pattern)
 	if looksLikeRegex(pattern) {
 		// Case-sensitive, deliberately. Compiling with (?i) meant an anchored
