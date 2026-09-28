@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,11 @@ type FlowRunner struct {
 	waitForIdleTimeout int
 	// Active runFlow timeout label (e.g. "3s") for enriching sub-step errors
 	runFlowTimeout string
+	// When the last step that changed the device ended, and how many such
+	// steps have run, so a compound step can tell whether one ran inside it.
+	// They give MAESTRO_PARITY_TIMEOUTS its condition budget.
+	lastInteraction time.Time
+	interactions    int
 }
 
 // Run executes the flow and returns the result.
@@ -99,6 +105,11 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Apply the global condition-check timeout for when:/while: checks. 0 keeps
 	// the engine's fast default; --condition-timeout / config overrides it (#110).
 	fr.script.SetConditionTimeout(fr.config.ConditionTimeout)
+	// MAESTRO_PARITY_TIMEOUTS: with no condition timeout configured, a
+	// when:/while: check waits as long as Maestro's would (conditionBudgetMs).
+	if fr.config.ConditionTimeout <= 0 && os.Getenv("MAESTRO_PARITY_TIMEOUTS") != "" {
+		fr.script.conditionBudget = fr.conditionBudgetMs
+	}
 	fr.script.SetInsecureHTTP(fr.config.Insecure)
 
 	// Apply waitForIdleTimeout with priority:
@@ -164,8 +175,8 @@ func (fr *FlowRunner) Run() FlowResult {
 	// starts, whether it will be wanted.
 	flowStatus := report.StatusPassed
 
-	// --record: capture the whole flow, onFlowComplete hooks included — this
-	// defer is registered before theirs, so it runs after them. Best-effort
+	// --record: capture the whole flow, onFlowComplete hooks included. This
+	// defer runs when Run returns, after the hooks. Best-effort
 	// throughout: a driver that can't record must not fail the flow.
 	if fr.config.Record {
 		if recorder, ok := innerDriver.(core.ScreenRecorder); ok {
@@ -206,14 +217,19 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Execute all steps
 	var flowError string
 
-	// Execute onFlowComplete in defer (runs even on failure)
+	// onFlowComplete runs before the result is final, below. When a panic
+	// skips that, it still runs here, as Maestro runs it in a finally
+	// (Orchestra.kt:236-259).
+	flowCompleteRan := false
 	defer func() {
-		if len(fr.flow.Config.OnFlowComplete) > 0 {
-			for _, step := range fr.flow.Config.OnFlowComplete {
-				fr.executeNestedStep(step) // Ignore failures in cleanup
-			}
+		if !flowCompleteRan {
+			fr.runFlowCompleteHooks()
 		}
 	}()
+
+	// Maestro's condition budget runs from the start of the flow until the
+	// first step that changes the device (Orchestra.kt:197).
+	fr.lastInteraction = time.Now()
 
 	// Execute onFlowStart hooks
 	if len(fr.flow.Config.OnFlowStart) > 0 {
@@ -222,6 +238,11 @@ func (fr *FlowRunner) Run() FlowResult {
 			if !result.Success && !step.IsOptional() {
 				// onFlowStart failed - fail the flow
 				errMsg := fmt.Sprintf("onFlowStart failed: %v", result.Error)
+				flowStatus = report.StatusFailed
+				// onFlowComplete still runs, as in Maestro, and the flow
+				// keeps this error whatever the hook does.
+				flowCompleteRan = true
+				fr.runFlowCompleteHooks()
 				fr.flowWriter.End(report.StatusFailed, errMsg)
 				if fr.config.OnFlowEnd != nil {
 					fr.config.OnFlowEnd(flowName, false, time.Since(flowStart).Milliseconds(), errMsg)
@@ -313,6 +334,15 @@ func (fr *FlowRunner) Run() FlowResult {
 		}
 	}
 
+	// onFlowComplete runs before the result is final. As in Maestro
+	// (Orchestra.kt:237-268), a failing hook fails a flow that had passed,
+	// and a flow that had failed keeps its own error.
+	flowCompleteRan = true
+	if hookErr := fr.runFlowCompleteHooks(); hookErr != "" && flowStatus == report.StatusPassed {
+		flowStatus = report.StatusFailed
+		flowError = hookErr
+	}
+
 	// Pull console / page error entries from the driver (web only).
 	// Any driver that exposes ConsoleLogReport() — the CDP browser driver
 	// does today, others return nothing — surfaces its captured entries
@@ -367,6 +397,22 @@ func (fr *FlowRunner) Run() FlowResult {
 	}
 }
 
+// runFlowCompleteHooks runs the flow's onFlowComplete steps and returns why
+// they failed, or "" when they passed. Maestro runs the hook through
+// executeCommands (Orchestra.kt:237-256), which stops at the first failing
+// step that is not optional, and so does this.
+func (fr *FlowRunner) runFlowCompleteHooks() string {
+	for _, step := range fr.flow.Config.OnFlowComplete {
+		result := fr.executeNestedStep(step)
+		if !result.Success && !step.IsOptional() {
+			errMsg := fmt.Sprintf("onFlowComplete failed: %v", result.Error)
+			logger.Warn("%s", errMsg)
+			return errMsg
+		}
+	}
+	return ""
+}
+
 // executeStep executes a single step and updates the report.
 // Returns status, error message, and duration in milliseconds.
 func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, string, int64) {
@@ -404,6 +450,7 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 
 	// Execute step - route to appropriate handler
 	var result *core.CommandResult
+	interactionsBefore := fr.interactions
 
 	switch s := step.(type) {
 	// JS/Scripting steps - handled by ScriptEngine
@@ -575,6 +622,7 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 	default:
 		result = fr.driver.Execute(step)
 	}
+	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	stepDuration := time.Since(stepStart).Milliseconds()
 
@@ -977,41 +1025,133 @@ const maxPrepareScanDepth = 10
 // one reached first at runtime. runFlow wrappers are dropped and their children
 // inlined; file-based subflows are parsed best-effort (parse errors are ignored
 // here — they surface during execution). A visited set + depth cap guard cycles.
+//
+// retry and repeat are expanded the same way, and so is a runFlow's else
+// branch, since a launchApp inside them runs too: a flow whose only launchApp
+// sat in a retry got no alert handling. A file named inside a subflow file
+// resolves against the subflow file's own directory, as it does when it runs,
+// not against the top flow's.
 func (fr *FlowRunner) collectStepsForPrepare() []flow.Step {
 	var out []flow.Step
 	seen := make(map[string]bool)
 
-	var expand func(steps []flow.Step, depth int)
-	expand = func(steps []flow.Step, depth int) {
+	var expand func(steps []flow.Step, dir string, depth int)
+	// expandFile parses a flow file named by a flow in dir and expands its
+	// steps against the file's own directory.
+	expandFile := func(file, dir string, depth int) {
+		if file == "" {
+			return
+		}
+		path := file
+		if !filepath.IsAbs(path) && dir != "" {
+			path = filepath.Join(dir, path)
+		}
+		if seen[path] {
+			return
+		}
+		seen[path] = true
+		if sub, err := flow.ParseFile(path); err == nil {
+			expand(sub.Steps, filepath.Dir(path), depth+1)
+		}
+	}
+	expand = func(steps []flow.Step, dir string, depth int) {
 		if depth > maxPrepareScanDepth {
 			return
 		}
 		for _, s := range steps {
-			rf, ok := s.(*flow.RunFlowStep)
-			if !ok {
+			switch st := s.(type) {
+			case *flow.RunFlowStep:
+				expand(st.Steps, dir, depth+1)
+				expandFile(st.File, dir, depth)
+				expand(st.ElseSteps, dir, depth+1)
+				expandFile(st.ElseFile, dir, depth)
+			case *flow.RetryStep:
+				expand(st.Steps, dir, depth+1)
+				expandFile(st.File, dir, depth)
+			case *flow.RepeatStep:
+				expand(st.Steps, dir, depth+1)
+			default:
 				out = append(out, s)
-				continue
-			}
-			// Inline subflow steps are already parsed.
-			if len(rf.Steps) > 0 {
-				expand(rf.Steps, depth+1)
-			}
-			// File-based subflow: parse it to reach its launchApp.
-			if rf.File != "" {
-				path := fr.script.ResolvePath(rf.File)
-				if !seen[path] {
-					seen[path] = true
-					if sub, err := flow.ParseFile(path); err == nil {
-						expand(sub.Steps, depth+1)
-					}
-				}
 			}
 		}
 	}
 
-	expand(fr.flow.Config.OnFlowStart, 0)
-	expand(fr.flow.Steps, 0)
+	expand(fr.flow.Config.OnFlowStart, fr.script.FlowDir(), 0)
+	expand(fr.flow.Steps, fr.script.FlowDir(), 0)
 	return out
+}
+
+// maestroOptionalLookupMs is Maestro's optional lookup timeout
+// (optionalLookupTimeoutMs, Orchestra.kt:137), which when: and while: wait on.
+const maestroOptionalLookupMs = 7000
+
+// conditionBudgetMs is how long a when:/while: visibility check may wait under
+// MAESTRO_PARITY_TIMEOUTS: Maestro's 7 s optional lookup, less the time since
+// the last step that changed the device (adjustedToLatestInteraction,
+// Orchestra.kt:1767-1770, used for conditions at 1058 and 1067). Maestro still
+// looks once when nothing is left, because its lookups loop do-while
+// (MaestroTimer.kt:33-46). So the floor is 1 ms: 0 would hand the driver its
+// own default instead.
+func (fr *FlowRunner) conditionBudgetMs() int {
+	left := maestroOptionalLookupMs - int(time.Since(fr.lastInteraction).Milliseconds())
+	if left < 1 {
+		return 1
+	}
+	return left
+}
+
+// changesDevice reports whether Maestro counts a passing step as one that
+// changed the device. Maestro's executeCommand returns false only for these
+// steps (Orchestra.kt:384-453) and true for every other, the ones it does not
+// list included. runFlow, repeat and retry go by the steps inside them.
+func changesDevice(step flow.Step) bool {
+	switch step.(type) {
+	case *flow.AssertVisibleStep, *flow.AssertNotVisibleStep, *flow.AssertTrueStep,
+		*flow.AssertConditionStep, *flow.WaitUntilStep, *flow.AssertScreenshotStep,
+		*flow.AssertNoDefectsWithAIStep, *flow.AssertWithAIStep, *flow.ExtractTextWithAIStep,
+		*flow.AssertDarkModeStep, *flow.AssertLightModeStep, *flow.CopyTextFromStep,
+		*flow.SetClipboardStep, *flow.SetPermissionsStep, *flow.ClearKeychainStep,
+		*flow.TakeScreenshotStep, *flow.StartRecordingStep, *flow.StopRecordingStep,
+		*flow.DefineVariablesStep:
+		return false
+	}
+	return true
+}
+
+// noteInteraction restarts the condition budget after a step that changed the
+// device, as Maestro does when executeCommand returns true (Orchestra.kt:448-451).
+// A failed step changes nothing: Maestro's command throws before that. A runFlow
+// or repeat counts when a step inside it did, since Maestro's subflow returns
+// whether any of its commands did (Orchestra.kt:1152). A retry counts when a
+// step of its passing attempt did, which executeRetry notes itself.
+func (fr *FlowRunner) noteInteraction(step flow.Step, passed bool, before int) {
+	if !passed {
+		return
+	}
+	switch step.(type) {
+	case *flow.RunFlowStep, *flow.RepeatStep:
+		if fr.interactions == before {
+			return
+		}
+	case *flow.RetryStep:
+		return
+	default:
+		if !changesDevice(step) {
+			return
+		}
+	}
+	fr.lastInteraction = time.Now()
+	fr.interactions++
+}
+
+// noteAttemptInteraction ends a retry's passing attempt, which changed the
+// device when a step of that attempt did (Maestro returns that attempt's
+// runSubFlow, Orchestra.kt:942).
+func (fr *FlowRunner) noteAttemptInteraction(attemptStart int) {
+	if fr.interactions > attemptStart {
+		fr.lastInteraction = time.Now()
+		fr.interactions++
+	}
 }
 
 // executeRepeat handles repeat step execution.
@@ -1077,16 +1217,53 @@ func (fr *FlowRunner) executeRepeat(step *flow.RepeatStep) *core.CommandResult {
 	}
 }
 
-// executeRetry handles retry step execution.
-func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
-	maxRetries, err := fr.script.ParseIntStrict(step.MaxRetries, 3)
-	if err != nil {
-		return &core.CommandResult{
-			Success: false,
-			Error:   err,
-			Message: fmt.Sprintf("retry: invalid 'maxRetries' value: %v", err),
+// maxRetriesAllowed caps retry's maxRetries, as Maestro's MAX_RETRIES_ALLOWED
+// does (Orchestra.kt:1844).
+const maxRetriesAllowed = 3
+
+// retryAttempts is how many times a retry runs its commands: the first run
+// plus one per retry. maxRetries is read as Maestro reads it (Orchestra.kt:934
+// and 939-955): unset or not an integer is 1, more than 3 is 3, and a negative
+// value runs nothing, because Maestro's `while (attempt <= maxRetries)` never
+// starts.
+func (fr *FlowRunner) retryAttempts(raw string) int {
+	maxRetries := 1
+	if expanded := fr.script.ExpandVariables(raw); expanded != "" {
+		if n, err := strconv.Atoi(expanded); err == nil {
+			maxRetries = n
+		} else {
+			logger.Warn("retry: maxRetries %q is not an integer, so it is 1, as in Maestro", expanded)
 		}
 	}
+	if maxRetries > maxRetriesAllowed {
+		maxRetries = maxRetriesAllowed
+	}
+	if maxRetries < 0 {
+		return 0
+	}
+	return maxRetries + 1
+}
+
+// retryExhausted is the result of a retry that ran out of attempts. With no
+// attempt at all (a negative maxRetries) Maestro's command completes without
+// running anything, so that one passes.
+func retryExhausted(lastErr error, attempts int) *core.CommandResult {
+	if attempts == 0 {
+		return &core.CommandResult{
+			Success: true,
+			Message: "Retry ran no attempts (maxRetries is negative)",
+		}
+	}
+	return &core.CommandResult{
+		Success: false,
+		Error:   lastErr,
+		Message: fmt.Sprintf("Retry failed after %d attempts", attempts),
+	}
+}
+
+// executeRetry handles retry step execution.
+func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
+	attempts := fr.retryAttempts(step.MaxRetries)
 
 	// Apply env variables with restore
 	defer fr.script.withEnvVars(step.Env)()
@@ -1102,12 +1279,12 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 				Message: fmt.Sprintf("Failed to parse flow file: %s", filePath),
 			}
 		}
-		return fr.executeSubFlowWithRetry(*subFlow, maxRetries)
+		return fr.executeSubFlowWithRetry(*subFlow, attempts)
 	}
 
 	// Execute inline steps with retry
 	var lastErr error
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		if fr.ctx.Err() != nil {
 			return &core.CommandResult{
 				Success: false,
@@ -1116,6 +1293,7 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 			}
 		}
 
+		attemptStart := fr.interactions
 		success := true
 		for _, nestedStep := range step.Steps {
 			result := fr.executeNestedStep(nestedStep)
@@ -1127,6 +1305,7 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 		}
 
 		if success {
+			fr.noteAttemptInteraction(attemptStart)
 			return &core.CommandResult{
 				Success: true,
 				Message: fmt.Sprintf("Retry succeeded on attempt %d", attempt),
@@ -1134,11 +1313,7 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 		}
 	}
 
-	return &core.CommandResult{
-		Success: false,
-		Error:   lastErr,
-		Message: fmt.Sprintf("Retry failed after %d attempts", maxRetries),
-	}
+	return retryExhausted(lastErr, attempts)
 }
 
 // executeRunFlow handles runFlow step execution.
@@ -1418,6 +1593,7 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		}()
 	}
 
+	interactionsBefore := fr.interactions
 	switch s := step.(type) {
 	case *flow.DefineVariablesStep:
 		result = fr.script.ExecuteDefineVariables(s)
@@ -1565,6 +1741,7 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		fr.script.ExpandStep(step)
 		result = fr.driver.Execute(step)
 	}
+	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	duration := time.Since(start).Milliseconds()
 
@@ -1705,11 +1882,11 @@ func (fr *FlowRunner) executeSubFlow(subFlow flow.Flow) *core.CommandResult {
 	}
 }
 
-// executeSubFlowWithRetry executes a sub-flow with retry logic.
-func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, maxRetries int) *core.CommandResult {
+// executeSubFlowWithRetry runs a sub-flow up to attempts times, until it passes.
+func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, attempts int) *core.CommandResult {
 	var lastErr error
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		if fr.ctx.Err() != nil {
 			return &core.CommandResult{
 				Success: false,
@@ -1718,8 +1895,10 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, maxRetries int)
 			}
 		}
 
+		attemptStart := fr.interactions
 		result := fr.executeSubFlow(subFlow)
 		if result.Success {
+			fr.noteAttemptInteraction(attemptStart)
 			return &core.CommandResult{
 				Success: true,
 				Message: fmt.Sprintf("Retry succeeded on attempt %d", attempt),
@@ -1728,11 +1907,7 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, maxRetries int)
 		lastErr = result.Error
 	}
 
-	return &core.CommandResult{
-		Success: false,
-		Error:   lastErr,
-		Message: fmt.Sprintf("Retry failed after %d attempts", maxRetries),
-	}
+	return retryExhausted(lastErr, attempts)
 }
 
 // captureArtifacts captures the step screenshot and, when captureHierarchy is

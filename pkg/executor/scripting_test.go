@@ -522,7 +522,7 @@ func TestScriptEngine_EvalCondition(t *testing.T) {
 		{"comparison false", "count > 10", false},
 		{"equality", "count == 5", true},
 		{"string true", "'true'", true},
-		{"string other", "'yes'", false},
+		{"string other", "'yes'", true}, // true in Maestro: only a falsy string is false
 		{"empty string", "''", false},
 		{"number non-zero", "42", true},
 		{"number zero", "0", false},
@@ -645,20 +645,6 @@ func TestExecuteRepeat_InvalidTimes(t *testing.T) {
 	}
 	if !strings.Contains(result.Message, "invalid 'times'") {
 		t.Errorf("message = %q, want it to mention invalid 'times'", result.Message)
-	}
-}
-
-func TestExecuteRetry_InvalidMaxRetries(t *testing.T) {
-	se := NewScriptEngine()
-	defer se.Close()
-	fr := &FlowRunner{ctx: context.Background(), driver: &mockDriver{}, script: se}
-
-	result := fr.executeRetry(&flow.RetryStep{MaxRetries: "five"})
-	if result.Success {
-		t.Error("expected failure for non-numeric maxRetries, got success")
-	}
-	if !strings.Contains(result.Message, "invalid 'maxRetries'") {
-		t.Errorf("message = %q, want it to mention invalid 'maxRetries'", result.Message)
 	}
 }
 

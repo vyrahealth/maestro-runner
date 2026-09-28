@@ -160,10 +160,12 @@ Examples:
 			EnvVars: []string{"MAESTRO_STEP_DELAY"},
 		},
 		&cli.IntFlag{
-			Name:    "condition-timeout",
-			Usage:   "Default timeout in ms for when:/while: condition checks (default 1000). Override per condition with `timeout:`.",
-			Value:   1000,
-			EnvVars: []string{"MAESTRO_CONDITION_TIMEOUT"},
+			Name:  "condition-timeout",
+			Usage: "Default timeout in ms for when:/while: condition checks (default 1000). Override per condition with `timeout:`.",
+			// No Value: unset reads as 0, which the engine takes as its 1000 ms
+			// default and MAESTRO_PARITY_TIMEOUTS as "not configured".
+			DefaultText: "1000",
+			EnvVars:     []string{"MAESTRO_CONDITION_TIMEOUT"},
 		},
 		&cli.BoolFlag{
 			Name:    "insecure",
@@ -550,7 +552,7 @@ type RunConfig struct {
 
 	// Driver settings
 	WaitForIdleTimeout int    // Wait for device idle in ms (0 = disabled, default 200)
-	ConditionTimeout   int    // Default timeout (ms) for when:/while: condition checks (default 1000)
+	ConditionTimeout   int    // Default timeout (ms) for when:/while: condition checks (0 = not set, so 1000)
 	Insecure           bool   // Skip TLS verification for runScript http.* (--insecure)
 	StepDelay          int    // Pause between top-level steps in ms (0 = none)
 	TypingFrequency    int    // WDA typing frequency in keys/sec (0 = use WDA default of 60)

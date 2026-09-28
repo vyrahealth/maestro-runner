@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"strings"
+	"time"
 )
 
 // TextEntryVerdict is what a read-back of a text field after typing tells us.
@@ -158,13 +159,14 @@ func (f funcTextField) Clear() error          { return f.clear() }
 // one the app has reformatted, is left alone — and a field that still disagrees
 // after the retry is reported in the result rather than failed, because the
 // assertion that follows will describe the real problem better than a driver
-// can.
+// can. With MAESTRO_STRICT_TYPING set, each read-back, the retype's included,
+// waits for the field to hold still first (readBack).
 func ConfirmTypedText(field TextField, typed, before string, warn func(format string, args ...interface{})) string {
 	if field == nil {
 		return ""
 	}
 
-	after, err := field.Text()
+	after, err := readBack(field)
 	verdict := VerifyTypedText(typed, before, after, err == nil)
 	if !worthRetyping(verdict) {
 		return ""
@@ -184,7 +186,7 @@ func ConfirmTypedText(field TextField, typed, before string, warn func(format st
 		return " (warning: characters were dropped and retyping failed)"
 	}
 
-	retyped, retypedErr := field.Text()
+	retyped, retypedErr := readBack(field)
 	again := VerifyTypedText(typed, before, retyped, retypedErr == nil)
 	if again == TextEntryDropped {
 		return " (warning: characters are still missing after retyping)"
@@ -213,8 +215,53 @@ func worthRetyping(v TextEntryVerdict) bool {
 	case TextEntryDropped:
 		return true
 	case TextEntryTransformed:
-		return os.Getenv("MAESTRO_STRICT_TYPING") != ""
+		return strictTyping()
 	default:
 		return false
 	}
+}
+
+// strictTyping reports whether MAESTRO_STRICT_TYPING is set.
+func strictTyping() bool {
+	return os.Getenv("MAESTRO_STRICT_TYPING") != ""
+}
+
+// A strict read-back waits typedReadWait between reads of the field, and gives
+// up waiting for two to agree after about typedReadLimit. The wait is longer
+// than the keyboard's late character took to arrive (about a second after the
+// text was typed), so two reads that agree have seen it. Variables so tests
+// can shorten them.
+var (
+	typedReadWait  = 1200 * time.Millisecond
+	typedReadLimit = 3 * time.Second
+)
+
+// readBack reads the field back after typing. With MAESTRO_STRICT_TYPING set
+// it waits and reads again until two reads in a row agree, for about
+// typedReadLimit, and returns the last: on a real iPhone a typed email read
+// back as typed, and the keyboard added an "@" about a second later, so the
+// check passed and the flow failed further on, on the wrong value. A field
+// still changing at the limit is judged on its last read. Unset, it is one
+// read. A field that cannot be read is not waited on: a code box that hands
+// focus to the next one after its digit is gone once typed, and re-reading it
+// until the limit only cost seconds per digit. A read that fails after good
+// ones keeps the last good one.
+func readBack(field TextField) (string, error) {
+	text, err := field.Text()
+	if !strictTyping() || err != nil {
+		return text, err
+	}
+	start := time.Now()
+	for time.Since(start) < typedReadLimit {
+		time.Sleep(typedReadWait)
+		next, nextErr := field.Text()
+		if nextErr != nil {
+			return text, nil
+		}
+		if next == text {
+			return next, nil
+		}
+		text = next
+	}
+	return text, nil
 }

@@ -12,6 +12,11 @@ import (
 	"github.com/dop251/goja"
 )
 
+// defaultHTTPTimeout bounds an http.* call that sets no timeout of its own:
+// the 5 minutes Maestro's script client allows a call (GraalJsEngine.kt:28-34).
+// A variable so tests can shorten it.
+var defaultHTTPTimeout = 5 * time.Minute
+
 // httpModule returns the http object with get, post, put, delete methods
 func (e *Engine) httpModule() *goja.Object {
 	obj := e.runtime.NewObject()
@@ -84,7 +89,7 @@ func (e *Engine) doHTTPRequest(method string, call goja.FunctionCall) goja.Value
 	// Parse options if provided
 	var body io.Reader
 	headers := make(map[string]string)
-	timeout := 30 * time.Second
+	timeout := defaultHTTPTimeout
 	insecure := e.insecureHTTP
 
 	if len(call.Arguments) > 1 && !goja.IsUndefined(call.Arguments[1]) {

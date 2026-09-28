@@ -54,6 +54,10 @@ type Driver struct {
 	// The element the last step tapped, while the next step may still need
 	// to wait for that tap's UI to settle
 	lastTapID string
+
+	// A swipe or scroll has run since the last tap, so with MAESTRO_WDA_SETTLE
+	// the next element tap waits for the element to stop moving (settle.go)
+	recentScroll bool
 }
 
 // Crash-loop detection thresholds.
@@ -95,6 +99,11 @@ func NewDriver(client *Client, info *core.PlatformInfo, udid string) *Driver {
 // at "", which means no monitor is registered and in-app dialogs aren't
 // auto-handled.
 func (d *Driver) PrepareForFlow(steps []flow.Step) {
+	// A crash loop is diagnosed for the flow it happened in. The next flow
+	// launches the app again and gets its own chance.
+	d.crashAbortReason = ""
+	d.appDeathCount = 0
+
 	for _, s := range steps {
 		launchApp, ok := s.(*flow.LaunchAppStep)
 		if !ok {
@@ -227,11 +236,13 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 	// An action right after a tap waits for that tap's UI to settle. WDA's
 	// own wait for quiescence is off (it crashed XCTest), so a second tap
 	// went out tens of milliseconds after the first, before the push the
-	// first one started, and landed on the screen being left (#179).
-	if d.lastTapID != "" && actsOnScreen(step) {
+	// first one started, and landed on the screen being left (#179). With
+	// MAESTRO_WDA_SETTLE the screen settle after every step does this.
+	if !settleOn() && d.lastTapID != "" && actsOnScreen(step) {
 		d.settleAfterTap()
 	}
 	d.lastTapID = ""
+	d.settleBefore(step)
 
 	var result *core.CommandResult
 	switch s := step.(type) {
@@ -353,6 +364,7 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 		}
 	}
 
+	d.settleAfter(step, result)
 	result.Duration = time.Since(start)
 	d.trackCrashLoop(result)
 	return result
@@ -449,7 +461,8 @@ func (d *Driver) trackCrashLoop(result *core.CommandResult) {
 
 // isAppDeathError matches result messages / error texts that indicate the
 // app under test is no longer running. Patterns drawn from real WDA failure
-// modes observed in #38 and similar repros.
+// modes observed in #38 and similar repros. A reset or refused connection is
+// not one: that is WDA or the link to it, with the app possibly fine.
 func isAppDeathError(result *core.CommandResult) bool {
 	if result == nil {
 		return false
@@ -471,8 +484,6 @@ func isAppDeathError(result *core.CommandResult) bool {
 		"could not start app",
 		"failed to launch",
 		"no such session",
-		"connection reset",
-		"connection refused",
 	}
 	for _, s := range signals {
 		if strings.Contains(combined, s) {
@@ -541,29 +552,30 @@ func (d *Driver) findElementWithContext(ctx context.Context, sel flow.Selector) 
 	// All other selectors - try WDA strategies with page source fallback
 	var lastErr error
 
-	for {
-		select {
-		case <-ctx.Done():
+	// The first attempt runs whatever the deadline, as Maestro's timer always
+	// looks once (MaestroTimer.kt): a condition checked after a long step has
+	// almost no budget left and must still look at the screen.
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil && attempt > 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("%s: %w", ctx.Err(), lastErr)
+				return nil, fmt.Errorf("%s: %w", err, lastErr)
 			}
-			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), ctx.Err())
-		default:
-			// Try WDA strategies first (skip for index selectors — WDA returns single match)
-			if !sel.HasNonZeroIndex() {
-				if info, err := d.findElementByWDA(sel); err == nil {
-					return info, nil
-				}
-			}
-
-			// Fallback to page source parsing
-			if info, err := d.findElementByPageSourceOnce(sel); err == nil {
-				return info, nil
-			} else {
-				lastErr = err
-			}
-			time.Sleep(50 * time.Millisecond)
+			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), err)
 		}
+		// Try WDA strategies first (skip for index selectors — WDA returns single match)
+		if !sel.HasNonZeroIndex() {
+			if info, err := d.findElementByWDA(sel); err == nil {
+				return info, nil
+			}
+		}
+
+		// Fallback to page source parsing
+		if info, err := d.findElementByPageSourceOnce(sel); err == nil {
+			return info, nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -571,6 +583,13 @@ func (d *Driver) findElementWithContext(ctx context.Context, sel flow.Selector) 
 // For text selectors, it tries interactive element types first (TextField, SecureTextField, Button),
 // then falls back to generic text matching with clickable parent lookup via page source.
 func (d *Driver) findElementForTap(sel flow.Selector, optional bool, stepTimeoutMs int) (*core.ElementInfo, error) {
+	// Maestro finds the element a tap goes to the way it finds any other
+	// (Orchestra.kt:1325-1331). The tap strategies below are the runner's:
+	// a text field that merely contains the text outranks an exact button.
+	if strictSelectors() {
+		return d.findElement(sel, optional, stepTimeoutMs)
+	}
+
 	// For relative selectors, use page source which handles them correctly
 	if sel.HasRelativeSelector() {
 		timeout := d.calculateTimeout(optional, stepTimeoutMs)
@@ -582,6 +601,12 @@ func (d *Driver) findElementForTap(sel flow.Selector, optional bool, stepTimeout
 	// For index selectors, use standard findElement which routes to page source
 	// (WDA native API returns single match, can't pick Nth)
 	if sel.HasNonZeroIndex() {
+		return d.findElement(sel, optional, stepTimeoutMs)
+	}
+
+	// checked is only known from the page source, which findElement reaches;
+	// the text strategies below would tap a switch in either state.
+	if sel.Checked != nil {
 		return d.findElement(sel, optional, stepTimeoutMs)
 	}
 
@@ -766,7 +791,7 @@ func (d *Driver) calculateTimeout(optional bool, stepTimeoutMs int) time.Duratio
 			timeoutMs = d.optionalFindTimeout
 		}
 	} else {
-		timeoutMs = DefaultFindTimeout
+		timeoutMs = requiredFindTimeoutMs()
 		if d.findTimeout > 0 {
 			timeoutMs = d.findTimeout
 		}
@@ -889,9 +914,17 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 	if sel.ID != "" && sel.Text != "" {
 		return nil, fmt.Errorf("combined id+text selector requires page-source AND matching")
 	}
+	// checked is read from the page source (type and value); the queries
+	// below would match a switch in either state.
+	if sel.Checked != nil {
+		return nil, fmt.Errorf("checked selector requires page-source matching")
+	}
 
 	// Try class chain for accessibility ID
 	if sel.ID != "" {
+		if strictSelectors() {
+			return d.strictIDByWDA(sel, stateFilter)
+		}
 		if looksLikeRegex(sel.ID) {
 			// Regex id: match against name via MATCHES.
 			query := fmt.Sprintf("**/XCUIElementTypeAny[`name MATCHES '%s'%s`]", sel.ID, stateFilter)
@@ -917,6 +950,9 @@ func (d *Driver) findElementByWDA(sel flow.Selector) (*core.ElementInfo, error) 
 	}
 
 	if sel.Text != "" {
+		if strictSelectors() {
+			return d.strictTextByWDA(sel, stateFilter)
+		}
 		// Try generic predicate first — most assertions target StaticText/labels,
 		// so this avoids 3 wasted type-specific queries (TextField, SecureTextField, Button)
 		predicateBase := fmt.Sprintf("label CONTAINS[c] '%s' OR value CONTAINS[c] '%s'",
@@ -979,7 +1015,8 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 	if rectErr != nil {
 		return nil, fmt.Errorf("element bounds unavailable: %w", rectErr)
 	}
-	if w <= 0 || h <= 0 {
+	strict := strictSelectors()
+	if !strict && (w <= 0 || h <= 0) {
 		return nil, fmt.Errorf("element has invalid bounds: %dx%d", w, h)
 	}
 	info.Bounds = core.Bounds{X: x, Y: y, Width: w, Height: h}
@@ -991,6 +1028,22 @@ func (d *Driver) getElementInfo(elemID string) (*core.ElementInfo, error) {
 		info.Class = elemName
 	}
 	info.Visible = dispErr == nil && displayed
+
+	if strict {
+		// Maestro goes by bounds alone (maestroOnScreen): displayed=true is no
+		// pass, and neither is a displayed read that failed. XCUITest's flag
+		// only breaks ties between same-id elements (onScreenOf). An element
+		// under 10% on screen may still have a descendant on it, which the
+		// page source, where this lookup goes next, can see.
+		onScreen := w >= 0 && h >= 0 && (w > 0 || h > 0)
+		if screenW, screenH, err := d.screenSize(); err == nil {
+			onScreen = maestroOnScreen(info.Bounds, screenW, screenH)
+		}
+		if !onScreen {
+			return nil, fmt.Errorf("element exists but is not visible on screen (bounds %d,%d %dx%d)", x, y, w, h)
+		}
+		return info, nil
+	}
 
 	if dispErr == nil && !displayed {
 		// XCUITest says off-screen. Check bounds geometrically — if they're
@@ -1071,21 +1124,20 @@ func (d *Driver) onScreenOf(ids []string) (*core.ElementInfo, error) {
 func (d *Driver) findElementRelativeWithContext(ctx context.Context, sel flow.Selector) (*core.ElementInfo, error) {
 	var lastErr error
 
-	for {
-		select {
-		case <-ctx.Done():
+	// As in findElementWithContext, the first attempt runs whatever the deadline.
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil && attempt > 0 {
 			if lastErr != nil {
-				return nil, fmt.Errorf("%s: %w", ctx.Err(), lastErr)
+				return nil, fmt.Errorf("%s: %w", err, lastErr)
 			}
-			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), ctx.Err())
-		default:
-			info, err := d.findElementRelativeOnce(sel)
-			if err == nil {
-				return info, nil
-			}
-			lastErr = err
-			// HTTP round-trip is natural rate limit, no sleep needed
+			return nil, fmt.Errorf("element '%s' not found: %w", sel.Describe(), err)
 		}
+		info, err := d.findElementRelativeOnce(sel)
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+		// HTTP round-trip is natural rate limit, no sleep needed
 	}
 }
 
@@ -1106,6 +1158,9 @@ func (d *Driver) findElementRelativeOnce(sel flow.Selector) (*core.ElementInfo, 
 		allElements = FilterOutOfBounds(allElements, w, h)
 	}
 
+	if strictSelectors() {
+		return d.strictMatch(sel, allElements)
+	}
 	return d.resolveRelativeSelector(sel, allElements)
 }
 
@@ -1126,7 +1181,7 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector, allElements []*Parse
 
 	// Get candidates
 	var candidates []*ParsedElement
-	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 {
+	if baseSel.Text != "" || baseSel.ID != "" || baseSel.Width > 0 || baseSel.Height > 0 || baseSel.Checked != nil {
 		candidates = FilterBySelector(allElements, baseSel)
 	} else {
 		candidates = allElements
@@ -1137,7 +1192,7 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector, allElements []*Parse
 	if anchorSelector != nil {
 		anchors := FilterBySelector(allElements, *anchorSelector)
 		if len(anchors) == 0 {
-			return nil, fmt.Errorf("anchor element not found")
+			return nil, notFound("anchor element not found")
 		}
 
 		var matchingCandidates []*ParsedElement
@@ -1159,7 +1214,7 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector, allElements []*Parse
 	// Bounds-based visibility (FilterOutOfBounds already applied above);
 	// XCUITest's `visible="false"` is unreliable on RN testID wrappers.
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no elements match selector")
+		return nil, notFound("no elements match selector")
 	}
 
 	// Prioritize clickable/interactive elements
@@ -1175,7 +1230,7 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector, allElements []*Parse
 	}
 
 	info := &core.ElementInfo{
-		Text:    selected.Label,
+		Text:    elementText(selected),
 		Bounds:  selected.Bounds,
 		Enabled: selected.Enabled,
 		Visible: selected.Displayed,
@@ -1193,7 +1248,12 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 	if err != nil {
 		return nil, err
 	}
+	return d.findInPageSource(pageSource, sel)
+}
 
+// findInPageSource matches a selector against a page source already read, so a
+// caller that needs the source for something else as well reads it once.
+func (d *Driver) findInPageSource(pageSource string, sel flow.Selector) (*core.ElementInfo, error) {
 	allElements, err := ParsePageSource(pageSource)
 	if err != nil {
 		return nil, err
@@ -1205,6 +1265,9 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 		allElements = FilterOutOfBounds(allElements, w, h)
 	}
 
+	if strictSelectors() {
+		return d.strictMatch(sel, allElements)
+	}
 	candidates := FilterBySelector(allElements, sel)
 
 	// XCUITest's `visible="false"` is unreliable on React Native testID-bearing
@@ -1215,10 +1278,10 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 	if len(candidates) == 0 {
 		if sel.Text != "" {
 			if closest := ClosestTexts(allElements, sel.Text, 3); len(closest) > 0 {
-				return nil, fmt.Errorf("no elements match selector; closest on-screen texts: %s", strings.Join(closest, ", "))
+				return nil, notFound("no elements match selector; closest on-screen texts: %s", strings.Join(closest, ", "))
 			}
 		}
-		return nil, fmt.Errorf("no elements match selector")
+		return nil, notFound("no elements match selector")
 	}
 
 	// Prioritize clickable/interactive elements
@@ -1231,7 +1294,7 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*core.ElementIn
 	clickableElem := GetClickableElement(selected)
 
 	info := &core.ElementInfo{
-		Text:    selected.Label,
+		Text:    elementText(selected),
 		Bounds:  clickableElem.Bounds,
 		Enabled: selected.Enabled,
 		Visible: selected.Displayed,
