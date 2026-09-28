@@ -158,3 +158,46 @@ func TestTimedSwipeFromAnElementRunsToTheScreenEdge(t *testing.T) {
 		}
 	}
 }
+
+// With the switch, a scroll is Maestro's: from the middle of the screen
+// (195, 422) to 10% of its height, taking 333 ms (IOSDriver.kt:240-250), and
+// the same swipe mirrored for the other directions. It was a 0.3 s hold and a
+// drag from 66.7% to 33.3% of the height. A `speed:` still sets the duration.
+func TestTimedScrollIsMaestrosSwipeFromTheMiddle(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_TIMED_SWIPE", "1")
+	cases := []struct {
+		direction string
+		speed     int
+		want      [4]float64
+		ms        float64
+	}{
+		{"down", 0, [4]float64{195, 422, 195, 84}, 333},
+		{"up", 0, [4]float64{195, 422, 195, 759}, 333},
+		{"left", 0, [4]float64{195, 422, 351, 422}, 333},
+		{"right", 0, [4]float64{195, 422, 39, 422}, 333},
+		{"down", 40, [4]float64{195, 422, 195, 84}, 601},
+	}
+	for _, c := range cases {
+		log := &gestureLog{}
+		server := swipeServer(t, log)
+		result := createTestDriver(server).scroll(&flow.ScrollStep{Direction: c.direction, Speed: c.speed})
+		server.Close()
+		if !result.Success {
+			t.Fatalf("%s: scroll failed: %s", c.direction, result.Message)
+		}
+		if strings.Join(log.paths, ",") != "actions" {
+			t.Fatalf("%s: gesture endpoints %v, want the W3C actions alone", c.direction, log.paths)
+		}
+		if got := gesturePoints(t, log.body); got != c.want {
+			t.Errorf("%s: scroll %v, want %v", c.direction, got, c.want)
+		}
+		if got := moveDuration(t, log.body); got != c.ms {
+			t.Errorf("%s at speed %d: took %v ms, want %v", c.direction, c.speed, got, c.ms)
+		}
+	}
+	server := swipeServer(t, &gestureLog{})
+	defer server.Close()
+	if result := createTestDriver(server).scroll(&flow.ScrollStep{Direction: "sideways"}); result.Success {
+		t.Error("an unknown direction must fail")
+	}
+}

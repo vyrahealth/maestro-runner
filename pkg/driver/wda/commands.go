@@ -753,6 +753,20 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 		return errorResult(fmt.Errorf("invalid direction: %s", step.Direction), "Invalid scroll direction")
 	}
 
+	// With timed swipes, a scroll is Maestro's: a swipe from the middle of the
+	// screen to 10% of its height, taking 333 ms (IOSDriver.kt:240-250), and
+	// the same swipe mirrored for the other directions.
+	if timedSwipes() {
+		sx, sy, ex, ey, err := maestroScrollSwipe(dir, width, height)
+		if err != nil {
+			return errorResult(err, "Invalid scroll direction")
+		}
+		if err := d.client.PointerSwipe(sx, sy, ex, ey, core.ScrollDurationOrDefault(step.Speed, maestroScrollDurationMs)); err != nil {
+			return errorResult(err, "Scroll failed")
+		}
+		return successResult(fmt.Sprintf("Scrolled %s", step.Direction), nil)
+	}
+
 	// WDA's swipe duration is in seconds; the Maestro speed inverts to ms.
 	// Was hardcoded 0.3s, so `speed:` was silently dropped here too (#165).
 	durationSec := float64(core.ScrollDurationOrDefault(step.Speed, 300)) / 1000.0
@@ -1043,6 +1057,23 @@ func maestroSwipeFrom(direction string, b core.Bounds, point string, screenW, sc
 	}
 	return maestroOnScreen(x, screenW), maestroOnScreen(y, screenH),
 		maestroOnScreen(endX, screenW), maestroOnScreen(endY, screenH), nil
+}
+
+// maestroScrollDurationMs is how long Maestro's `scroll` swipe takes
+// (IOSDriver.kt:248).
+const maestroScrollDurationMs = 333
+
+// maestroScrollSwipe is the swipe Maestro scrolls with on iOS: from the middle
+// of the screen to 10% or 90% of it, against the scroll (scrolling down swipes
+// up). A `scroll` is this swipe up (IOSDriver.kt:240-250), and each of
+// scrollUntilVisible's scrolls is it in the step's direction
+// (Maestro.kt:198-206, then IOSDriver.kt:339-367).
+func maestroScrollSwipe(scrollDirection string, screenW, screenH int) (sx, sy, ex, ey float64, err error) {
+	swipe, ok := map[string]string{"down": "up", "up": "down", "left": "right", "right": "left"}[scrollDirection]
+	if !ok {
+		return 0, 0, 0, 0, fmt.Errorf("invalid direction: %s", scrollDirection)
+	}
+	return maestroSwipeFrom(swipe, core.Bounds{Width: screenW, Height: screenH}, "", screenW, screenH)
 }
 
 // swipeGesture performs a swipe step's gesture.
