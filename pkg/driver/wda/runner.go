@@ -69,6 +69,14 @@ type Runner struct {
 	isSimulatorCache    bool      // Cached device type
 }
 
+// ExternalForward reports whether MAESTRO_WDA_EXTERNAL_FORWARD is set: a physical device's WDA
+// port is already forwarded to 127.0.0.1 by something else (the phone is plugged into another
+// host, whose iproxy forwards the port, reached through an SSH tunnel). The runner then skips
+// its own go-ios forward, and the CLI stops reading a bound port as "device in use".
+func ExternalForward() bool {
+	return os.Getenv("MAESTRO_WDA_EXTERNAL_FORWARD") != ""
+}
+
 // NewRunner creates a new WDA runner.
 // The WDA port is derived from the device UDID so each simulator gets a
 // deterministic, unique port without scanning.
@@ -247,8 +255,14 @@ func (r *Runner) Start(ctx context.Context) error {
 			if attempt > 1 {
 				fmt.Fprintf(os.Stderr, "  ✓ WDA started on attempt %d/%d\n", attempt, maxStartupAttempts)
 			}
-			// For physical devices, forward the WDA port from device to localhost.
-			if !r.isSimulatorCache {
+			// For physical devices, forward the WDA port from device to localhost,
+			// unless MAESTRO_WDA_EXTERNAL_FORWARD says 127.0.0.1:<port> already
+			// reaches the device: the phone is plugged into another host, whose
+			// iproxy forwards the port, reached from here through an SSH tunnel.
+			// go-ios can only forward a device on this machine's own usbmuxd.
+			if !r.isSimulatorCache && ExternalForward() {
+				fmt.Fprintf(os.Stderr, "  ↪ WDA port %d: using the external forward (MAESTRO_WDA_EXTERNAL_FORWARD)\n", r.port)
+			} else if !r.isSimulatorCache {
 				if pferr := r.startPortForward(); pferr != nil {
 					r.Stop()
 					return fmt.Errorf("failed to start port forwarding: %w", pferr)
