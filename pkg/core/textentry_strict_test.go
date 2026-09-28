@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -194,5 +195,46 @@ func TestReadBackGivesUpOnAFieldThatKeepsChanging(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < typedReadLimit || elapsed > time.Second {
 		t.Errorf("gave up after %v, want about %v", elapsed, typedReadLimit)
+	}
+}
+
+// goneField reads once, or not at all, and then is gone, as a code box is once
+// its digit moves focus on.
+type goneField struct {
+	reads, good int
+}
+
+func (f *goneField) Text() (string, error) {
+	f.reads++
+	if f.reads <= f.good {
+		return "7", nil
+	}
+	return "", errors.New("no such element")
+}
+func (f *goneField) Clear() error         { return nil }
+func (f *goneField) Input(s string) error { return nil }
+
+// A field that cannot be read back is not re-read until the limit: that is
+// seconds per digit of a one-time code, for nothing.
+func TestReadBackDoesNotWaitOnAFieldThatCannotBeRead(t *testing.T) {
+	t.Setenv("MAESTRO_STRICT_TYPING", "1")
+	wait := typedReadWait
+	typedReadWait = time.Hour // a wait would hang the test
+	t.Cleanup(func() { typedReadWait = wait })
+
+	f := &goneField{good: 0}
+	if _, err := readBack(f); err == nil || f.reads != 1 {
+		t.Fatalf("unreadable field: err %v after %d reads, want the error after 1", err, f.reads)
+	}
+}
+
+// A field that goes away after a good read keeps that read.
+func TestReadBackKeepsTheLastGoodReadWhenTheFieldGoes(t *testing.T) {
+	t.Setenv("MAESTRO_STRICT_TYPING", "1")
+	quickTypedReads(t)
+	f := &goneField{good: 1}
+	text, err := readBack(f)
+	if err != nil || text != "7" || f.reads != 2 {
+		t.Fatalf("read %q (%v) after %d reads, want \"7\" after 2", text, err, f.reads)
 	}
 }
