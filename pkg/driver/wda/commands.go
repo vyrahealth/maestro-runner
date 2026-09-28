@@ -1403,6 +1403,12 @@ func (d *Driver) clearKeychain(_ *flow.ClearKeychainStep) *core.CommandResult {
 // resetKeychain runs `xcrun simctl keychain <udid> reset` on the simulator.
 // Shared by the standalone step and the launchApp clearKeychain: true option.
 func (d *Driver) resetKeychain() *core.CommandResult {
+	if !d.info.IsSimulator && os.Getenv("MAESTRO_IOS_DEVICE_SKIP_CLEAR_KEYCHAIN") != "" {
+		// Opt-in: the keychain of a real device cannot be reset from outside the app, so a suite
+		// that also runs on simulators can let the step pass here and make the app itself start
+		// clean (clearState reinstalls it; the app decides what an old keychain means).
+		return successResult("clearKeychain skipped on a real iOS device (MAESTRO_IOS_DEVICE_SKIP_CLEAR_KEYCHAIN)", nil)
+	}
 	if !d.info.IsSimulator {
 		return &core.CommandResult{
 			Success: false,
