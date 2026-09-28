@@ -64,18 +64,29 @@ func TestTimedSwipeIsAPointerGestureOfThatLength(t *testing.T) {
 	}
 }
 
-// Without a duration nothing changes, switch or not: the drag every swipe has
-// always been. (Without the switch, TestSwipeCustomDuration pins the old
-// mapping of a duration onto the drag's hold.)
-func TestTimedSwipeWithoutDurationKeepsTheDrag(t *testing.T) {
-	t.Setenv("MAESTRO_WDA_TIMED_SWIPE", "1")
-	log := &gestureLog{}
-	server := swipeServer(t, log)
-	defer server.Close()
-	if result := createTestDriver(server).swipe(&flow.SwipeStep{Direction: "UP"}); !result.Success {
-		t.Fatalf("swipe failed: %s", result.Message)
-	}
-	if strings.Join(log.paths, ",") != "dragfromtoforduration" {
-		t.Fatalf("gesture endpoints %v, want dragfromtoforduration alone", log.paths)
+// A swipe without a duration takes Maestro's default 400 ms with the switch
+// (YamlSwipe.kt:58). Without it, that swipe is the drag it has always been.
+// (TestSwipeCustomDuration pins the old mapping of a duration onto the drag's
+// hold.)
+func TestTimedSwipeWithoutDurationTakesMaestrosDefault(t *testing.T) {
+	for _, c := range []struct {
+		env, paths string
+	}{{"1", "actions"}, {"", "dragfromtoforduration"}} {
+		t.Setenv("MAESTRO_WDA_TIMED_SWIPE", c.env)
+		log := &gestureLog{}
+		server := swipeServer(t, log)
+		result := createTestDriver(server).swipe(&flow.SwipeStep{Direction: "UP"})
+		server.Close()
+		if !result.Success {
+			t.Fatalf("switch %q: swipe failed: %s", c.env, result.Message)
+		}
+		if strings.Join(log.paths, ",") != c.paths {
+			t.Fatalf("switch %q: gesture endpoints %v, want %s alone", c.env, log.paths, c.paths)
+		}
+		if c.env != "" {
+			if got := moveDuration(t, log.body); got != 400 {
+				t.Errorf("the swipe took %v ms, want Maestro's 400", got)
+			}
+		}
 	}
 }
