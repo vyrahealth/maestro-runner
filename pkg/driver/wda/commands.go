@@ -1102,9 +1102,9 @@ func maestroPercentOf(fraction float64, total int) int {
 	return int(fraction * float64(total))
 }
 
-// maestroOnScreen keeps either end of a swipe within [0, limit], as Maestro's
+// maestroCoerceIn keeps either end of a swipe within [0, limit], as Maestro's
 // Point.coerceIn does before every iOS swipe (IOSDriver.kt:265-266, 704-709).
-func maestroOnScreen(v, limit int) float64 {
+func maestroCoerceIn(v, limit int) float64 {
 	return float64(min(max(v, 0), limit))
 }
 
@@ -1120,7 +1120,7 @@ func maestroScreenPoint(coord string, screenW, screenH int) (x, y float64, err e
 	if errX != nil || errY != nil {
 		return 0, 0, fmt.Errorf("invalid coordinate: %s", coord)
 	}
-	return maestroOnScreen(px, screenW), maestroOnScreen(py, screenH), nil
+	return maestroCoerceIn(px, screenW), maestroCoerceIn(py, screenH), nil
 }
 
 // maestroSwipeFrom is where Maestro's swipe from an element starts and ends on
@@ -1147,8 +1147,8 @@ func maestroSwipeFrom(direction string, b core.Bounds, point string, screenW, sc
 	default:
 		return 0, 0, 0, 0, fmt.Errorf("invalid swipe direction: %q", direction)
 	}
-	return maestroOnScreen(x, screenW), maestroOnScreen(y, screenH),
-		maestroOnScreen(endX, screenW), maestroOnScreen(endY, screenH), nil
+	return maestroCoerceIn(x, screenW), maestroCoerceIn(y, screenH),
+		maestroCoerceIn(endX, screenW), maestroCoerceIn(endY, screenH), nil
 }
 
 // maestroScrollDurationMs is the duration of Maestro's `scroll` swipe
