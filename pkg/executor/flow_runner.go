@@ -41,6 +41,11 @@ type FlowRunner struct {
 	waitForIdleTimeout int
 	// Active runFlow timeout label (e.g. "3s") for enriching sub-step errors
 	runFlowTimeout string
+	// When the last step that changed the device ended, and how many such
+	// steps have run, so a compound step can tell whether one ran inside it.
+	// They give MAESTRO_PARITY_TIMEOUTS its condition budget.
+	lastInteraction time.Time
+	interactions    int
 }
 
 // Run executes the flow and returns the result.
@@ -100,6 +105,11 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Apply the global condition-check timeout for when:/while: checks. 0 keeps
 	// the engine's fast default; --condition-timeout / config overrides it (#110).
 	fr.script.SetConditionTimeout(fr.config.ConditionTimeout)
+	// MAESTRO_PARITY_TIMEOUTS: with no condition timeout configured, a
+	// when:/while: check waits as long as Maestro's would (conditionBudgetMs).
+	if fr.config.ConditionTimeout <= 0 && os.Getenv("MAESTRO_PARITY_TIMEOUTS") != "" {
+		fr.script.conditionBudget = fr.conditionBudgetMs
+	}
 	fr.script.SetInsecureHTTP(fr.config.Insecure)
 
 	// Apply waitForIdleTimeout with priority:
@@ -215,6 +225,10 @@ func (fr *FlowRunner) Run() FlowResult {
 			}
 		}
 	}()
+
+	// Maestro's condition budget runs from the start of the flow until the
+	// first step that changes the device (Orchestra.kt:197).
+	fr.lastInteraction = time.Now()
 
 	// Execute onFlowStart hooks
 	if len(fr.flow.Config.OnFlowStart) > 0 {
@@ -405,6 +419,7 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 
 	// Execute step - route to appropriate handler
 	var result *core.CommandResult
+	interactionsBefore := fr.interactions
 
 	switch s := step.(type) {
 	// JS/Scripting steps - handled by ScriptEngine
@@ -576,6 +591,7 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 	default:
 		result = fr.driver.Execute(step)
 	}
+	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	stepDuration := time.Since(stepStart).Milliseconds()
 
@@ -1015,6 +1031,79 @@ func (fr *FlowRunner) collectStepsForPrepare() []flow.Step {
 	return out
 }
 
+// maestroOptionalLookupMs is Maestro's optional lookup timeout
+// (optionalLookupTimeoutMs, Orchestra.kt:137), which when: and while: wait on.
+const maestroOptionalLookupMs = 7000
+
+// conditionBudgetMs is how long a when:/while: visibility check may wait under
+// MAESTRO_PARITY_TIMEOUTS: Maestro's 7 s optional lookup, less the time since
+// the last step that changed the device (adjustedToLatestInteraction,
+// Orchestra.kt:1767-1770, used for conditions at 1058 and 1067). Maestro still
+// looks once when nothing is left, because its lookups loop do-while
+// (MaestroTimer.kt:33-46). So the floor is 1 ms: 0 would hand the driver its
+// own default instead.
+func (fr *FlowRunner) conditionBudgetMs() int {
+	left := maestroOptionalLookupMs - int(time.Since(fr.lastInteraction).Milliseconds())
+	if left < 1 {
+		return 1
+	}
+	return left
+}
+
+// changesDevice reports whether Maestro counts a passing step as one that
+// changed the device. Maestro's executeCommand returns false only for these
+// steps (Orchestra.kt:384-453) and true for every other, the ones it does not
+// list included. runFlow, repeat and retry go by the steps inside them.
+func changesDevice(step flow.Step) bool {
+	switch step.(type) {
+	case *flow.AssertVisibleStep, *flow.AssertNotVisibleStep, *flow.AssertTrueStep,
+		*flow.AssertConditionStep, *flow.WaitUntilStep, *flow.AssertScreenshotStep,
+		*flow.AssertNoDefectsWithAIStep, *flow.AssertWithAIStep, *flow.ExtractTextWithAIStep,
+		*flow.AssertDarkModeStep, *flow.AssertLightModeStep, *flow.CopyTextFromStep,
+		*flow.SetClipboardStep, *flow.SetPermissionsStep, *flow.ClearKeychainStep,
+		*flow.TakeScreenshotStep, *flow.StartRecordingStep, *flow.StopRecordingStep,
+		*flow.DefineVariablesStep:
+		return false
+	}
+	return true
+}
+
+// noteInteraction restarts the condition budget after a step that changed the
+// device, as Maestro does when executeCommand returns true (Orchestra.kt:448-451).
+// A failed step changes nothing: Maestro's command throws before that. A runFlow
+// or repeat counts when a step inside it did, since Maestro's subflow returns
+// whether any of its commands did (Orchestra.kt:1152). A retry counts when a
+// step of its passing attempt did, which executeRetry notes itself.
+func (fr *FlowRunner) noteInteraction(step flow.Step, passed bool, before int) {
+	if !passed {
+		return
+	}
+	switch step.(type) {
+	case *flow.RunFlowStep, *flow.RepeatStep:
+		if fr.interactions == before {
+			return
+		}
+	case *flow.RetryStep:
+		return
+	default:
+		if !changesDevice(step) {
+			return
+		}
+	}
+	fr.lastInteraction = time.Now()
+	fr.interactions++
+}
+
+// noteAttemptInteraction ends a retry's passing attempt, which changed the
+// device when a step of that attempt did (Maestro returns that attempt's
+// runSubFlow, Orchestra.kt:942).
+func (fr *FlowRunner) noteAttemptInteraction(attemptStart int) {
+	if fr.interactions > attemptStart {
+		fr.lastInteraction = time.Now()
+		fr.interactions++
+	}
+}
+
 // executeRepeat handles repeat step execution.
 func (fr *FlowRunner) executeRepeat(step *flow.RepeatStep) *core.CommandResult {
 	hasWhile := step.While.Visible != nil || step.While.NotVisible != nil || step.While.Script != ""
@@ -1154,6 +1243,7 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 			}
 		}
 
+		attemptStart := fr.interactions
 		success := true
 		for _, nestedStep := range step.Steps {
 			result := fr.executeNestedStep(nestedStep)
@@ -1165,6 +1255,7 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 		}
 
 		if success {
+			fr.noteAttemptInteraction(attemptStart)
 			return &core.CommandResult{
 				Success: true,
 				Message: fmt.Sprintf("Retry succeeded on attempt %d", attempt),
@@ -1452,6 +1543,7 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		}()
 	}
 
+	interactionsBefore := fr.interactions
 	switch s := step.(type) {
 	case *flow.DefineVariablesStep:
 		result = fr.script.ExecuteDefineVariables(s)
@@ -1599,6 +1691,7 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		fr.script.ExpandStep(step)
 		result = fr.driver.Execute(step)
 	}
+	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	duration := time.Since(start).Milliseconds()
 
@@ -1752,8 +1845,10 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, attempts int) *
 			}
 		}
 
+		attemptStart := fr.interactions
 		result := fr.executeSubFlow(subFlow)
 		if result.Success {
+			fr.noteAttemptInteraction(attemptStart)
 			return &core.CommandResult{
 				Success: true,
 				Message: fmt.Sprintf("Retry succeeded on attempt %d", attempt),

@@ -35,6 +35,11 @@ type ScriptEngine struct {
 	variables          map[string]string
 	flowDir            string // Directory of current flow (for resolving relative paths)
 	conditionTimeoutMs int    // default timeout for when/while condition checks
+
+	// conditionBudget, when set, replaces conditionTimeoutMs for a when/while
+	// visibility check that sets no timeout of its own. The flow runner sets
+	// it for MAESTRO_PARITY_TIMEOUTS.
+	conditionBudget func() int
 }
 
 // NewScriptEngine creates a new script engine.
@@ -595,7 +600,7 @@ func (se *ScriptEngine) CheckCondition(ctx context.Context, cond flow.Condition,
 	if cond.Visible != nil {
 		visibleStep := &flow.AssertVisibleStep{Selector: *cond.Visible}
 		// when/while: an unmet condition should fail fast (#110).
-		visibleStep.TimeoutMs = conditionTimeout(cond, cond.Visible, se.conditionTimeoutMs)
+		visibleStep.TimeoutMs = conditionTimeout(cond, cond.Visible, se.conditionFallbackMs())
 		visibleStep.Optional = true
 		result := driver.Execute(visibleStep)
 		if !result.Success {
@@ -606,7 +611,7 @@ func (se *ScriptEngine) CheckCondition(ctx context.Context, cond flow.Condition,
 	// Check notVisible
 	if cond.NotVisible != nil {
 		notVisibleStep := &flow.AssertNotVisibleStep{Selector: *cond.NotVisible}
-		notVisibleStep.TimeoutMs = conditionTimeout(cond, cond.NotVisible, se.conditionTimeoutMs)
+		notVisibleStep.TimeoutMs = conditionTimeout(cond, cond.NotVisible, se.conditionFallbackMs())
 		notVisibleStep.Optional = true
 		result := driver.Execute(notVisibleStep)
 		if !result.Success {
@@ -623,6 +628,16 @@ func (se *ScriptEngine) CheckCondition(ctx context.Context, cond flow.Condition,
 	}
 
 	return true
+}
+
+// conditionFallbackMs is the timeout of a when/while visibility check whose
+// condition and selector set none. It is read for each check, so a budget that
+// shrinks with time is as small as it is at that moment.
+func (se *ScriptEngine) conditionFallbackMs() int {
+	if se.conditionBudget != nil {
+		return se.conditionBudget()
+	}
+	return se.conditionTimeoutMs
 }
 
 // conditionTimeout returns the timeout to use for a condition check.
