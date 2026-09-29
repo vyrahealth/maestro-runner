@@ -32,9 +32,30 @@ func NewClient(port uint16) *Client {
 	return &Client{
 		baseURL: fmt.Sprintf("http://localhost:%d", port),
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout:   60 * time.Second,
+			Transport: newWDATransport(),
 		},
 	}
+}
+
+// wdaIdleConnsPerHost is how many idle connections the client keeps open to WebDriverAgent.
+// The driver sends up to four requests at once (an element's name, rect, text and displayed;
+// a tap's four lookups), and Go keeps two idle connections per host by default, so every such
+// burst closed two connections and opened two new ones. On a real iPhone reached through a
+// forward (SSH, then iproxy), a new connection took about 300 ms, and the two opened together
+// failed at once with EOF in 297 of 996 bursts of one 44-flow run, always both of them and
+// never a kept connection. Kept for every request of a burst, no new ones are needed.
+const wdaIdleConnsPerHost = 8
+
+// newWDATransport is Go's default transport with room to keep a whole burst's connections.
+func newWDATransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		base = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	t := base.Clone()
+	t.MaxIdleConnsPerHost = wdaIdleConnsPerHost
+	return t
 }
 
 // Session management

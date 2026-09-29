@@ -14,7 +14,7 @@ plugged into.
   patches, one commit each, so a tag's history is the patch series. The base is a release tag
   when the fixes we need are released, and an upstream `main` commit when they are not;
   `<base>` names it the way `git describe --tags` does. `v1.1.27-vyra.1` sits on the `v1.1.27`
-  release, and `v1.1.27-57-gc985a19-vyra.4` (the current build) on upstream `main` at
+  release, and `v1.1.27-57-gc985a19-vyra.5` (the current build) on upstream `main` at
   `c985a19`, 57 commits later and not yet released. Tags are never moved.
 - **`vyra`** (the default branch) holds the current build's tree. The Vyra Health org keeps
   every default branch linear and changed only through pull requests, so `vyra` is never
@@ -46,6 +46,7 @@ when it is used, that is on when it is set to anything.
 | `fix(wda): read the focused field back after typing into it` | Upstream reads the field back only for `inputText` with a selector; typing into the focused field is how a flow usually types. |
 | `fix(wda): launchApp stops a running app first unless stopApp is false` | Maestro stops the app before launching it by default; the WDA driver only activated a running app, so a relaunch did not restart it. |
 | `fix(wda): send a read or a lookup again when its connection drops` | WebDriverAgent drops connections late in a long session; a read, or a lookup that changes nothing, is sent once more. |
+| `fix(wda): keep enough connections open for four requests at once` | The driver sends four requests at once, and Go kept two idle connections, so each burst opened two new ones. Through a phone's forward, new connections opened together failed in pairs with EOF; kept ones never did. |
 | `fix(executor): retry's maxRetries counts retries, not attempts` | Maestro runs a `retry` block maxRetries + 1 times (1 by default, at most 3). The runner ran it maxRetries times (3 by default, no cap), so `maxRetries: 1` never retried. |
 | `fix(executor): run onFlowComplete before the result, and fail on it` | As in Maestro, a failing `onFlowComplete` step fails a flow that had passed, and the hook runs before the flow is reported. |
 | `fix(executor): remove the env keys a runFlow or retry added when it ends` | Keys a subflow added are removed when it returns, not set to "". |
@@ -105,7 +106,7 @@ From a checkout of a `v*-vyra.*` tag (Go 1.25 or later), so the binary names its
 
 ```bash
 M=github.com/devicelab-dev/maestro-runner/pkg/cli
-V=1.1.27-57-gc985a19+vyra.4   # the tag without its leading v, with + before "vyra"
+V=1.1.27-57-gc985a19+vyra.5   # the tag without its leading v, with + before "vyra"
 go build -trimpath -o bin/maestro-runner \
   -ldflags "-s -w -X $M.Version=$V -X $M.Commit=$(git rev-parse --short HEAD) -X $M.BuildDate=$(date -u +%F)" .
 ```
@@ -120,7 +121,7 @@ A new upstream base, a new patch, or both, start from the current build's tag:
 
 ```bash
 git fetch upstream --tags && git fetch origin --tags
-git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.4
+git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.5
 git rebase --onto v1.1.28 c985a19     # c985a19: the base the series sits on now
 # add or drop patches here, one commit each
 # test it as Testing, above, says: not a bare go test ./...
