@@ -68,7 +68,7 @@ func CreateIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 
 	// Check if device port is already in use (another instance using this device)
 	port := wdadriver.PortFromUDID(udid)
-	if !wdadriver.ExternalForward() && isPortInUse(port) {
+	if !wdadriver.ExternalForward() && !wdadriver.AttachExisting() && isPortInUse(port) {
 		return nil, nil, fmt.Errorf("device %s is in use (port %d already bound)\n"+
 			"Another maestro-runner instance may be using this device.\n"+
 			"Hint: Wait for it to finish or use a different device with --device <UDID>", udid, port)
@@ -94,47 +94,64 @@ func CreateIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		printSetupSuccess("App installed")
 	}
 
-	// 2. Verify bundled WDA is present (no auto-download — releases ship WDA)
-	if !cfg.NoDriverInstall {
-		printSetupStep("Checking WDA installation...")
-		if _, err := wdadriver.Setup(); err != nil {
-			return nil, nil, fmt.Errorf("WDA setup failed: %w", err)
+	// 2-4. Attach to a WDA something else started, or install, build and start our own.
+	var runner *wdadriver.Runner
+	wdaPort := port
+	if wdadriver.AttachExisting() {
+		printSetupStep(fmt.Sprintf("Attaching to the running WDA on port %d...", port))
+		if err := wdadriver.WaitForRunning(wdadriver.NewClient(port), wdadriver.AttachTimeout); err != nil {
+			return nil, nil, fmt.Errorf("MAESTRO_WDA_ATTACH: %w", err)
 		}
-		printSetupSuccess("WDA installed")
-	}
+		printSetupSuccess("WDA attached")
+	} else {
+		// 2. Verify bundled WDA is present (no auto-download — releases ship WDA)
+		if !cfg.NoDriverInstall {
+			printSetupStep("Checking WDA installation...")
+			if _, err := wdadriver.Setup(); err != nil {
+				return nil, nil, fmt.Errorf("WDA setup failed: %w", err)
+			}
+			printSetupSuccess("WDA installed")
+		}
 
-	// 3. Create WDA runner
-	printSetupStep("Building WDA...")
-	logger.Info("Building WDA for device %s (team ID: %s)", udid, cfg.TeamID)
-	runner := wdadriver.NewRunner(udid, cfg.TeamID, cfg.WDABundleID)
-	ctx := context.Background()
+		// 3. Create WDA runner
+		printSetupStep("Building WDA...")
+		logger.Info("Building WDA for device %s (team ID: %s)", udid, cfg.TeamID)
+		runner = wdadriver.NewRunner(udid, cfg.TeamID, cfg.WDABundleID)
+		ctx := context.Background()
 
-	if err := runner.Build(ctx); err != nil {
-		logger.Error("WDA build failed: %v", err)
-		return nil, nil, fmt.Errorf("WDA build failed: %w", err)
-	}
-	logger.Info("WDA build completed successfully")
-	printSetupSuccess("WDA built")
+		if err := runner.Build(ctx); err != nil {
+			logger.Error("WDA build failed: %v", err)
+			return nil, nil, fmt.Errorf("WDA build failed: %w", err)
+		}
+		logger.Info("WDA build completed successfully")
+		printSetupSuccess("WDA built")
 
-	// 4. Start WDA
-	printSetupStep("Starting WDA...")
-	logger.Info("Starting WDA on device %s (port: %d)", udid, runner.Port())
-	if err := runner.Start(ctx); err != nil {
-		logger.Error("WDA start failed: %v", err)
-		runner.Cleanup()
-		return nil, nil, fmt.Errorf("WDA start failed: %w", err)
+		// 4. Start WDA
+		printSetupStep("Starting WDA...")
+		logger.Info("Starting WDA on device %s (port: %d)", udid, runner.Port())
+		if err := runner.Start(ctx); err != nil {
+			logger.Error("WDA start failed: %v", err)
+			runner.Cleanup()
+			return nil, nil, fmt.Errorf("WDA start failed: %w", err)
+		}
+		logger.Info("WDA started successfully on port %d", runner.Port())
+		printSetupSuccess("WDA started")
+		wdaPort = runner.Port()
 	}
-	logger.Info("WDA started successfully on port %d", runner.Port())
-	printSetupSuccess("WDA started")
 
 	// 5. Create WDA client
-	printSetupSuccess(fmt.Sprintf("WDA port: %d", runner.Port()))
-	client := wdadriver.NewClient(runner.Port())
+	printSetupSuccess(fmt.Sprintf("WDA port: %d", wdaPort))
+	client := wdadriver.NewClient(wdaPort)
+	stopRunner := func() {
+		if runner != nil {
+			runner.Cleanup()
+		}
+	}
 
 	// 6. Get device info
 	deviceInfo, err := getIOSDeviceInfo(udid)
 	if err != nil {
-		runner.Cleanup()
+		stopRunner()
 		return nil, nil, fmt.Errorf("get device info: %w", err)
 	}
 
@@ -176,9 +193,7 @@ func CreateIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 	wdaDrv.SetAppFile(cfg.AppFile)
 
 	// Cleanup function
-	cleanup := func() {
-		runner.Cleanup()
-	}
+	cleanup := stopRunner
 
 	var driver core.Driver = wdaDrv
 
