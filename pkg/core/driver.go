@@ -268,6 +268,30 @@ type FlowAware interface {
 	PrepareForFlow(steps []flow.Step)
 }
 
+// SystemAlert is an alert the operating system shows over the app under
+// test, such as iOS's "FaceTime App Required". It is not in the app's view
+// tree, so no lookup sees it, and it takes the touches meant for the app.
+type SystemAlert struct {
+	Title   string   // its first line of text
+	Text    string   // all of its text, title and message, a line each
+	Buttons []string // its buttons' labels
+	// Dismissed is the label of the button tapped to dismiss it, or "" when
+	// it was left alone.
+	Dismissed string
+}
+
+// SystemAlertDismisser is an optional interface drivers can implement to
+// dismiss a system alert covering the app. The executor asks at the start of
+// each flow and after a step fails to find its element, and at no other time.
+type SystemAlertDismisser interface {
+	// DismissSystemAlert looks once for a system alert and dismisses it when
+	// that is safe. It returns nil when there is none, when the one it found
+	// went away or changed before the tap, or when the driver does not look
+	// (its switch is off), and an alert with an empty Dismissed when one was
+	// left alone. An error means the look failed.
+	DismissSystemAlert() (*SystemAlert, error)
+}
+
 // Unwrap returns the innermost driver, stripping any wrapper layers
 // (e.g. FlutterDriver). Use this to access optional interfaces that
 // wrappers may not forward.

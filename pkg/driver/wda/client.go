@@ -520,6 +520,53 @@ func (c *Client) DismissAlert() error {
 	return err
 }
 
+// AlertText returns the text of the alert WDA finds: its title and its
+// message, a line each.
+func (c *Client) AlertText() (string, error) {
+	resp, err := c.get(c.sessionPath("/alert/text"))
+	if err != nil {
+		return "", err
+	}
+	if value, ok := resp["value"].(string); ok {
+		return value, nil
+	}
+	return "", fmt.Errorf("invalid alert text response")
+}
+
+// AlertButtons returns the labels of the buttons of the alert WDA finds.
+func (c *Client) AlertButtons() ([]string, error) {
+	resp, err := c.get(c.sessionPath("/wda/alert/buttons"))
+	if err != nil {
+		return nil, err
+	}
+	values, ok := resp["value"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid alert buttons response")
+	}
+	labels := make([]string, 0, len(values))
+	for _, v := range values {
+		if label, ok := v.(string); ok {
+			labels = append(labels, label)
+		}
+	}
+	return labels, nil
+}
+
+// ActiveAppBundleID returns the bundle ID of the app WDA reads now: the
+// session's active application, which lookups and the alert calls use.
+func (c *Client) ActiveAppBundleID() (string, error) {
+	resp, err := c.get(c.sessionPath("/wda/activeAppInfo"))
+	if err != nil {
+		return "", err
+	}
+	if value, ok := resp["value"].(map[string]interface{}); ok {
+		if bundleID, ok := value["bundleId"].(string); ok {
+			return bundleID, nil
+		}
+	}
+	return "", fmt.Errorf("invalid active app response")
+}
+
 // GetOrientation returns the current orientation.
 func (c *Client) GetOrientation() (string, error) {
 	resp, err := c.get(c.sessionPath("/orientation"))
