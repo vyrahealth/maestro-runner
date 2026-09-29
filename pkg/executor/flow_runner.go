@@ -46,6 +46,9 @@ type FlowRunner struct {
 	// They give MAESTRO_PARITY_TIMEOUTS its condition budget.
 	lastInteraction time.Time
 	interactions    int
+	// System alerts this flow dismissed, which stop at
+	// maxSystemAlertDismissals (system_alerts.go).
+	systemAlertDismissals int
 }
 
 // Run executes the flow and returns the result.
@@ -213,6 +216,11 @@ func (fr *FlowRunner) Run() FlowResult {
 	// flow's report or double-counting alongside the launchApp navigation.
 	// No-op for drivers that don't implement consoleLogReporter.
 	resetConsoleLogs(fr.driver)
+
+	// A system alert still up from the flow before would take this flow's
+	// first taps, so it is dismissed before the first step (when the driver
+	// does that: MAESTRO_WDA_DISMISS_SYSTEM_ALERTS).
+	fr.checkSystemAlert("", -1)
 
 	// Execute all steps
 	var flowError string
@@ -413,45 +421,9 @@ func (fr *FlowRunner) runFlowCompleteHooks() string {
 	return ""
 }
 
-// executeStep executes a single step and updates the report.
-// Returns status, error message, and duration in milliseconds.
-func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, string, int64) {
-	stepStart := time.Now()
-
-	logger.Debug("Executing step %d: %s", idx, step.Describe())
-
-	// Mark step as started
-	fr.flowWriter.CommandStart(idx)
-
-	// Step-level platform gate: a step with `platform: ios|android|web` runs
-	// only on that platform and is skipped elsewhere (Maestro #1353).
-	if gate := step.PlatformGate(); gate != "" {
-		if info := fr.driver.GetPlatformInfo(); info != nil && !strings.EqualFold(info.Platform, gate) {
-			logger.Debug("Skipping step %d: platform gate %q != driver platform %q", idx, gate, info.Platform)
-			fr.flowWriter.CommandEnd(idx, report.StatusSkipped, nil, nil, report.CommandArtifacts{})
-			return report.StatusSkipped, "", time.Since(stepStart).Milliseconds()
-		}
-	}
-
-	// Determine what artifacts to capture
-	captureAlways := fr.config.Artifacts == ArtifactAlways
-	captureOnFailure := fr.config.Artifacts == ArtifactOnFailure
-
-	// Capture before screenshot if configured
-	var artifacts report.CommandArtifacts
-	if captureAlways {
-		artifacts = fr.captureArtifacts(idx, "before", false)
-	}
-
-	// Expand variables in a copy: the flow keeps the ${...} template for the
-	// next time this step runs (a count: rerun reuses the parsed flow).
-	step = cloneForRun(step)
-	fr.script.ExpandStep(step)
-
-	// Execute step - route to appropriate handler
+// dispatchStep runs a top-level step with the handler for its kind.
+func (fr *FlowRunner) dispatchStep(idx int, step flow.Step, artifacts *report.CommandArtifacts) *core.CommandResult {
 	var result *core.CommandResult
-	interactionsBefore := fr.interactions
-
 	switch s := step.(type) {
 	// JS/Scripting steps - handled by ScriptEngine
 	case *flow.DefineVariablesStep:
@@ -622,6 +594,57 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 	default:
 		result = fr.driver.Execute(step)
 	}
+	return result
+}
+
+// executeStep executes a single step and updates the report.
+// Returns status, error message, and duration in milliseconds.
+func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, string, int64) {
+	stepStart := time.Now()
+
+	// Described before expansion, as the report shows steps.
+	desc := step.Describe()
+
+	logger.Debug("Executing step %d: %s", idx, desc)
+
+	// Mark step as started
+	fr.flowWriter.CommandStart(idx)
+
+	// Step-level platform gate: a step with `platform: ios|android|web` runs
+	// only on that platform and is skipped elsewhere (Maestro #1353).
+	if gate := step.PlatformGate(); gate != "" {
+		if info := fr.driver.GetPlatformInfo(); info != nil && !strings.EqualFold(info.Platform, gate) {
+			logger.Debug("Skipping step %d: platform gate %q != driver platform %q", idx, gate, info.Platform)
+			fr.flowWriter.CommandEnd(idx, report.StatusSkipped, nil, nil, report.CommandArtifacts{})
+			return report.StatusSkipped, "", time.Since(stepStart).Milliseconds()
+		}
+	}
+
+	// Determine what artifacts to capture
+	captureAlways := fr.config.Artifacts == ArtifactAlways
+	captureOnFailure := fr.config.Artifacts == ArtifactOnFailure
+
+	// Capture before screenshot if configured
+	var artifacts report.CommandArtifacts
+	if captureAlways {
+		artifacts = fr.captureArtifacts(idx, "before", false)
+	}
+
+	// Expand variables in a copy: the flow keeps the ${...} template for the
+	// next time this step runs (a count: rerun reuses the parsed flow).
+	step = cloneForRun(step)
+	fr.script.ExpandStep(step)
+
+	// Execute step - route to appropriate handler
+	interactionsBefore := fr.interactions
+	result := fr.dispatchStep(idx, step, &artifacts)
+	// A step that failed to find its element runs once more when a system
+	// alert covering the app was dismissed, and its error names one that was
+	// left alone (MAESTRO_WDA_DISMISS_SYSTEM_ALERTS). The report has the
+	// dismissal on command idx already.
+	result, alertNote, _ := fr.afterFailedLookup(step, desc, idx, result, func() *core.CommandResult {
+		return fr.dispatchStep(idx, step, &artifacts)
+	})
 	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	stepDuration := time.Since(stepStart).Milliseconds()
@@ -638,6 +661,7 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 		status = report.StatusFailed
 		errorInfo = commandResultToError(result)
 		if errorInfo != nil {
+			errorInfo.Message += alertNote
 			errorMsg = errorInfo.Message
 		}
 		// Enrich error with WebView/CDP context
@@ -1567,33 +1591,9 @@ func (fr *FlowRunner) executePasteText(step *flow.PasteTextStep) *core.CommandRe
 	return result
 }
 
-// executeNestedStep executes a step without report tracking (for nested execution).
-func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
-	step = cloneForRun(step)
-	start := time.Now()
+// dispatchNestedStep runs a nested step with the handler for its kind.
+func (fr *FlowRunner) dispatchNestedStep(step flow.Step) *core.CommandResult {
 	var result *core.CommandResult
-	// Describe before expansion. Top-level commands are described when the
-	// report is built, so they showed `${PASSWORD}`; a sub-flow's steps were
-	// described here after ExpandStep had rewritten them, so the same step
-	// inside a runFlow showed the password itself.
-	desc := step.Describe()
-
-	// For nested compound steps, we need to track their sub-commands separately
-	var nestedSubCommands []report.Command
-	isCompoundStep := false
-	switch step.(type) {
-	case *flow.RepeatStep, *flow.RetryStep, *flow.RunFlowStep:
-		isCompoundStep = true
-		// Save parent's subCommands and start fresh for this nested compound step
-		parentSubCommands := fr.subCommands
-		fr.subCommands = nil
-		defer func() {
-			nestedSubCommands = fr.subCommands
-			fr.subCommands = parentSubCommands
-		}()
-	}
-
-	interactionsBefore := fr.interactions
 	switch s := step.(type) {
 	case *flow.DefineVariablesStep:
 		result = fr.script.ExecuteDefineVariables(s)
@@ -1741,6 +1741,43 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		fr.script.ExpandStep(step)
 		result = fr.driver.Execute(step)
 	}
+	return result
+}
+
+// executeNestedStep executes a step without report tracking (for nested execution).
+func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
+	step = cloneForRun(step)
+	start := time.Now()
+	var result *core.CommandResult
+	// Describe before expansion. Top-level commands are described when the
+	// report is built, so they showed `${PASSWORD}`; a sub-flow's steps were
+	// described here after ExpandStep had rewritten them, so the same step
+	// inside a runFlow showed the password itself.
+	desc := step.Describe()
+
+	// For nested compound steps, we need to track their sub-commands separately
+	var nestedSubCommands []report.Command
+	isCompoundStep := false
+	switch step.(type) {
+	case *flow.RepeatStep, *flow.RetryStep, *flow.RunFlowStep:
+		isCompoundStep = true
+		// Save parent's subCommands and start fresh for this nested compound step
+		parentSubCommands := fr.subCommands
+		fr.subCommands = nil
+		defer func() {
+			nestedSubCommands = fr.subCommands
+			fr.subCommands = parentSubCommands
+		}()
+	}
+
+	interactionsBefore := fr.interactions
+	result = fr.dispatchNestedStep(step)
+	// As in executeStep. The note goes on the error, which is what a nested
+	// step's report entry and console line show.
+	result, alertNote, dismissal := fr.afterFailedLookup(step, desc, -1, result, func() *core.CommandResult {
+		return fr.dispatchNestedStep(step)
+	})
+	result = withSystemAlertNote(result, alertNote)
 	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	duration := time.Since(start).Milliseconds()
@@ -1785,6 +1822,10 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		StartTime: &start,
 		EndTime:   &now,
 		Duration:  &duration,
+	}
+
+	if dismissal != nil {
+		cmd.SystemAlerts = []report.SystemAlert{*dismissal}
 	}
 
 	// Add error info if failed

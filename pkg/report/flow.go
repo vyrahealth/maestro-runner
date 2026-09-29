@@ -156,6 +156,20 @@ func (w *FlowWriter) SetConsoleLogs(logs []ConsoleLog) {
 	w.flush()
 }
 
+// AddSystemAlert records a system alert dismissed during the flow, and on
+// the top-level command cmdIndex when it was dismissed so that command could
+// run again. A cmdIndex outside the flow's commands (-1) records it on the
+// flow alone: it was up as the flow started, or a nested step's sub-command
+// carries it.
+func (w *FlowWriter) AddSystemAlert(alert SystemAlert, cmdIndex int) {
+	w.flow.SystemAlerts = append(w.flow.SystemAlerts, alert)
+	if cmdIndex >= 0 && cmdIndex < len(w.flow.Commands) {
+		cmd := &w.flow.Commands[cmdIndex]
+		cmd.SystemAlerts = append(cmd.SystemAlerts, alert)
+	}
+	w.flush()
+}
+
 // AddVideoTimestamp adds a video timestamp mapping.
 func (w *FlowWriter) AddVideoTimestamp(cmdIndex int, videoTimeMs int64) {
 	w.flow.Artifacts.VideoTimestamps = append(w.flow.Artifacts.VideoTimestamps, VideoTimestamp{

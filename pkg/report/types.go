@@ -187,6 +187,22 @@ type FlowDetail struct {
 	StepLatency *StepLatency      `json:"stepLatency,omitempty"` // p50/p95/max over this flow's commands
 	Artifacts   FlowArtifacts     `json:"artifacts"`
 	ConsoleLogs []ConsoleLog      `json:"consoleLogs,omitempty"` // Browser console / page errors captured during the flow (web only)
+	// SystemAlerts are the system alerts dismissed during the flow, in order
+	// (MAESTRO_WDA_DISMISS_SYSTEM_ALERTS).
+	SystemAlerts []SystemAlert `json:"systemAlerts,omitempty"`
+}
+
+// SystemAlert is a system alert the runner dismissed so the flow could go on:
+// an alert the operating system showed over the app, such as "FaceTime App
+// Required", and the button that closed it.
+type SystemAlert struct {
+	Title  string    `json:"title"`
+	Button string    `json:"button"`
+	Time   time.Time `json:"time"`
+	// Step is the step that failed to find its element while the alert was
+	// up, and ran again once it was gone. Empty when the alert was up as the
+	// flow started.
+	Step string `json:"step,omitempty"`
 }
 
 // ConsoleLog represents a single browser console message or uncaught JS
@@ -213,6 +229,9 @@ type Command struct {
 	Error       *Error           `json:"error,omitempty"`
 	Artifacts   CommandArtifacts `json:"artifacts"`
 	SubCommands []Command        `json:"subCommands,omitempty"` // For runFlow, repeat, retry
+	// SystemAlerts are the system alerts dismissed before this command ran
+	// again (MAESTRO_WDA_DISMISS_SYSTEM_ALERTS).
+	SystemAlerts []SystemAlert `json:"systemAlerts,omitempty"`
 }
 
 // CommandParams contains command-specific parameters.
