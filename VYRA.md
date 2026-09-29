@@ -46,6 +46,7 @@ when it is used, that is on when it is set to anything.
 | `fix(wda): read the focused field back after typing into it` | Upstream reads the field back only for `inputText` with a selector; typing into the focused field is how a flow usually types. |
 | `fix(wda): launchApp stops a running app first unless stopApp is false` | Maestro stops the app before launching it by default; the WDA driver only activated a running app, so a relaunch did not restart it. |
 | `fix(wda): send a read or a lookup again when its connection drops` | WebDriverAgent drops connections late in a long session; a read, or a lookup that changes nothing, is sent once more. |
+| `fix(wda): keep enough connections open for four requests at once` | The driver sends four requests at once, and Go kept two idle connections, so each burst opened two new ones. Through a phone's forward, new connections opened together failed in pairs with EOF; kept ones never did. |
 | `fix(executor): retry's maxRetries counts retries, not attempts` | Maestro runs a `retry` block maxRetries + 1 times (1 by default, at most 3). The runner ran it maxRetries times (3 by default, no cap), so `maxRetries: 1` never retried. |
 | `fix(executor): run onFlowComplete before the result, and fail on it` | As in Maestro, a failing `onFlowComplete` step fails a flow that had passed, and the hook runs before the flow is reported. |
 | `fix(executor): remove the env keys a runFlow or retry added when it ends` | Keys a subflow added are removed when it returns, not set to "". |
