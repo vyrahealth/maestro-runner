@@ -3,6 +3,7 @@ package report
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -246,6 +247,46 @@ func TestFlowWriter_SetConsoleLogs(t *testing.T) {
 	}
 	if fw.flow.ConsoleLogs[2].Level != "exception" {
 		t.Errorf("ConsoleLogs[2].Level = %q, want exception", fw.flow.ConsoleLogs[2].Level)
+	}
+}
+
+func TestFlowWriter_AddSystemAlert(t *testing.T) {
+	fw, iw, tmpDir := createTestFlowWriter(t)
+	defer iw.Close()
+
+	atStart := SystemAlert{Title: "FaceTime App Required", Button: "Cancel", Time: time.Now()}
+	forTap := SystemAlert{Title: "FaceTime App Required", Button: "Cancel", Time: time.Now(), Step: `tapOn: text="Call"`}
+	fw.AddSystemAlert(atStart, -1)
+	fw.AddSystemAlert(forTap, 1)
+	// A later CommandEnd keeps the command's record.
+	fw.CommandEnd(1, StatusPassed, nil, nil, CommandArtifacts{})
+
+	detail, err := ReadFlowDetail(filepath.Join(tmpDir, "flows", "flow-000.json"))
+	if err != nil {
+		t.Fatalf("ReadFlowDetail: %v", err)
+	}
+	if len(detail.SystemAlerts) != 2 || detail.SystemAlerts[0].Step != "" || detail.SystemAlerts[1].Step != forTap.Step {
+		t.Errorf("flow SystemAlerts = %+v, want the flow-start one, then the tap's", detail.SystemAlerts)
+	}
+	if got := detail.Commands[1].SystemAlerts; len(got) != 1 || got[0].Button != "Cancel" {
+		t.Errorf("command 1 SystemAlerts = %+v, want the tap's dismissal", got)
+	}
+	if len(detail.Commands[0].SystemAlerts)+len(detail.Commands[2].SystemAlerts) != 0 {
+		t.Error("a dismissal was recorded on another command")
+	}
+}
+
+func TestFlowDetail_NoSystemAlertsLeavesTheJSONAsItWas(t *testing.T) {
+	fw, iw, tmpDir := createTestFlowWriter(t)
+	defer iw.Close()
+	fw.CommandEnd(0, StatusPassed, nil, nil, CommandArtifacts{})
+
+	raw, err := os.ReadFile(filepath.Join(tmpDir, "flows", "flow-000.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "systemAlerts") {
+		t.Errorf("flow JSON without a dismissal has a systemAlerts key: %s", raw)
 	}
 }
 
