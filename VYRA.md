@@ -8,13 +8,15 @@ plugged into.
 
 ## Branches and tags
 
-- **`main`** mirrors upstream `main`. `.github/workflows/sync-upstream.yml` fast-forwards it every
-  day. Nothing is committed to it directly.
+- **`main`** is a copy of upstream `main`, brought up to date when a new build starts (§ A new
+  build). Nothing is committed to it and nothing here reads it. A daily workflow used to sync it;
+  vyra.6 dropped it, because its schedule never once ran in this fork and a build fetches upstream
+  itself.
 - **`v<base>-vyra.<n>`** tags are the builds we install. Each is an upstream base plus our
   patches, one commit each, so a tag's history is the patch series. The base is a release tag
   when the fixes we need are released, and an upstream `main` commit when they are not;
   `<base>` names it the way `git describe --tags` does. `v1.1.27-vyra.1` sits on the `v1.1.27`
-  release, and `v1.1.27-57-gc985a19-vyra.5` (the current build) on upstream `main` at
+  release, and `v1.1.27-57-gc985a19-vyra.6` (the current build) on upstream `main` at
   `c985a19`, 57 commits later and not yet released. Tags are never moved.
 - **`vyra`** (the default branch) holds the current build's tree. The Vyra Health org keeps
   every default branch linear and changed only through pull requests, so `vyra` is never
@@ -106,7 +108,7 @@ From a checkout of a `v*-vyra.*` tag (Go 1.25 or later), so the binary names its
 
 ```bash
 M=github.com/devicelab-dev/maestro-runner/pkg/cli
-V=1.1.27-57-gc985a19+vyra.5   # the tag without its leading v, with + before "vyra"
+V=1.1.27-57-gc985a19+vyra.6   # the tag without its leading v, with + before "vyra"
 go build -trimpath -o bin/maestro-runner \
   -ldflags "-s -w -X $M.Version=$V -X $M.Commit=$(git rev-parse --short HEAD) -X $M.BuildDate=$(date -u +%F)" .
 ```
@@ -117,18 +119,28 @@ The binary looks for its drivers in `<home>/drivers`, where `<home>` is the dire
 
 ## A new build
 
+**When.** A build moves to a new upstream base when upstream releases, not on every commit to
+upstream `main`. Vyra Health's meta repo has a weekly watch on the night's pin
+(`bin/vyra-tool-pin-check`, tool `maestro-runner`): it files a notice the first Monday a release
+lands past our base, and goes red once the pin has been behind for more than 60 days or three
+minor lines. Rebase onto the release tag. An upstream `main` commit is a base only when a fix we
+need is not released yet, as it was for vyra.1 to vyra.6.
+
 A new upstream base, a new patch, or both, start from the current build's tag:
 
 ```bash
 git fetch upstream --tags && git fetch origin --tags
-git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.5
+gh repo sync vyrahealth/maestro-runner --branch main    # main catches up with upstream
+git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.6
 git rebase --onto v1.1.28 c985a19     # c985a19: the base the series sits on now
 # add or drop patches here, one commit each
 # test it as Testing, above, says: not a bare go test ./...
 git tag -a v1.1.28-vyra.1 -m "..." && git push origin v1.1.28-vyra.1
 ```
 
-When upstream has released a fix one of the patches carries, leave that patch out.
+Leave out every patch upstream now has (§ Proposed upstream). After the rebase, `git cherry -v
+v1.1.28 HEAD` marks with `-` a patch whose change upstream already carries; one that upstream
+took in another form needs reading, and usually conflicts.
 
 Then `vyra` takes the new build's tree in one commit, through a pull request:
 
@@ -141,3 +153,22 @@ gh pr create --base vyra --head build/v1.1.28-vyra.1 --title "Build v1.1.28-vyra
 Merge it with "Squash and merge", the only method the org allows. The commit's parent is `vyra`
 itself, so the squash is that one commit again: the history stays linear and nothing is
 rewritten.
+
+## Proposed upstream
+
+A plain bug fix goes upstream once it has been proved here, so the series shrinks. Each proposal
+is one patch on upstream `main`, without this file, with a CHANGELOG line. The patches behind a
+switch stay here, and so do the ones for a phone reached over the network.
+
+| Patch | Upstream pull request |
+|---|---|
+| `fix(wda): keep enough connections open for four requests at once` | [#181](https://github.com/devicelab-dev/maestro-runner/pull/181) |
+| `fix(executor): retry's maxRetries counts retries, not attempts` | [#182](https://github.com/devicelab-dev/maestro-runner/pull/182) |
+| `fix(wda): launchApp stops a running app first unless stopApp is false` | [#183](https://github.com/devicelab-dev/maestro-runner/pull/183) |
+| `fix(wda): an element is not visible only when a lookup finds it absent` | [#184](https://github.com/devicelab-dev/maestro-runner/pull/184) |
+| `fix(wda): checked selectors work on iOS` | [#185](https://github.com/devicelab-dev/maestro-runner/pull/185) |
+
+The other plain fixes in § Maestro's behaviour, on by default follow once these have been
+reviewed, so upstream sees a few at a time. Four of them do not stand alone on upstream `main`
+yet: copyTextFrom and swipe points without `%` conflict there, one page source a scroll pass
+builds on the centerElement fix, and the truthiness fix's test uses a helper from another patch.
