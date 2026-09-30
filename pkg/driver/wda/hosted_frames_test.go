@@ -146,3 +146,27 @@ func TestHostedFrames_ZeroSizeChildIsNotASpace(t *testing.T) {
 		t.Fatalf("a zero-size (0,0) child starts no space: button y=%d, want 300", got)
 	}
 }
+
+func TestHostedFrames_LeavesAWebViewAlone(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_HOSTED_FRAMES", "1")
+	// Shaped like Google's sign-in sheet on the iPhone (iOS 27): a web view at (0,48) whose
+	// same-size child sits at (0,0), and links reported where the screen draws them.
+	const source = `<AppiumAUT>
+<XCUIElementTypeApplication type="XCUIElementTypeApplication" name="app" x="0" y="0" width="414" height="896">
+  <XCUIElementTypeOther type="XCUIElementTypeOther" name="sheet" x="0" y="48" width="414" height="848">
+    <XCUIElementTypeWebView type="XCUIElementTypeWebView" name="web" x="0" y="48" width="414" height="848">
+      <XCUIElementTypeOther type="XCUIElementTypeOther" name="content" x="0" y="0" width="414" height="848">
+        <XCUIElementTypeLink type="XCUIElementTypeLink" name="account" label="Tester" x="64" y="339" width="71" height="22"/>
+        <XCUIElementTypeLink type="XCUIElementTypeLink" name="another" label="Use another account" x="64" y="410" width="157" height="22"/>
+      </XCUIElementTypeOther>
+    </XCUIElementTypeWebView>
+  </XCUIElementTypeOther>
+</XCUIElementTypeApplication>
+</AppiumAUT>`
+	byName := parsedByName(t, source)
+	for name, y := range map[string]int{"web": 48, "content": 0, "account": 339, "another": 410} {
+		if got := byName[name].Bounds.Y; got != y {
+			t.Errorf("%s y=%d, want %d (a web view's content is in screen coordinates already)", name, got, y)
+		}
+	}
+}
