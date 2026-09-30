@@ -16,7 +16,7 @@ plugged into.
   patches, one commit each, so a tag's history is the patch series. The base is a release tag
   when the fixes we need are released, and an upstream `main` commit when they are not;
   `<base>` names it the way `git describe --tags` does. `v1.1.27-vyra.1` sits on the `v1.1.27`
-  release, and `v1.1.27-57-gc985a19-vyra.11` (the current build) on upstream `main` at
+  release, and `v1.1.27-57-gc985a19-vyra.12` (the current build) on upstream `main` at
   `c985a19`, 57 commits later and not yet released. Tags are never moved.
 - **`vyra`** (the default branch) holds the current build's tree. The Vyra Health org keeps
   every default branch linear and changed only through pull requests, so `vyra` is never
@@ -43,6 +43,7 @@ when it is used, that is on when it is set to anything.
 | `fix(wda): clear a real device's app state without Xcode` | none | A `clearState` on a real device uninstalled and reinstalled the app through `xcrun devicectl`, which only a Mac has. Without devicectl it now uses go-ios's installation proxy and zip conduit over usbmuxd, neither of which needs the iOS 17+ tunnel. A Mac with Xcode is unchanged. |
 | `feat(wda): opt-in dismissal of a system alert that covers the app` | `MAESTRO_WDA_DISMISS_SYSTEM_ALERTS=1` | Looks once for an alert SpringBoard shows over the app, such as "FaceTime App Required", at the start of each flow and when a step fails to find its element, and at no other time. Lookups read only the app's view tree, so such an alert was invisible to the run and took every touch, in that flow and the flows after it. It is dismissed only with a button whose whole label is Cancel, Not Now, Close, Later, Dismiss, Remind Me Later or Ignore, and never when its text mentions trust, a password or passcode, an Apple ID or Apple Account, signing in, allowing, paying, buying, a purchase, subscribing, deleting, erasing, an update or an install, so permission prompts stay with the permission handling. The failed step then runs once more. A flow dismisses at most three; each is a console warning and a `systemAlerts` entry in the flow's report and on the step's command, and an alert left alone is named in the step's error. WDA's alert monitor cannot do this, as it would tap Cancel on the app's own dialogs too: for the look WDA reads SpringBoard alone (`defaultActiveApplication`, `respectSystemAlerts`), no alert is read unless WDA reports SpringBoard as the app it reads, and the session goes back to the app under test afterwards, even when the look fails. The tap is a click on the alert's button, never WDA's `/alert/dismiss`, which taps whatever alert is up when it arrives: the alert is read again just before it and must keep its title, one class chain query must find exactly one such button on an alert of that title, and the click fails as a stale element if the alert has gone by then. |
 | `feat(wda): opt-in correction of frames inside a view another process hosts` | `MAESTRO_WDA_HOSTED_FRAMES=1` | On iOS 27 XCUITest reports the elements of a view that another process hosts in that view's own coordinates. Apple Health's permission sheet is one: it sits 48 points down the screen and everything in it read 48 points too high, so every tap on it landed above its target, whether a page-source tap, a WDA rect tap or XCUITest's own element click. With the switch a page source's frames are corrected where such a space starts, at a child at (0,0) with its parent's size inside a parent that is not at the origin: that child and everything under it move by the parent's origin. Only lookups through the page source see it. A selector WDA answers with a query of its own (plain text, or an id whose regex matches only itself, such as `UIA.Health.Allow.Button`) still gets WDA's rect, so a flow reaches such a view with a regex text or an id with its dots escaped (`UIA\.Health\.Allow\.Button`). A table cell that is off screen reports its children's frames relative to the cell, and those are not corrected, so a flow scrolls the cell into view first. |
+| `fix(wda): the hosted-frames correction leaves a web view's content alone` | `MAESTRO_WDA_HOSTED_FRAMES=1` | A web view no longer starts a hosted space. Its content reports screen coordinates already, under the same shape: Google's sign-in sheet on iOS 27 is a WebView at (0,48) whose same-size child sits at (0,0), with every link where the screen draws it. Corrected anyway, each element moved 48 points down, and a tap on the chooser's account landed on "Use another account". The Health sheet, whose space starts under an Other, is corrected as before. |
 | `feat(wda): opt-in reading of a system alert over the app, as Maestro reads it` | `MAESTRO_WDA_RESPECT_SYSTEM_ALERTS=1` | WebDriverAgent reads one app at a time, and a permission prompt the app raises, such as "“App” Would Like to Send You Notifications", is SpringBoard's: a flow that answers the prompt itself waited for its text until it timed out, with the prompt on the screen. With the switch every session is created with WDA's `respectSystemAlerts` on, so while the app under test is in front and SpringBoard shows an alert, lookups read SpringBoard, and the app again once the alert has gone. A `MAESTRO_WDA_DEFAULT_ACTIVE_APP` in the foreground still comes first. While such an alert is up the app's own elements cannot be found, as the alert covers them, so the switch is for flows that answer the prompts themselves. The system-alert check (`MAESTRO_WDA_DISMISS_SYSTEM_ALERTS`) puts the setting back as the switch left it. |
 
 ### Maestro's behaviour, on by default
@@ -113,7 +114,7 @@ From a checkout of a `v*-vyra.*` tag (Go 1.25 or later), so the binary names its
 
 ```bash
 M=github.com/devicelab-dev/maestro-runner/pkg/cli
-V=1.1.27-57-gc985a19+vyra.11  # the tag without its leading v, with + before "vyra"
+V=1.1.27-57-gc985a19+vyra.12  # the tag without its leading v, with + before "vyra"
 go build -trimpath -o bin/maestro-runner \
   -ldflags "-s -w -X $M.Version=$V -X $M.Commit=$(git rev-parse --short HEAD) -X $M.BuildDate=$(date -u +%F)" .
 ```
@@ -129,14 +130,14 @@ upstream `main`. Vyra Health's meta repo has a weekly watch on the night's pin
 (`bin/vyra-tool-pin-check`, tool `maestro-runner`): it files a notice the first Monday a release
 lands past our base, and goes red once the pin has been behind for more than 60 days or three
 minor lines. Rebase onto the release tag. An upstream `main` commit is a base only when a fix we
-need is not released yet, as it was for vyra.1 to vyra.11.
+need is not released yet, as it was for vyra.1 to vyra.12.
 
 A new upstream base, a new patch, or both, start from the current build's tag:
 
 ```bash
 git fetch upstream --tags && git fetch origin --tags
 gh repo sync vyrahealth/maestro-runner --branch main    # main catches up with upstream
-git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.11
+git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.12
 git rebase --onto v1.1.28 c985a19     # c985a19: the base the series sits on now
 # add or drop patches here, one commit each
 # test it as Testing, above, says: not a bare go test ./...
