@@ -17,6 +17,11 @@ import "os"
 // that fills its parent reports the parent's origin instead. With this switch set,
 // ParsePageSource adds the parent's origin to that child and to everything under it.
 //
+// A web view is left alone. Its content reports screen coordinates already, under the same
+// shape: Google's sign-in sheet (ASWebAuthenticationSession) is a WebView at (0,48) whose
+// same-size child sits at (0,0), with every link in it where the screen draws it. Rebased, a tap
+// on the chooser's account landed 48 points lower, on "Use another account".
+//
 // Two limits. Only lookups through the page source see the correction: a selector WDA answers
 // with a query of its own (plain text, or an id that means itself) still gets WDA's rect, so a
 // flow reaches a hosted view with a regex text or an id with its dots escaped. And a table cell
@@ -42,9 +47,13 @@ func rebaseHostedFrames(elem *ParsedElement, offsetX, offsetY int) {
 }
 
 // startsHostedSpace reports whether child restarts the coordinates: it is at (0,0) with its
-// parent's size, while the parent, as reported, is not at (0,0). Zero-size elements never do.
+// parent's size, while the parent, as reported, is not at (0,0) and is not a web view (see
+// hostedFrames). Zero-size elements never do.
 func startsHostedSpace(parentX, parentY int, parent, child *ParsedElement) bool {
 	if parentX == 0 && parentY == 0 {
+		return false
+	}
+	if parent.Type == "XCUIElementTypeWebView" {
 		return false
 	}
 	c := child.Bounds
