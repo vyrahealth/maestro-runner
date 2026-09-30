@@ -118,6 +118,11 @@ func (c *Client) CreateSession(bundleID string, alertAction string) error {
 		settings["defaultAlertAction"] = ""
 		settings["autoClickAlertSelector"] = permissionAlertSelector(alertAction)
 	}
+	if respectSystemAlerts() {
+		// While SpringBoard shows an alert over the app, read SpringBoard
+		// (respect_system_alerts.go).
+		settings["respectSystemAlerts"] = true
+	}
 	_ = c.UpdateSettings(settings)
 
 	return nil
