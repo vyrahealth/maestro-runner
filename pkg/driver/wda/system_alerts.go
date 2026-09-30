@@ -207,9 +207,10 @@ func chainString(s string) string {
 // restoreAppTargeting points the session back at the app under test, as the
 // runner set it up: at MAESTRO_WDA_DEFAULT_ACTIVE_APP's app when that is set
 // (CreateSession), at WDA's own choice ("auto", FBDefaultApplicationAuto)
-// otherwise, and with respectSystemAlerts off, WDA's default, which nothing
-// else here turns on. It is sent a second time when the first fails, since
-// until it lands every lookup could read SpringBoard.
+// otherwise, and with respectSystemAlerts on when
+// MAESTRO_WDA_RESPECT_SYSTEM_ALERTS is set and off, WDA's default, when it is
+// not. It is sent a second time when the first fails, since until it lands
+// every lookup could read SpringBoard.
 func (d *Driver) restoreAppTargeting() {
 	app := os.Getenv("MAESTRO_WDA_DEFAULT_ACTIVE_APP")
 	if app == "" {
@@ -217,7 +218,7 @@ func (d *Driver) restoreAppTargeting() {
 	}
 	settings := map[string]interface{}{
 		"defaultActiveApplication": app,
-		"respectSystemAlerts":      false,
+		"respectSystemAlerts":      respectSystemAlerts(),
 	}
 	err := d.client.UpdateSettings(settings)
 	if err != nil {
