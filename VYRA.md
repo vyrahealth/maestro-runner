@@ -16,8 +16,9 @@ plugged into.
   patches, one commit each, so a tag's history is the patch series. The base is a release tag
   when the fixes we need are released, and an upstream `main` commit when they are not;
   `<base>` names it the way `git describe --tags` does. `v1.1.27-vyra.1` sits on the `v1.1.27`
-  release, and `v1.1.27-57-gc985a19-vyra.12` (the current build) on upstream `main` at
-  `c985a19`, 57 commits later and not yet released. Tags are never moved.
+  release, `v1.1.27-57-gc985a19-vyra.1` to `vyra.12` on upstream `main` at `c985a19`, 57
+  commits later and not yet released, and `v1.1.29-vyra.1` (the current build) on the `v1.1.29`
+  release. Tags are never moved.
 - **`vyra`** (the default branch) holds the current build's tree. The Vyra Health org keeps
   every default branch linear and changed only through pull requests, so `vyra` is never
   rebased: it moves forward one pull request per build, whose one commit carries that build's
@@ -28,6 +29,9 @@ plugged into.
 A patch that fixes a plain bug, or a difference from Maestro that nobody could want, is on by
 default. One that changes how a run behaves is behind a switch: an environment variable, read
 when it is used, that is on when it is set to anything.
+
+The `wda` patches act only on the WebDriverAgent driver. Since 1.1.28 upstream's default iOS
+driver is its own DeviceLab agent, so a run that wants them passes `--driver wda`.
 
 ### For a physical iPhone
 
@@ -50,27 +54,26 @@ when it is used, that is on when it is set to anything.
 
 | Commit | What it does |
 |---|---|
-| `fix(runscript): run a script file as written` | Script files were `${...}`-expanded as a whole before running, so template literals using the script's own variables became `"undefined"`. |
 | `fix(wda): read the focused field back after typing into it` | Upstream reads the field back only for `inputText` with a selector; typing into the focused field is how a flow usually types. |
-| `fix(wda): launchApp stops a running app first unless stopApp is false` | Maestro stops the app before launching it by default; the WDA driver only activated a running app, so a relaunch did not restart it. |
-| `fix(wda): send a read or a lookup again when its connection drops` | WebDriverAgent drops connections late in a long session; a read, or a lookup that changes nothing, is sent once more. |
-| `fix(executor): retry's maxRetries counts retries, not attempts` | Maestro runs a `retry` block maxRetries + 1 times (1 by default, at most 3). The runner ran it maxRetries times (3 by default, no cap), so `maxRetries: 1` never retried. |
-| `fix(executor): run onFlowComplete before the result, and fail on it` | As in Maestro, a failing `onFlowComplete` step fails a flow that had passed, and the hook runs before the flow is reported. |
-| `fix(executor): remove the env keys a runFlow or retry added when it ends` | Keys a subflow added are removed when it returns, not set to "". |
-| `fix(executor): read when: true: and assertTrue values as Maestro does` | Only blank, "false", "undefined", "null" and 0 are false. An unset `${...}` no longer runs the branch Maestro skips. |
-| `fix(jsengine): give a script's http call Maestro's 5 minutes` | The script http timeout was 30 s. |
 | `fix(executor): the pre-session scan finds a launchApp in retry and repeat` | The session's alert handling comes from the flow's first `launchApp`; one inside `retry`, `repeat` or a `runFlow` else branch was missed, and nested files resolved against the wrong directory. |
-| `fix(wda): scrollUntilVisible honours centerElement` | A found element must have its center in the leading part of the screen, for up to 5 more looks, as in Maestro. |
 | `fix(wda): a swipe's start and end without % are points, as in Maestro` | `start: "100, 500"` was read as 100% and 500% of the screen. |
 | `fix(executor): tap options cost nothing on iOS unless the retry is on` | `retryTapIfNoChange: false` or a bare `waitToSettleTimeoutMs` read the page source four times around every tap (about 8 s on a phone). `true` follows Maestro's screenshot-based retry. |
 | `fix(wda): a long press holds 3 s, as Maestro's does on iOS` | It held 1 s. |
-| `fix(wda): checked selectors work on iOS` | `checked` was dropped with a warning and matched any state. Now a Switch, CheckBox or Toggle with value "1" is checked, as in Maestro. |
-| `fix(wda): an element is not visible only when a lookup finds it absent` | A failed page source or rect read counted as "not visible", so `assertNotVisible` passed on errors. |
 | `fix(wda): copyTextFrom never copies an empty string for a failed read` | A failed text read copied "". It reads again, then takes value, placeholder or label from the page source, as Maestro does, or fails. |
 | `fix(wda): the crash-loop latch ends with its flow, and ignores transport errors` | Four quick "app died" errors failed every later step of every later flow in the run, and dropped connections counted as the app dying. |
 | `fix(wda): a lookup looks at the screen once, whatever time is left` | Maestro always makes one attempt; the lookup checked its deadline first, so a condition with no budget left could be judged without a look. |
-| `fix(wda): scrollUntilVisible reads one page source a pass` | Each pass read the page source twice, for the lookup and for the end-of-content check; on a real phone that is 2 to 3 s each. |
 | `refactor(wda): name the swipe clamp after Maestro's coerceIn` | A rename. |
+
+Upstream has these since 1.1.29, so the series no longer carries them: a script file run as
+written, launchApp stopping a running app first, a read or lookup sent again when its connection
+drops, eight kept connections, retry's maxRetries counting retries, onFlowComplete failing the
+flow, a subflow's env keys removed when it ends, `when: true:` and `assertTrue` truthiness, a
+script's http call getting 5 minutes, checked selectors, notVisible needing a real miss (all
+twelve sent from here, § Proposed upstream), and scrollUntilVisible's centerElement and one page
+source a pass, which upstream wrote itself. Upstream 1.1.29 also gives every `when:` and `while:`
+check Maestro's budget by default, so the condition half of `MAESTRO_PARITY_TIMEOUTS` went too
+(below). Upstream's budget never drops below 1 s; ours went down to 1 ms, which with the
+look-once fix meant a single look.
 
 ### Maestro's behaviour, behind a switch
 
@@ -78,14 +81,13 @@ when it is used, that is on when it is set to anything.
 |---|---|---|
 | `MAESTRO_NO_SUITE_EXPANSION=1` | `feat(executor): opt-in switch to run a runFlow-only flow as one flow` | maestro-runner runs a flow made only of `runFlow` steps as a suite, one flow per step, with each step's `env` unexpanded. Maestro runs it as one flow. |
 | `MAESTRO_STRICT_TYPING=1` | `feat(core): opt-in retype when a field holds more than was typed`, `feat(core): strict typing reads a field back once it holds still`, `fix(core): strict typing waits long enough for the keyboard's late character`, `fix(core): strict typing does not wait on a field it cannot read` | The typing read-back waits for the field to hold still (reads 1.2 s apart, at most 3 s), then retypes once a field that holds more than was typed. A real iPhone's keyboard sometimes adds a character, such as a second `@` about a second after an email. A field that cannot be read back, such as a code box that hands focus on, is not waited on. |
-| `MAESTRO_WDA_TIMED_SWIPE=1` | `feat(wda): opt-in timed swipes, so a short swipe is a fling`, four `feat(wda): with timed swipes, …` commits, `feat(wda): a timed swipe moves in 100 ms and rests for its duration, as Maestro's does` | Swipe, scroll and scrollUntilVisible become Maestro's pointer gesture: the finger moves to the end in 100 ms and rests there for the duration before it lifts (Maestro's EventRecord). Durations and points are Maestro's: 400 ms by default, from an element's center to the screen's edge, `scroll` from the middle in 333 ms, scrollUntilVisible 40% of the screen. Without it, a swipe's `duration` was the hold before a drag XCUITest paced itself. |
-| `MAESTRO_PARITY_TIMEOUTS=1` | `feat(executor): opt-in Maestro budget for when: and while: checks`, `feat(wda): opt-in Maestro lookup timeouts` | Lookups wait Maestro's 17 s (7 s when optional); `assertNotVisible` 17 s instead of 5. A `when:` or `while:` visibility check gets 7 s minus the time since the last step that changed the device, instead of a flat 1 s. An explicit timeout still wins. |
+| `MAESTRO_WDA_TIMED_SWIPE=1` | `feat(wda): opt-in timed swipes, so a short swipe is a fling`, four `feat(wda): with timed swipes, …` commits, `feat(wda): a timed swipe moves in 100 ms and rests for its duration, as Maestro's does` | Swipe, scroll and scrollUntilVisible become Maestro's pointer gesture: the finger moves to the end in 100 ms and rests there for the duration before it lifts (Maestro's EventRecord). Durations and points are Maestro's: 400 ms by default, from an element's center to the screen's edge, `scroll` from the middle in 333 ms, scrollUntilVisible 40% of the screen. Since 1.1.29 upstream's own swipe is the same gesture, resting 100 ms when no duration is given, with upstream's points; the switch adds Maestro's durations and points. |
+| `MAESTRO_PARITY_TIMEOUTS=1` | `feat(wda): opt-in Maestro lookup timeouts` | Lookups wait Maestro's 17 s (7 s when optional); `assertNotVisible` 17 s instead of 5. An explicit timeout still wins. A `when:` or `while:` visibility check gets 7 s minus the time since the last step that changed the device (at least 1 s) without the switch: upstream does that since 1.1.29. |
 | `MAESTRO_STRICT_SELECTORS=1` | `feat(wda): opt-in strict text selectors, …`, `… strict id selectors, …`, `… strict tapOn, …`, `… strict visibility, …`, `… strict relative selectors and ties, …`, `… strict size selectors, …` | Selectors mean what they mean in Maestro. A text is a case-insensitive regex that must match the whole of the text, value or label, not a substring (`'Resend code'` no longer matches "Resend code in 0:42"). An id matches the whole identifier. A key-named `tapOn` never presses the key. An element counts as on screen when 10% of it is. `below:` and the rest compare with any anchor, the deepest match in tree order wins, and the element itself is tapped. A size has no tolerance unless one is given. |
-| `MAESTRO_WDA_SETTLE=1` | `feat(wda): opt-in screen settle, the way Maestro waits on iOS` | Before and after the steps Maestro waits around, waits until two screenshots in a row are identical (at most 3 s), and after a swipe or scroll re-reads an element's position until it holds still before tapping it. |
-| `MAESTRO_WDA_COORDINATE_TAP=1` | `feat(wda): opt-in element taps as Maestro's 100 ms touch` | An element tap is a 100 ms touch at the center of the element's bounds, as in Maestro, instead of XCUITest's element tap, which can scroll the view first. |
+| `MAESTRO_WDA_SETTLE=1` | `feat(wda): opt-in screen settle, the way Maestro waits on iOS` | Before and after the steps Maestro waits around, waits until two screenshots in a row are identical (at most 3 s), and after a swipe or scroll re-reads an element's position until it holds still before tapping it. Without it, upstream (since 1.1.29) settles the same way only before an action that follows a tap, swipe, scroll or launch. |
+| `MAESTRO_WDA_COORDINATE_TAP=1` | `feat(wda): opt-in element taps as Maestro's 100 ms touch` | An element tap is a 100 ms W3C touch at the center of the element's bounds, as in Maestro, with no focus check on a text field and no element click after it. Without it, upstream (since 1.1.29) taps the same point with WDA's coordinate tap, whose hold XCTest decides, and falls back to XCUITest's element click. |
 
-The devicectl fallback, the script-file fix, the focused-field read-back, the launchApp stop and
-the parity fixes above are good candidates to offer upstream.
+The plain fixes still in the series are offered upstream a few at a time (§ Proposed upstream).
 
 ## Testing
 
@@ -113,7 +115,7 @@ From a checkout of a `v*-vyra.*` tag (Go 1.25 or later), so the binary names its
 
 ```bash
 M=github.com/devicelab-dev/maestro-runner/pkg/cli
-V=1.1.27-57-gc985a19+vyra.12  # the tag without its leading v, with + before "vyra"
+V=1.1.29+vyra.1  # the tag without its leading v, with + before "vyra"
 go build -trimpath -o bin/maestro-runner \
   -ldflags "-s -w -X $M.Version=$V -X $M.Commit=$(git rev-parse --short HEAD) -X $M.BuildDate=$(date -u +%F)" .
 ```
@@ -136,23 +138,23 @@ A new upstream base, a new patch, or both, start from the current build's tag:
 ```bash
 git fetch upstream --tags && git fetch origin --tags
 gh repo sync vyrahealth/maestro-runner --branch main    # main catches up with upstream
-git switch -c series/v1.1.28 v1.1.27-57-gc985a19-vyra.12
-git rebase --onto v1.1.28 c985a19     # c985a19: the base the series sits on now
+git switch -c series/v1.1.30 v1.1.29-vyra.1
+git rebase --onto v1.1.30 v1.1.29     # v1.1.29: the base the series sits on now
 # add or drop patches here, one commit each
 # test it as Testing, above, says: not a bare go test ./...
-git tag -a v1.1.28-vyra.1 -m "..." && git push origin v1.1.28-vyra.1
+git tag -a v1.1.30-vyra.1 -m "..." && git push origin v1.1.30-vyra.1
 ```
 
 Leave out every patch upstream now has (§ Proposed upstream). After the rebase, `git cherry -v
-v1.1.28 HEAD` marks with `-` a patch whose change upstream already carries; one that upstream
+v1.1.30 HEAD` marks with `-` a patch whose change upstream already carries; one that upstream
 took in another form needs reading, and usually conflicts.
 
 Then `vyra` takes the new build's tree in one commit, through a pull request:
 
 ```bash
-C=$(git commit-tree "v1.1.28-vyra.1^{tree}" -p origin/vyra -m "Build v1.1.28-vyra.1")
-git push origin "${C}:refs/heads/build/v1.1.28-vyra.1"   # braces: zsh reads "$C:r" as a modifier
-gh pr create --base vyra --head build/v1.1.28-vyra.1 --title "Build v1.1.28-vyra.1" --body "..."
+C=$(git commit-tree "v1.1.30-vyra.1^{tree}" -p origin/vyra -m "Build v1.1.30-vyra.1")
+git push origin "${C}:refs/heads/build/v1.1.30-vyra.1"   # braces: zsh reads "$C:r" as a modifier
+gh pr create --base vyra --head build/v1.1.30-vyra.1 --title "Build v1.1.30-vyra.1" --body "..."
 ```
 
 Merge it with "Squash and merge", the only method the org allows. The commit's parent is `vyra`
@@ -165,6 +167,8 @@ A plain bug fix goes upstream once it has been proved here, so the series shrink
 is one patch on upstream `main`, without this file, with a CHANGELOG line. The patches behind a
 switch stay here, and so do the ones for a phone reached over the network.
 
+Merged, and released in v1.1.29 (2026-10-15), so the series dropped them:
+
 | Patch | Upstream pull request |
 |---|---|
 | `fix(wda): keep enough connections open for four requests at once` | [#181](https://github.com/devicelab-dev/maestro-runner/pull/181) |
@@ -172,8 +176,32 @@ switch stay here, and so do the ones for a phone reached over the network.
 | `fix(wda): launchApp stops a running app first unless stopApp is false` | [#183](https://github.com/devicelab-dev/maestro-runner/pull/183) |
 | `fix(wda): an element is not visible only when a lookup finds it absent` | [#184](https://github.com/devicelab-dev/maestro-runner/pull/184) |
 | `fix(wda): checked selectors work on iOS` | [#185](https://github.com/devicelab-dev/maestro-runner/pull/185) |
+| `fix(runscript): run a script file as written` | [#194](https://github.com/devicelab-dev/maestro-runner/pull/194) |
+| `fix(executor): remove the env keys a runFlow or retry added when it ends` | [#195](https://github.com/devicelab-dev/maestro-runner/pull/195) |
+| `fix(jsengine): give a script's http call Maestro's 5 minutes` | [#196](https://github.com/devicelab-dev/maestro-runner/pull/196) |
+| `fix(wda): send a read or a lookup again when its connection drops` | [#197](https://github.com/devicelab-dev/maestro-runner/pull/197) |
+| `fix(executor): read when: true: and assertTrue values as Maestro does` | [#198](https://github.com/devicelab-dev/maestro-runner/pull/198) |
+| `fix(executor): run onFlowComplete before the result, and fail on it` | [#199](https://github.com/devicelab-dev/maestro-runner/pull/199) |
+| (upstream's own unused helper, which kept its CI red) | [#200](https://github.com/devicelab-dev/maestro-runner/pull/200) |
 
-The other plain fixes in § Maestro's behaviour, on by default follow once these have been
-reviewed, so upstream sees a few at a time. Four of them do not stand alone on upstream `main`
-yet: copyTextFrom and swipe points without `%` conflict there, one page source a scroll pass
-builds on the centerElement fix, and the truthiness fix's test uses a helper from another patch.
+Open since 2026-10-17, stacked on #215 and meant to merge in this order. The series keeps its own
+versions until a release carries them:
+
+| Patch | Upstream pull request |
+|---|---|
+| (upstream's gofmt and Linux `plutil` test failures, which keep `main`'s CI red) | [#215](https://github.com/devicelab-dev/maestro-runner/pull/215) |
+| `fix(executor): the pre-session scan finds a launchApp in retry and repeat` | [#216](https://github.com/devicelab-dev/maestro-runner/pull/216) |
+| `fix(wda): clear a real device's app state without Xcode` | [#217](https://github.com/devicelab-dev/maestro-runner/pull/217) |
+| `fix(wda): a long press holds 3 s, as Maestro's does on iOS` | [#218](https://github.com/devicelab-dev/maestro-runner/pull/218) |
+| `fix(wda): read the focused field back after typing into it` (without the `MAESTRO_STRICT_TYPING` half of its test) | [#219](https://github.com/devicelab-dev/maestro-runner/pull/219) |
+| `fix(wda): copyTextFrom never copies an empty string for a failed read` | [#220](https://github.com/devicelab-dev/maestro-runner/pull/220) |
+
+Not proposed yet: the devicectl info fallback (no test, and only a Mac that reaches the phone over
+the network uses it), the crash-loop latch (half of it reverses upstream's #38, so it needs
+splitting), tap options and swipe points without `%` (both conflict with upstream), and
+lookup-once (moot while upstream's condition budget has a 1 s floor). `MAESTRO_WDA_ATTACH` and
+the external forward are features behind switches, and could go up if upstream would take them
+as flags.
+
+Until #215 is released the tree keeps upstream's one gofmt finding, in
+`pkg/driver/uiautomator2/driver_test.go`. `golangci-lint` reports nothing.
