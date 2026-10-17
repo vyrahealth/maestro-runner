@@ -3,6 +3,7 @@ package wda
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -87,48 +88,57 @@ func (d *Driver) tapOn(step *flow.TapOnStep) *core.CommandResult {
 	// Determine if element is a text field (needs focus verification)
 	isTextField := strings.Contains(info.Class, "TextField")
 
-	// Strategy: ElementClick first (WDA's internal element targeting handles z-order),
-	// then coordinate tap as fallback. For text fields, verify focus after each attempt
-	// because ElementClick can return success without actually focusing the field.
-	// With MAESTRO_WDA_COORDINATE_TAP there is no click (see coordinateTapOn).
-	tapped := false
-	clickFailed := false
-	if info.ID != "" && !coordinateTapOn() {
-		if err := d.client.ElementClick(info.ID); err == nil {
-			tapped = true
-			if isTextField {
-				time.Sleep(100 * time.Millisecond)
-				if _, err := d.client.GetActiveElement(); err != nil {
-					tapped = false // No focus — retry with coordinate tap
-				}
-			}
-		} else {
-			clickFailed = true
+	// Strategy: a coordinate tap at the element's on-screen centre, as Maestro
+	// taps on iOS; WDA's element click is the fallback. The element click
+	// reported success for taps that did nothing — a menu item, a sheet
+	// button, a settings row — where a touch at the same spot works. With
+	// MAESTRO_WDA_COORDINATE_TAP the touch is Maestro's 100 ms one, with no
+	// focus check and no click (see coordinateTapOn).
+	x, y, onScreen := d.tapPoint(info.Bounds)
+	if !onScreen {
+		// Off screen usually means the element went stale: during a push the
+		// lookup can resolve to the outgoing screen's copy, whose bounds
+		// point at that screen, off the edge (x = -25). Look it up again.
+		if fresh, findErr := d.findElementForTap(step.Selector, true, staleRefindMs); findErr == nil && fresh != nil {
+			info = fresh
+			x, y, onScreen = d.tapPoint(info.Bounds)
 		}
 	}
 
-	if !tapped {
-		// A failed click usually means the element went stale: during a push
-		// the lookup can resolve to the outgoing screen's copy, which is gone
-		// by the time of the click. Its old bounds point at that screen, off
-		// the edge (x = -25), so look the element up again before tapping.
-		if clickFailed {
-			if fresh, findErr := d.findElementForTap(step.Selector, true, staleRefindMs); findErr == nil && fresh != nil {
-				info = fresh
+	tapped := false
+	var tapErr error
+	if onScreen {
+		if tapErr = d.tapAt(x, y); tapErr == nil {
+			tapped = true
+			// A text field must end up focused; if the touch missed it,
+			// let the element click try.
+			if isTextField && !coordinateTapOn() {
+				time.Sleep(100 * time.Millisecond)
+				if _, err := d.client.GetActiveElement(); err != nil {
+					tapped = false
+				}
 			}
 		}
-		x, y, onScreen := d.tapPoint(info.Bounds)
+	}
+	if !tapped && info.ID != "" && !coordinateTapOn() {
+		if err := d.client.ElementClick(info.ID); err == nil {
+			tapped = true
+		}
+	}
+	if !tapped {
 		if !onScreen {
 			return errorResult(fmt.Errorf("element is not on screen: bounds (%d,%d %dx%d)",
 				info.Bounds.X, info.Bounds.Y, info.Bounds.Width, info.Bounds.Height),
 				fmt.Sprintf("Element not on screen: %s", selectorDesc(step.Selector)))
 		}
-		if err := d.tapAt(x, y); err != nil {
-			return errorResult(err, "Tap failed")
+		if coordinateTapOn() && tapErr != nil {
+			// The touch is the only try, so its own error (a lost session,
+			// an app that died) is the step's.
+			return errorResult(tapErr, "Tap failed")
 		}
+		return errorResult(fmt.Errorf("tap at (%.0f, %.0f) failed", x, y), "Tap failed")
 	}
 
-	d.lastTapID = info.ID
 	return successResult("Tapped element", info)
 }
 
@@ -467,8 +477,10 @@ func (d *Driver) assertNotVisible(step *flow.AssertNotVisibleStep) *core.Command
 
 func (d *Driver) inputText(step *flow.InputTextStep) *core.CommandResult {
 	text := step.Text
+	// Empty text (often a blank line from a script-split value) types
+	// nothing and passes, as in Maestro.
 	if text == "" {
-		return errorResult(fmt.Errorf("no text specified"), "No text to input")
+		return successResult("Nothing to input (empty text)", nil)
 	}
 
 	// Check for non-ASCII characters (may cause input issues on some devices)
@@ -762,32 +774,28 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 		return errorResult(err, "Failed to get screen size")
 	}
 
-	centerX := float64(width) / 2
-	centerY := float64(height) / 2
-	scrollDistance := float64(height) / 3
+	w, h := float64(width), float64(height)
+	centerX, centerY := w/2, h/2
 
 	// Scroll direction = content movement direction
 	// "scroll down" means reveal content below, which requires swiping UP
-	// Maestro: ScrollDirection.DOWN -> SwipeDirection.UP
+	// Maestro: ScrollDirection.DOWN -> SwipeDirection.UP. Like Maestro's iOS
+	// driver, the swipe starts at the centre and ends 10% from the edge.
 	var fromX, fromY, toX, toY float64
 	dir := strings.ToLower(step.Direction)
 	switch dir {
 	case "up":
 		// Scroll up = reveal top content = swipe DOWN
-		fromX, fromY = centerX, centerY-scrollDistance/2
-		toX, toY = centerX, centerY+scrollDistance/2
+		fromX, fromY, toX, toY = centerX, centerY, centerX, h*0.9
 	case "down":
 		// Scroll down = reveal bottom content = swipe UP
-		fromX, fromY = centerX, centerY+scrollDistance/2
-		toX, toY = centerX, centerY-scrollDistance/2
+		fromX, fromY, toX, toY = centerX, centerY, centerX, h*0.1
 	case "left":
 		// Scroll left = reveal left content = swipe RIGHT
-		fromX, fromY = centerX-scrollDistance/2, centerY
-		toX, toY = centerX+scrollDistance/2, centerY
+		fromX, fromY, toX, toY = centerX, centerY, w*0.9, centerY
 	case "right":
 		// Scroll right = reveal right content = swipe LEFT
-		fromX, fromY = centerX+scrollDistance/2, centerY
-		toX, toY = centerX-scrollDistance/2, centerY
+		fromX, fromY, toX, toY = centerX, centerY, w*0.1, centerY
 	default:
 		return errorResult(fmt.Errorf("invalid direction: %s", step.Direction), "Invalid scroll direction")
 	}
@@ -800,8 +808,9 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 		return d.timedScroll(step.Direction, core.ScrollDurationOrDefault(step.Speed, maestroScrollDurationMs))
 	}
 
-	// WDA's swipe duration is in seconds; the Maestro speed inverts to ms.
-	// Was hardcoded 0.3s, so `speed:` was silently dropped here too (#165).
+	// The Maestro speed inverts to a duration: how long the finger rests at
+	// the end before lifting (Maestro's swipe shape), so a slow scroll does
+	// not fling. Was hardcoded 0.3s, so `speed:` was silently dropped (#165).
 	durationSec := float64(core.ScrollDurationOrDefault(step.Speed, 300)) / 1000.0
 	if err := d.client.Swipe(fromX, fromY, toX, toY, durationSec); err != nil {
 		return errorResult(err, "Scroll failed")
@@ -857,7 +866,9 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		direction = "down"
 	}
 
-	maxScrolls := 20
+	// Like Maestro, the timeout is the budget; a scroll count caps it only
+	// when the flow sets one.
+	maxScrolls := math.MaxInt
 	if step.MaxScrolls > 0 {
 		maxScrolls = step.MaxScrolls
 	}
@@ -870,68 +881,54 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	// Stop early when the surface stops moving — a target that is not in the
 	// list should not cost every scroll the step allows.
 	var progress core.ScrollProgress
-
-	// centerElement, as in Maestro (Orchestra.kt:799-821): a found element
-	// more than 10% on screen must also be near the middle of the screen, and
-	// is scrolled on until it is, for five looks. After that, or at 10% or
-	// less, the plain visibility test decides.
-	centerTries := 0
+	// centerElement: a visible element keeps the scroll going until it is
+	// near the middle. shown is the last match that was already visible
+	// enough, accepted if the list ends or the scrolls run out first.
+	var centering core.Centering
+	var shown *core.ElementInfo
 
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
-		// One page source a pass, for the lookup and for the end-of-content check:
-		// on a real phone a page source takes 2 to 3 s, and a pass read two.
-		// Relative selectors keep their own lookup, which reads its own.
-		var info *core.ElementInfo
-		var err error
-		source, sourceOK := "", false
-		if !step.Element.HasRelativeSelector() {
-			if src, srcErr := d.client.Source(); srcErr == nil && src != "" {
-				source, sourceOK = src, true
-			}
-		}
-		if sourceOK {
-			info, err = d.findInPageSource(source, step.Element)
-		} else {
-			info, err = d.findElement(step.Element, true, 1000)
-		}
-		visibleOffCenter := false
+		info, err := d.findElement(step.Element, true, 1000)
 		if err == nil && info != nil {
 			// Found in the tree is not enough: an element half-hidden behind
 			// the fold satisfies a bare find, and the tap that follows lands
 			// wrong. Keep scrolling until enough of it is actually on screen.
 			// With no screen size to compare against, accept the find as before.
 			w, h, sizeErr := d.screenSize()
-			if sizeErr != nil {
-				return successResult("Element found after scrolling", info)
-			}
-			visible := core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage)
-			if step.CenterElement && core.ScreenVisibleFraction(info.Bounds, w, h) > core.CenterElementMinVisible &&
-				centerTries <= core.CenterElementRetries {
-				if core.NearScreenCenter(info.Bounds, direction, w, h) {
-					return successResult("Element found after scrolling", info)
+			centred := false
+			if sizeErr == nil {
+				if decided, done := centering.Check(step.CenterElement, info.Bounds, direction, w, h); decided {
+					if done {
+						return successResult("Element centred after scrolling", info)
+					}
+					if core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage) {
+						shown = info
+					}
+					centred = true // still centring: scroll again below
 				}
-				centerTries++
-				visibleOffCenter = visible
-			} else if visible {
+			}
+			if !centred && (sizeErr != nil || core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage)) {
 				return successResult("Element found after scrolling", info)
+			}
+			// The WDA query returns the first match in tree order, which can
+			// be a copy that never comes on screen (DDG's home page parks a
+			// hidden "Terms of Service" off the right edge, ahead of the
+			// footer link). The page source drops out-of-bounds elements
+			// first, as Maestro does, so ask it for a match on screen.
+			if sizeErr == nil && !centred {
+				if onScreen, psErr := d.findElementByPageSourceOnce(step.Element); psErr == nil && onScreen != nil &&
+					core.MeetsVisibility(onScreen.Bounds, w, h, step.VisibilityPercentage) {
+					return successResult("Element found after scrolling", onScreen)
+				}
 			}
 		}
 
-		sig, ok := core.ScrollSignature(source), sourceOK
-		if !sourceOK {
-			sig, ok = d.scrollSurfaceSignature()
-		}
-		if ok && progress.Observe(sig) {
-			// A list at its end cannot bring the element any nearer the
-			// middle. Maestro would spend its remaining looks and then take
-			// an element the plain test passes, as this one does.
-			if visibleOffCenter {
-				return successResult("Element found after scrolling", info)
-			}
-			return errorResult(fmt.Errorf("element not found after scrolling"), fmt.Sprintf("Element not found: %s — scrolling %s made no progress after %d scrolls (end of content?)", selectorDesc(step.Element), direction, i))
-		}
-
-		// Scroll. With timed swipes, as Maestro does it (Orchestra.kt:825-829):
+		// Scroll, then wait for the content to come to rest, as Maestro does
+		// after every swipe: the find above must not look at a list that is
+		// still coasting. The settled screenshot's hash doubles as the
+		// progress check — the same picture after a swipe means the content
+		// stopped moving — so no page source is fetched just to compare.
+		// With timed swipes the scroll is Maestro's (Orchestra.kt:825-829):
 		// the swipe from the middle that `scroll` makes, 40% of the screen,
 		// with the duration the step's speed gives it.
 		var result *core.CommandResult
@@ -943,22 +940,18 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		if !result.Success {
 			return result
 		}
-
-		time.Sleep(300 * time.Millisecond) // Wait for scroll animation
+		if sig := d.settleScreen(); sig != "" && progress.Observe(sig) {
+			if shown != nil {
+				return successResult("Element visible after scrolling (end of content before centring)", shown)
+			}
+			return errorResult(fmt.Errorf("element not found after scrolling"), fmt.Sprintf("Element not found: %s — scrolling %s made no progress after %d scrolls (end of content?)", selectorDesc(step.Element), direction, i+1))
+		}
 	}
 
+	if shown != nil {
+		return successResult("Element visible after scrolling (scrolls ran out before centring)", shown)
+	}
 	return errorResult(fmt.Errorf("element not found after scrolling"), fmt.Sprintf("Element not found: %s", selectorDesc(step.Element)))
-}
-
-// scrollSurfaceSignature reduces the current page source to a key for
-// core.ScrollProgress. A capture that cannot be read reports ok=false and is
-// not observed, so a hiccup never passes for the end of the content.
-func (d *Driver) scrollSurfaceSignature() (string, bool) {
-	source, err := d.client.Source()
-	if err != nil || source == "" {
-		return "", false
-	}
-	return core.ScrollSignature(source), true
 }
 
 func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
@@ -1196,14 +1189,12 @@ func maestroScrollSwipe(scrollDirection string, screenW, screenH int) (sx, sy, e
 
 // swipeGesture performs a swipe step's gesture.
 //
-// By default a swipe is dragfromtoforduration, whose duration is how long the
-// finger is held before a drag XCUITest paces itself, so every swipe comes out
-// as the same drag. With MAESTRO_WDA_TIMED_SWIPE set, a swipe is Maestro's
-// gesture (Client.PointerSwipe): the finger crosses in 100 ms and rests on the
-// end for the swipe's duration, Maestro's default 400 ms when the flow sets
-// none, before it lifts. The shorter the rest, the more of the move's speed a
-// list keeps when the finger lifts. Without the switch, a swipe without a
-// duration is the drag.
+// By default a swipe is upstream's W3C gesture (Client.Swipe): the finger
+// crosses in 100 ms and rests on the end for the swipe's duration, 100 ms when
+// the flow sets none. With MAESTRO_WDA_TIMED_SWIPE set it is Maestro's
+// (Client.PointerSwipe), with Maestro's default 400 ms when the flow sets none.
+// The shorter the rest, the more of the move's speed a list keeps when the
+// finger lifts.
 func (d *Driver) swipeGesture(fromX, fromY, toX, toY float64, durationMs int) error {
 	if timedSwipes() {
 		if durationMs <= 0 {
@@ -1451,6 +1442,10 @@ func (d *Driver) launchApp(step *flow.LaunchAppStep) *core.CommandResult {
 	sessionSettings := map[string]interface{}{
 		"shouldWaitForQuiescence": false,
 		"waitForIdleTimeout":      0,
+		// WDA waits this long for the app to be stable after every W3C
+		// action (a swipe); a web page never is, so each swipe cost 8s. The
+		// driver settles on screenshots itself.
+		"animationCoolOffTimeout": 0,
 		"defaultAlertAction":      d.alertAction,
 	}
 	if permissionAlertsOnly() {
@@ -1948,16 +1943,19 @@ func (d *Driver) waitUntil(step *flow.WaitUntilStep) *core.CommandResult {
 	// The last notVisible check that could not read the screen, if the last
 	// check was one.
 	var unreadable error
+	waitStart := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
 			// Clean, clear error message with timeout value
 			if waitingForVisible {
-				return errorResult(
-					context.DeadlineExceeded,
-					fmt.Sprintf("Element '%s' not visible within %v", selector.Describe(), timeout),
-				)
+				msg := fmt.Sprintf("Element '%s' not visible within %v", selector.Describe(), timeout)
+				if srcErr := d.client.SourceUnreadableSince(waitStart); srcErr != nil {
+					// Not "missing": WDA could not read the screen to look.
+					msg += fmt.Sprintf("; WDA could not read the screen on any attempt (%v)", srcErr)
+				}
+				return errorResult(context.DeadlineExceeded, msg)
 			}
 			if unreadable != nil {
 				return errorResult(unreadable,

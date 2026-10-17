@@ -26,12 +26,8 @@ func TestSwipeStartAndEndWithoutPercentAreScreenPoints(t *testing.T) {
 		if !result.Success {
 			t.Fatalf("%q to %q: swipe failed: %s", c.start, c.end, result.Message)
 		}
-		got := [4]float64{}
-		for i, k := range []string{"fromX", "fromY", "toX", "toY"} {
-			got[i], _ = log.body[k].(float64)
-		}
-		if got != c.want {
-			t.Errorf("%q to %q: swipe %v, want %v", c.start, c.end, got, c.want)
+		if got := gesturePoints(t, log.body); got != c.want {
+			t.Errorf("%q to %q: swipe %v, want %v", c.start, c.end, gesturePoints(t, log.body), c.want)
 		}
 	}
 

@@ -232,6 +232,13 @@ type phoneRun struct {
 // runOnPhone runs a flow of steps on the WDA driver against phone.
 func runOnPhone(t *testing.T, phone *phoneWDA, steps ...flow.Step) phoneRun {
 	t.Helper()
+	return runOnPhoneWithEnv(t, phone, nil, steps...)
+}
+
+// runOnPhoneWithEnv is runOnPhone with variables from outside the flow, as -e
+// gives them.
+func runOnPhoneWithEnv(t *testing.T, phone *phoneWDA, env map[string]string, steps ...flow.Step) phoneRun {
+	t.Helper()
 	u, err := url.Parse(phone.url)
 	if err != nil {
 		t.Fatal(err)
@@ -246,6 +253,7 @@ func runOnPhone(t *testing.T, phone *phoneWDA, steps ...flow.Step) phoneRun {
 	runner := New(driver, RunnerConfig{
 		OutputDir: out,
 		Artifacts: ArtifactNever,
+		Env:       env,
 		Device:    report.Device{ID: "phone", Platform: "ios"},
 	})
 	var run phoneRun
@@ -408,6 +416,44 @@ func TestFaceTimeAlert_IsDismissedAndTheStepRunsAgain(t *testing.T) {
 	}
 	if cmds := run.detail.Commands; len(cmds[1].SystemAlerts) != 1 || len(cmds[0].SystemAlerts) != 0 {
 		t.Errorf("command system alerts = %v and %v, want the dismissal on the assertVisible only", cmds[0].SystemAlerts, cmds[1].SystemAlerts)
+	}
+}
+
+// A step is recorded by its name before expansion, so a value from outside
+// the flow (-e) never reaches the report's systemAlerts, at the top level or
+// inside a runFlow.
+func TestDismissal_RecordsTheStepWithoutOutsideValues(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_DISMISS_SYSTEM_ALERTS", "1")
+	seeSecret := func() flow.Step {
+		return &flow.AssertVisibleStep{
+			BaseStep: flow.BaseStep{StepType: flow.StepAssertVisible, TimeoutMs: 300},
+			Selector: flow.Selector{Text: "${SECRET}"},
+		}
+	}
+	for name, steps := range map[string][]flow.Step{
+		"top level": {tapCall(), seeSecret()},
+		"nested": {&flow.RunFlowStep{
+			BaseStep: flow.BaseStep{StepType: flow.StepRunFlow},
+			Steps:    []flow.Step{tapCall(), seeSecret()},
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			phone := newPhoneWDA(t)
+			phone.with(func() { phone.raise, phone.raiseButtons = facetimeAlert, []string{"Cancel"} })
+			run := runOnPhoneWithEnv(t, phone, map[string]string{"SECRET": "Connected"}, steps...)
+			if run.result.Status != report.StatusPassed {
+				t.Fatalf("status = %v (%s), want passed once the alert is gone", run.result.Status, run.result.Error)
+			}
+			if len(run.detail.SystemAlerts) != 1 {
+				t.Fatalf("system alerts = %v, want one", run.detail.SystemAlerts)
+			}
+			if got, want := run.detail.SystemAlerts[0].Step, `assertVisible: text="${SECRET}"`; got != want {
+				t.Errorf("recorded step %q, want %q", got, want)
+			}
+			if strings.Contains(run.printed, "Connected") {
+				t.Errorf("the output shows the outside value: %q", run.printed)
+			}
+		})
 	}
 }
 

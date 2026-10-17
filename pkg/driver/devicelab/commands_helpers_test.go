@@ -201,8 +201,10 @@ func TestKillApp_HappyPath(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("killApp failed: %v", res.Error)
 	}
-	if len(shell.commands) != 1 || !strings.Contains(shell.commands[0], "am force-stop com.test.app") {
-		t.Errorf("expected force-stop command, got %v", shell.commands)
+	// killApp is a system-initiated process death (am kill), as in Maestro;
+	// force-stop belongs to stopApp.
+	if len(shell.commands) != 1 || shell.commands[0] != "am kill com.test.app" {
+		t.Errorf("expected am kill, got %v", shell.commands)
 	}
 }
 
@@ -366,6 +368,13 @@ type trackingClient struct {
 	pressKeyErr    error
 	addMediaNames  []string
 	addMediaErr    error
+	locations      [][2]float64
+	setLocationErr error
+}
+
+func (t *trackingClient) SetLocation(latitude, longitude float64) error {
+	t.locations = append(t.locations, [2]float64{latitude, longitude})
+	return t.setLocationErr
 }
 
 func (t *trackingClient) AddMedia(name, mime string, data []byte) error {
@@ -822,6 +831,9 @@ func TestLaunchWithMonkey(t *testing.T) {
 	if !strings.Contains(shell.commands[0], "monkey -p com.test.app") {
 		t.Errorf("expected monkey command, got %s", shell.commands[0])
 	}
+	if !strings.Contains(shell.commands[0], "--pct-syskeys 0") {
+		t.Errorf("monkey launch should pass --pct-syskeys 0, got %q", shell.commands[0])
+	}
 
 	// Output contains "monkey aborted" → failure
 	driver2 := New(newTrackingClient(), &core.PlatformInfo{}, &mockShell{out: "monkey aborted: no main activity"})
@@ -976,9 +988,8 @@ func (h *hideKbClient) HideKeyboard() error {
 }
 
 func TestHideKeyboard_NoDevice_SucceedsImmediately(t *testing.T) {
-	// When d.device == nil, isKeyboardVisible() returns false on the first
-	// check (getKeyboardBounds returns nil without a shell), so
-	// hideKeyboard returns success after a single client call.
+	// Without a shell the keyboard cannot be seen (getKeyboardBounds returns
+	// nil), so there is nothing to hide and nothing is sent.
 	client := &hideKbClient{trackingClient: newTrackingClient()}
 	driver := New(client, &core.PlatformInfo{}, nil)
 
@@ -986,8 +997,89 @@ func TestHideKeyboard_NoDevice_SucceedsImmediately(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("hideKeyboard should succeed when keyboard is reported hidden: %v", res.Error)
 	}
-	if client.hideCount != 1 {
-		t.Errorf("expected 1 HideKeyboard call (no retries), got %d", client.hideCount)
+	if client.hideCount != 0 || len(client.pressKeyCodes) != 0 {
+		t.Errorf("sent ESC %d times and keys %v with no keyboard up; want nothing", client.hideCount, client.pressKeyCodes)
+	}
+}
+
+// keyboardShell reports the keyboard up until closed is set. The keyboard
+// serves com.app's process; focus is on focusPkg (com.app when empty).
+type keyboardShell struct {
+	closed   bool
+	focusPkg string
+}
+
+func (k *keyboardShell) Shell(cmd string) (string, error) {
+	switch {
+	case strings.HasPrefix(cmd, "cat /proc/4242/cmdline"):
+		return "com.app\x00", nil
+	case strings.Contains(cmd, "mCurrentFocus"):
+		pkg := k.focusPkg
+		if pkg == "" {
+			pkg = "com.app"
+		}
+		return "  mCurrentFocus=Window{3579058 u0 " + pkg + "/" + pkg + ".Main}", nil
+	case k.closed:
+		return "mInputShown=false", nil
+	}
+	return "mCurClient=ClientState{a9bbbf6 mUid=10410 mPid=4242 mSelfReportedDisplayId=0}\n" +
+		"mInputShown=true\n    touchable region=SkRegion((0,1428,1080,2340))", nil
+}
+
+// escKeyboardClient closes the keyboard on ESC, on BACK, or never.
+type escKeyboardClient struct {
+	*trackingClient
+	shell       *keyboardShell
+	closesOnEsc bool
+	closesOnKey int
+	escCount    int
+}
+
+func (c *escKeyboardClient) HideKeyboard() error {
+	c.escCount++
+	if c.closesOnEsc {
+		c.shell.closed = true
+	}
+	return nil
+}
+
+func (c *escKeyboardClient) PressKeyCode(code int) error {
+	_ = c.trackingClient.PressKeyCode(code)
+	if code == c.closesOnKey {
+		c.shell.closed = true
+	}
+	return nil
+}
+
+func TestHideKeyboard_BackOnlyWhileKeyboardIsUp(t *testing.T) {
+	for name, tc := range map[string]struct {
+		closesOnEsc bool
+		closesOnKey int
+		focusPkg    string
+		wantKeys    []int
+		wantMsg     string
+	}{
+		"keyboard honours ESC":        {closesOnEsc: true, wantKeys: nil, wantMsg: "Keyboard hidden"},
+		"keyboard ignores ESC (#42)":  {closesOnKey: uiautomator2.KeyCodeBack, wantKeys: []int{uiautomator2.KeyCodeBack}, wantMsg: "via back key"},
+		"keyboard ignores everything": {wantKeys: []int{uiautomator2.KeyCodeBack}, wantMsg: "not confirmed"},
+		// Just after an app switch: the previous app's keyboard still reads
+		// as shown while another app has focus. BACK would navigate that app.
+		"keyboard left by another app": {focusPkg: "com.other", wantKeys: nil, wantMsg: "not the focused app's"},
+	} {
+		shell := &keyboardShell{focusPkg: tc.focusPkg}
+		client := &escKeyboardClient{trackingClient: newTrackingClient(), shell: shell, closesOnEsc: tc.closesOnEsc, closesOnKey: tc.closesOnKey}
+		driver := New(client, &core.PlatformInfo{}, shell)
+
+		res := driver.hideKeyboard(&flow.HideKeyboardStep{})
+		if !res.Success || !strings.Contains(res.Message, tc.wantMsg) {
+			t.Errorf("%s: success=%v message %q, want %q", name, res.Success, res.Message, tc.wantMsg)
+		}
+		if client.escCount != 1 {
+			t.Errorf("%s: ESC sent %d times, want once", name, client.escCount)
+		}
+		if fmt.Sprint(client.pressKeyCodes) != fmt.Sprint(tc.wantKeys) {
+			t.Errorf("%s: keys %v, want %v (BACK once, only while the keyboard is up)", name, client.pressKeyCodes, tc.wantKeys)
+		}
 	}
 }
 
@@ -1090,39 +1182,57 @@ func TestSwipeWithMaestroCoordinates(t *testing.T) {
 // setLocation
 // =============================================================================
 
+// setLocation goes through the agent's test location providers, after one
+// appops grant per session. The am broadcast it used to send had no receiver:
+// the step passed and the location never moved.
 func TestSetLocation(t *testing.T) {
 	shell := &mockShell{}
-	driver := New(newTrackingClient(), &core.PlatformInfo{}, shell)
+	client := newTrackingClient()
+	driver := New(client, &core.PlatformInfo{}, shell)
 
-	res := driver.setLocation(&flow.SetLocationStep{Latitude: "37.7749", Longitude: "-122.4194"})
-	if !res.Success {
-		t.Fatalf("setLocation failed: %v", res.Error)
+	for i := 0; i < 2; i++ {
+		res := driver.setLocation(&flow.SetLocationStep{Latitude: "37.7749", Longitude: "-122.4194"})
+		if !res.Success {
+			t.Fatalf("setLocation failed: %v", res.Error)
+		}
 	}
-	if !strings.Contains(shell.commands[0], "MOCK_LOCATION") ||
-		!strings.Contains(shell.commands[0], "37.7749") ||
-		!strings.Contains(shell.commands[0], "-122.4194") {
-		t.Errorf("unexpected setLocation command: %s", shell.commands[0])
+	if len(shell.commands) != 1 || shell.commands[0] != "appops set dev.devicelab.driver.android android:mock_location allow" {
+		t.Errorf("want one appops grant, got %q", shell.commands)
+	}
+	for _, c := range shell.commands {
+		if strings.Contains(c, "MOCK_LOCATION") {
+			t.Errorf("the broadcast nothing receives is still sent: %s", c)
+		}
+	}
+	if len(client.locations) != 2 || client.locations[0] != [2]float64{37.7749, -122.4194} {
+		t.Errorf("agent got %v, want 37.7749,-122.4194 twice", client.locations)
 	}
 
-	// Missing lat
-	res = driver.setLocation(&flow.SetLocationStep{Latitude: "", Longitude: "-122"})
-	if res.Success {
-		t.Error("missing latitude should fail")
-	}
-	// Missing lon
-	res = driver.setLocation(&flow.SetLocationStep{Latitude: "37", Longitude: ""})
-	if res.Success {
-		t.Error("missing longitude should fail")
+	for _, bad := range []flow.SetLocationStep{
+		{Latitude: "", Longitude: "-122"}, {Latitude: "37", Longitude: ""},
+		{Latitude: "91", Longitude: "0"}, {Latitude: "0", Longitude: "181"}, {Latitude: "north", Longitude: "0"},
+	} {
+		if res := driver.setLocation(&bad); res.Success {
+			t.Errorf("setLocation(%s, %s) should fail", bad.Latitude, bad.Longitude)
+		}
 	}
 	// No device
-	res = New(newTrackingClient(), &core.PlatformInfo{}, nil).setLocation(&flow.SetLocationStep{Latitude: "1", Longitude: "2"})
-	if res.Success {
+	if res := New(newTrackingClient(), &core.PlatformInfo{}, nil).setLocation(&flow.SetLocationStep{Latitude: "1", Longitude: "2"}); res.Success {
 		t.Error("setLocation without device should fail")
 	}
-	// Shell error
-	res = New(newTrackingClient(), &core.PlatformInfo{}, &mockShell{err: errors.New("blocked")}).setLocation(&flow.SetLocationStep{Latitude: "1", Longitude: "2"})
-	if res.Success {
-		t.Error("setLocation should propagate shell error")
+	// The appops grant fails
+	if res := New(newTrackingClient(), &core.PlatformInfo{}, &mockShell{err: errors.New("blocked")}).setLocation(&flow.SetLocationStep{Latitude: "1", Longitude: "2"}); res.Success {
+		t.Error("setLocation should report a refused appops grant")
+	}
+	// The agent refuses (no mock location op, old agent)
+	refusing := newTrackingClient()
+	refusing.setLocationErr = errors.New("mock_location_denied")
+	if res := New(refusing, &core.PlatformInfo{}, &mockShell{}).setLocation(&flow.SetLocationStep{Latitude: "1", Longitude: "2"}); res.Success {
+		t.Error("setLocation should report the agent's refusal")
+	}
+	// A client that cannot set the location at all
+	if res := New(&mockDeviceLabClient{}, &core.PlatformInfo{}, &mockShell{}).setLocation(&flow.SetLocationStep{Latitude: "1", Longitude: "2"}); res.Success {
+		t.Error("setLocation on a client without SetLocation should fail")
 	}
 }
 
@@ -1631,12 +1741,15 @@ type richClient struct {
 	settleQuiet  bool
 	settleErr    error
 	applySettErr error
+	settleCalls  [][2]int
 }
 
 func (r *richClient) Source() (string, error)         { return r.source, r.sourceErr }
+func (r *richClient) Snapshot(int) (string, error)    { return r.source, r.sourceErr }
 func (r *richClient) GetOrientation() (string, error) { return r.orientation, nil }
 func (r *richClient) GetClipboard() (string, error)   { return r.clipboard, nil }
 func (r *richClient) WaitForSettle(timeoutMs, quietMs int) (bool, error) {
+	r.settleCalls = append(r.settleCalls, [2]int{timeoutMs, quietMs})
 	return r.settleQuiet, r.settleErr
 }
 func (r *richClient) SetAppiumSettings(settings map[string]interface{}) error {
@@ -1777,6 +1890,46 @@ func TestDriver_WaitForSettle(t *testing.T) {
 	}
 }
 
+func TestActsOnScreen(t *testing.T) {
+	for _, s := range []flow.Step{&flow.TapOnStep{}, &flow.SwipeStep{}, &flow.BackStep{}, &flow.PressKeyStep{}, &flow.CopyTextFromStep{}} {
+		if !actsOnScreen(s) {
+			t.Errorf("actsOnScreen(%T) = false", s)
+		}
+	}
+	for _, s := range []flow.Step{&flow.AssertVisibleStep{}, &flow.AssertNotVisibleStep{}, &flow.WaitUntilStep{},
+		&flow.InputTextStep{}, &flow.HideKeyboardStep{}, &flow.LaunchAppStep{}} {
+		if actsOnScreen(s) {
+			t.Errorf("actsOnScreen(%T) = true", s)
+		}
+	}
+}
+
+// A settle keeps its own limit whatever waitForIdleTimeout is (its 200ms
+// default once cut every settle short), and waitForIdleTimeout 0 skips it.
+func TestSettle_IdleTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		idle  int // -1 = never set
+		calls [][2]int
+	}{
+		{"unset", -1, [][2]int{{settleAfterTapTimeoutMs, settleQuietMs}}},
+		{"default 200", 200, [][2]int{{settleAfterTapTimeoutMs, settleQuietMs}}},
+		{"zero skips", 0, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &richClient{trackingClient: newTrackingClient(), settleQuiet: true}
+			d := New(client, &core.PlatformInfo{}, &mockShell{})
+			if tc.idle >= 0 {
+				_ = d.SetWaitForIdleTimeout(tc.idle)
+			}
+			d.settle(settleAfterTapTimeoutMs, "tap")
+			if len(client.settleCalls) != len(tc.calls) || (len(tc.calls) > 0 && client.settleCalls[0] != tc.calls[0]) {
+				t.Errorf("settle calls = %v, want %v", client.settleCalls, tc.calls)
+			}
+		})
+	}
+}
+
 // =============================================================================
 // scriptedClient — extends trackingClient with scriptable FindElement,
 // FindAndClick, ActiveElement, PressKeyCode tracking, SendKeyActions
@@ -1815,6 +1968,10 @@ func (s *scriptedClient) FindAndClick(strategy, selector string) (*uiautomator2.
 	s.findAndClickCalls++
 	return s.findAndClickReturn, s.findAndClickErr
 }
+func (s *scriptedClient) FindFirstAndClickChecked([]string, int, int, bool) (*uiautomator2.Element, bool, string, int, error) {
+	return nil, false, "", -1, errors.New("unknown_method: Unknown method: Gesture.findFirstAndClick")
+}
+
 func (s *scriptedClient) FindAndClickChecked(strategy, selector string, screenW, screenH int, hitTest bool) (*uiautomator2.Element, bool, string, error) {
 	elem, clicked, err := s.FindAndClickGuarded(strategy, selector, screenW, screenH)
 	s.findAndClickHitTest = hitTest
@@ -1997,11 +2154,20 @@ func TestLongPressOn_CustomDuration(t *testing.T) {
 // assertVisible — uses findElementFast which calls FindElement
 // =============================================================================
 
+// screenWithID is a one-element screen for the whole-screen checks.
+func screenWithID(id string) func() (string, error) {
+	return func() (string, error) {
+		return `<hierarchy><node class="android.widget.TextView" text="Hello" resource-id="` + id +
+			`" displayed="true" enabled="true" bounds="[0,0][10,10]"/></hierarchy>`, nil
+	}
+}
+
 func TestAssertVisible_Success(t *testing.T) {
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	client.findElementReturn = uiautomator2.NewCachedElement(
 		"id", "Hello", uiautomator2.ElementRect{X: 0, Y: 0, Width: 10, Height: 10},
 	)
+	client.sourceFunc = screenWithID("el")
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
 
 	res := driver.assertVisible(&flow.AssertVisibleStep{Selector: flow.Selector{ID: "el"}})
@@ -2079,6 +2245,43 @@ func TestInputText_NoSelector_SendsKeyActions(t *testing.T) {
 	}
 }
 
+// delayKeysClient is an agent client that can pause between typed characters.
+type delayKeysClient struct {
+	*scriptedClient
+	delayed []string
+}
+
+func (c *delayKeysClient) SendKeyActionsWithDelay(text string, delayMs int) error {
+	c.delayed = append(c.delayed, fmt.Sprintf("%s@%d", text, delayMs))
+	return nil
+}
+
+func TestInputText_KeyPressHonoursTypingFrequency(t *testing.T) {
+	client := &delayKeysClient{scriptedClient: &scriptedClient{trackingClient: newTrackingClient()}}
+	driver := New(client, &core.PlatformInfo{}, &mockShell{})
+
+	// No frequency: plain key events.
+	if res := driver.inputText(&flow.InputTextStep{Text: "abc", KeyPress: true}); !res.Success {
+		t.Fatalf("inputText keyPress: %v", res.Error)
+	}
+	// 10 keys/sec: a 100ms pause after each character.
+	if err := driver.SetTypingFrequency(10); err != nil {
+		t.Fatal(err)
+	}
+	if res := driver.inputText(&flow.InputTextStep{Text: "xyz", KeyPress: true}); !res.Success {
+		t.Fatalf("inputText keyPress: %v", res.Error)
+	}
+	// Cleared again.
+	_ = driver.SetTypingFrequency(0)
+	if res := driver.inputText(&flow.InputTextStep{Text: "q", KeyPress: true}); !res.Success {
+		t.Fatalf("inputText keyPress: %v", res.Error)
+	}
+
+	if fmt.Sprint(client.sendKeyActionsCalls) != "[abc q]" || fmt.Sprint(client.delayed) != "[xyz@100]" {
+		t.Errorf("plain %v, delayed %v; want [abc q] and [xyz@100]", client.sendKeyActionsCalls, client.delayed)
+	}
+}
+
 func TestInputText_KeyPress(t *testing.T) {
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
@@ -2095,8 +2298,8 @@ func TestInputText_KeyPress(t *testing.T) {
 func TestInputText_EmptyText(t *testing.T) {
 	client := &scriptedClient{trackingClient: newTrackingClient()}
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
-	if res := driver.inputText(&flow.InputTextStep{Text: ""}); res.Success {
-		t.Error("inputText with empty text should fail")
+	if res := driver.inputText(&flow.InputTextStep{Text: ""}); !res.Success {
+		t.Errorf("inputText with empty text should pass as a no-op, got %q", res.Message)
 	}
 }
 
@@ -2177,6 +2380,7 @@ func TestAssertNotVisible_ElementStillPresent(t *testing.T) {
 	client.findElementReturn = uiautomator2.NewCachedElement(
 		"id", "Hello", uiautomator2.ElementRect{X: 0, Y: 0, Width: 10, Height: 10},
 	)
+	client.sourceFunc = screenWithID("el")
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
 
 	// Element is "still visible" → expect failure after short polling timeout.
@@ -2214,7 +2418,7 @@ func TestExecute_DispatchesByStepType(t *testing.T) {
 		{"SwipeStep direction", &flow.SwipeStep{Direction: "up", Duration: 100}, true},
 		{"HideKeyboardStep", &flow.HideKeyboardStep{}, true},
 		// Expected failures (validation / shell errors)
-		{"InputTextStep empty", &flow.InputTextStep{Text: ""}, false},
+		{"InputTextStep empty", &flow.InputTextStep{Text: ""}, true},
 		{"PressKeyStep unknown", &flow.PressKeyStep{Key: "asdf"}, false},
 		{"OpenLinkStep empty", &flow.OpenLinkStep{Link: ""}, false},
 		{"OpenBrowserStep empty", &flow.OpenBrowserStep{URL: ""}, false},
@@ -2438,6 +2642,7 @@ func TestWaitUntil_Visible_Success(t *testing.T) {
 	client.findElementReturn = uiautomator2.NewCachedElement(
 		"id", "Hello", uiautomator2.ElementRect{X: 0, Y: 0, Width: 10, Height: 10},
 	)
+	client.sourceFunc = screenWithID("el")
 	driver := New(client, &core.PlatformInfo{}, &mockShell{})
 
 	sel := flow.Selector{ID: "el"}
@@ -2483,55 +2688,6 @@ func TestWaitUntil_Visible_Timeout(t *testing.T) {
 // =============================================================================
 // travel
 // =============================================================================
-
-func TestTravel_HappyPath(t *testing.T) {
-	shell := &mockShell{}
-	driver := New(newTrackingClient(), &core.PlatformInfo{}, shell)
-
-	res := driver.travel(&flow.TravelStep{
-		Points: []string{"37.7,-122.4", "37.8,-122.5"},
-		Speed:  100000, // very fast → ~0s sleep between points
-	})
-	if !res.Success {
-		t.Fatalf("travel: %v", res.Error)
-	}
-	if len(shell.commands) != 2 {
-		t.Errorf("expected 2 MOCK_LOCATION broadcasts, got %d", len(shell.commands))
-	}
-	for _, c := range shell.commands {
-		if !strings.Contains(c, "MOCK_LOCATION") {
-			t.Errorf("expected MOCK_LOCATION command, got %s", c)
-		}
-	}
-}
-
-func TestTravel_NoDevice(t *testing.T) {
-	res := New(newTrackingClient(), &core.PlatformInfo{}, nil).travel(&flow.TravelStep{
-		Points: []string{"0,0", "1,1"},
-	})
-	if res.Success {
-		t.Error("travel without device should fail")
-	}
-}
-
-func TestTravel_OnePointInsufficient(t *testing.T) {
-	driver := New(newTrackingClient(), &core.PlatformInfo{}, &mockShell{})
-	res := driver.travel(&flow.TravelStep{Points: []string{"0,0"}})
-	if res.Success {
-		t.Error("travel with <2 points should fail")
-	}
-}
-
-func TestTravel_ShellError(t *testing.T) {
-	driver := New(newTrackingClient(), &core.PlatformInfo{}, &mockShell{err: errors.New("blocked")})
-	res := driver.travel(&flow.TravelStep{
-		Points: []string{"0,0", "1,1"},
-		Speed:  100000,
-	})
-	if res.Success {
-		t.Error("travel should propagate shell error")
-	}
-}
 
 // =============================================================================
 // getRelativeFilter / applyRelativeFilter
@@ -3447,5 +3603,99 @@ func TestLooksLikeFileName(t *testing.T) {
 		if looksLikeFileName(no) {
 			t.Errorf("%q should not look like a file name", no)
 		}
+	}
+}
+
+func TestWebViewRepeatBackoffGrowsAndCaps(t *testing.T) {
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{0, webViewConnectBackoff},
+		{1, webViewConnectBackoff},
+		{2, 2 * webViewConnectBackoff},
+		{3, 4 * webViewConnectBackoff},
+		{4, 8 * webViewConnectBackoff},
+		{10, time.Minute},
+	}
+	for _, c := range cases {
+		if got := webViewRepeatBackoff(c.failures); got != c.want {
+			t.Errorf("webViewRepeatBackoff(%d) = %v, want %v", c.failures, got, c.want)
+		}
+	}
+}
+
+// TestInputText_NoSelector_AppendsToExistingText: a field that holds text is
+// typed into at the cursor, as Maestro does, not replaced. A rich-text editor
+// typed "1", Enter, "2" lost the first line when the field was set.
+func TestInputText_NoSelector_AppendsToExistingText(t *testing.T) {
+	var set string
+	client := &scriptedClient{trackingClient: newTrackingClient()}
+	field := makeFocusedElement("1\n", &set, nil, nil)
+	field.SetShowingHint(false)
+	client.activeElementReturn = field
+	driver := New(client, &core.PlatformInfo{}, &mockShell{})
+
+	res := driver.inputText(&flow.InputTextStep{Text: "2"})
+	if !res.Success {
+		t.Fatalf("inputText: %v", res.Error)
+	}
+	if set != "" {
+		t.Errorf("field was set to %q; existing text must be kept", set)
+	}
+	if len(client.sendKeyActionsCalls) != 1 || client.sendKeyActionsCalls[0] != "2" {
+		t.Errorf("expected key events typing %q at the cursor, got %v", "2", client.sendKeyActionsCalls)
+	}
+}
+
+// TestInputText_NoSelector_SetsWhenFieldIsEmpty: a field showing its hint, or
+// one whose hint state is not reported (an older agent), is set in one call.
+func TestInputText_NoSelector_SetsWhenFieldIsEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hint func(e *uiautomator2.Element)
+	}{
+		{"showing its hint", func(e *uiautomator2.Element) { e.SetShowingHint(true) }},
+		{"hint state not reported", func(*uiautomator2.Element) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var set string
+			client := &scriptedClient{trackingClient: newTrackingClient()}
+			field := makeFocusedElement("Email", &set, nil, nil)
+			tc.hint(field)
+			client.activeElementReturn = field
+			driver := New(client, &core.PlatformInfo{}, &mockShell{})
+
+			res := driver.inputText(&flow.InputTextStep{Text: "a@b.co"})
+			if !res.Success {
+				t.Fatalf("inputText: %v", res.Error)
+			}
+			if set != "a@b.co" {
+				t.Errorf("expected the field to be set to %q, got %q", "a@b.co", set)
+			}
+			if len(client.sendKeyActionsCalls) != 0 {
+				t.Errorf("expected no key events, got %v", client.sendKeyActionsCalls)
+			}
+		})
+	}
+}
+
+// A find-and-click that gets no answer may have tapped: tapOn must not send it
+// again, however much of its timeout is left. Any other error keeps polling.
+func TestTapOn_UnansweredClickIsNotRepeated(t *testing.T) {
+	client := &scriptedClient{trackingClient: newTrackingClient()}
+	client.findAndClickErr = fmt.Errorf("%w: timeout waiting for response to Gesture.findAndClick (id=7)", core.ErrUnanswered)
+	driver := New(client, &core.PlatformInfo{ScreenWidth: 1080, ScreenHeight: 2400}, &mockShell{})
+
+	start := time.Now()
+	res := driver.tapOn(&flow.TapOnStep{Selector: flow.Selector{Text: "Pay"}, BaseStep: flow.BaseStep{TimeoutMs: 3000}})
+	if res.Success {
+		t.Fatal("tapOn succeeded on a click with no answer")
+	}
+	if client.findAndClickCalls != 1 {
+		t.Errorf("find-and-click sent %d times, want once", client.findAndClickCalls)
+	}
+	if !strings.Contains(res.Message, "not repeated") || time.Since(start) > time.Second {
+		t.Errorf("message %q after %v; want an immediate 'not repeated' failure", res.Message, time.Since(start))
 	}
 }

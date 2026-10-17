@@ -52,6 +52,9 @@ func (opts tapOptions) hasTapOptions() bool {
 const (
 	defaultRepeatDelay = 100 // ms, matches Maestro's DEFAULT_REPEAT_DELAY
 	settleInterval     = 200 * time.Millisecond
+	// tapSettleQuietMs: how long the screen must stay unchanged for a native
+	// waitToSettleTimeoutMs settle (the DeviceLab driver's own post-tap settle).
+	tapSettleQuietMs = 500
 )
 
 // settleAfterAction waits for the UI to settle after a UI-mutating action.
@@ -132,6 +135,25 @@ func (fr *FlowRunner) waitForSettle(timeoutMs int) []byte {
 	return hierarchy
 }
 
+// repeatTap is tap i of count of a tapOn with repeat:, as a copy of the step
+// that carries its place; any other step is returned as it is.
+func repeatTap(step flow.Step, i, count int) flow.Step {
+	t, ok := step.(*flow.TapOnStep)
+	if !ok || count <= 1 {
+		return step
+	}
+	c := *t
+	c.RepeatIndex, c.RepeatCount = i, count
+	return &c
+}
+
+// waitsAroundTaps reports whether the driver waits for the screen to settle
+// before a tap (DeviceLab Android and iOS, WDA).
+func waitsAroundTaps(driver core.Driver) bool {
+	w, ok := core.Unwrap(driver).(interface{ WaitsAroundTaps() bool })
+	return ok && w.WaitsAroundTaps()
+}
+
 // executeTapWithOptions wraps a tap step with repeat, delay,
 // retryTapIfNoChange, and waitToSettleTimeoutMs logic.
 //
@@ -155,9 +177,18 @@ func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *co
 
 	settleTimeout := opts.WaitToSettleTimeoutMs
 
+	// A driver with a native settle (DeviceLab) waits for the screen to stay
+	// unchanged for tapSettleQuietMs after the tap, up to the step's timeout.
+	// Two hierarchy reads 200ms apart ended DDG privacy 9's settle after its
+	// Refresh tap about 1s in, while the page was still reloading.
+	nativeSettle, _ := core.Unwrap(fr.driver).(interface {
+		WaitForSettle(timeoutMs, quietMs int) (bool, error)
+	})
+	settleNatively := settleTimeout > 0 && nativeSettle != nil
+
 	// Capture hierarchy before tap (for settle and/or retry comparison)
 	var hierarchyBefore []byte
-	if settleTimeout > 0 || opts.RetryTapIfNoChange != nil {
+	if (settleTimeout > 0 && !settleNatively) || opts.RetryTapIfNoChange != nil {
 		hierarchyBefore = fr.waitForSettle(settleTimeout)
 	}
 
@@ -179,13 +210,24 @@ func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *co
 		}
 
 		// Execute tap (possibly repeated)
-		lastResult = fr.repeatTap(step, opts)
+		lastResult = fr.tapRepeatedly(step, opts)
 		if !lastResult.Success {
 			return lastResult
 		}
 
+		if settleNatively {
+			if settled, err := nativeSettle.WaitForSettle(settleTimeout, tapSettleQuietMs); err != nil {
+				logger.Debug("waitToSettleTimeoutMs: native settle error: %v", err)
+			} else if !settled {
+				logger.Debug("waitToSettleTimeoutMs: still changing after %dms", settleTimeout)
+			}
+			if opts.RetryTapIfNoChange == nil {
+				return lastResult
+			}
+		}
+
 		// Check if UI changed (for retry and settle logic)
-		if settleTimeout > 0 || opts.RetryTapIfNoChange != nil {
+		if (settleTimeout > 0 && !settleNatively) || opts.RetryTapIfNoChange != nil {
 			hierarchyAfter := fr.waitForSettle(settleTimeout)
 			if hierarchyBefore != nil && hierarchyAfter != nil &&
 				!bytes.Equal(hierarchyBefore, hierarchyAfter) {
@@ -201,9 +243,11 @@ func (fr *FlowRunner) executeTapWithOptions(step flow.Step, opts tapOptions) *co
 	return lastResult
 }
 
-// repeatTap executes the tap the step's repeat count of times, delay apart,
-// and stops at the first that fails.
-func (fr *FlowRunner) repeatTap(step flow.Step, opts tapOptions) *core.CommandResult {
+// tapRepeatedly executes the tap the step's repeat count of times, delay
+// apart, and stops at the first that fails. Each tap of a repeat carries its
+// place in it (flow.RepeatTapAfterFirst), so a driver that waits for the
+// screen around taps sends them back to back, as Maestro does.
+func (fr *FlowRunner) tapRepeatedly(step flow.Step, opts tapOptions) *core.CommandResult {
 	repeatCount := opts.Repeat
 	if repeatCount <= 0 {
 		repeatCount = 1
@@ -217,14 +261,21 @@ func (fr *FlowRunner) repeatTap(step flow.Step, opts tapOptions) *core.CommandRe
 	var lastResult *core.CommandResult
 	for i := 0; i < repeatCount; i++ {
 		tapStart := time.Now()
-		lastResult = fr.driver.Execute(step)
+		lastResult = fr.driver.Execute(repeatTap(step, i, repeatCount))
 		if !lastResult.Success {
 			return lastResult
 		}
 
-		// Delay between repeated taps (not after the last one)
+		// Delay between repeated taps (not after the last one). Maestro
+		// counts it from the tap, less the time the tap took. The first
+		// Execute of a driver that waits around taps can include a
+		// settle for the step before (seconds on a playing video), which
+		// used up the delay, so after it the whole delay follows.
 		if repeatCount > 1 && i < repeatCount-1 {
-			sleepTime := time.Duration(delayMs)*time.Millisecond - time.Since(tapStart)
+			sleepTime := time.Duration(delayMs) * time.Millisecond
+			if !(i == 0 && waitsAroundTaps(fr.driver)) {
+				sleepTime -= time.Since(tapStart)
+			}
 			if sleepTime > 0 {
 				time.Sleep(sleepTime)
 			}
@@ -265,7 +316,7 @@ const (
 // and Orchestra.kt:393) the tap costs nothing more than itself.
 func (fr *FlowRunner) executeScreenshotBasedTap(step flow.Step, opts tapOptions, settler screenshotSettler) *core.CommandResult {
 	if opts.RetryTapIfNoChange == nil || !*opts.RetryTapIfNoChange {
-		return fr.repeatTap(step, opts)
+		return fr.tapRepeatedly(step, opts)
 	}
 
 	hierarchyBefore, err := fr.driver.Hierarchy()
@@ -288,7 +339,7 @@ func (fr *FlowRunner) executeScreenshotBasedTap(step flow.Step, opts tapOptions,
 			}
 		}
 
-		lastResult = fr.repeatTap(step, opts)
+		lastResult = fr.tapRepeatedly(step, opts)
 		if !lastResult.Success {
 			return lastResult
 		}

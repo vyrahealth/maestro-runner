@@ -113,7 +113,7 @@ func TestStrictIndexSortsByPosition(t *testing.T) {
 		{"0", "300", "100"},
 		{"1", "100", "200"},
 		{"-1", "200", "300"},
-		{"5", "300", "none"},
+		{"5", "none", "none"},
 	} {
 		plain, strict := lookupBoth(t, source, flow.Selector{Text: "Row", Index: tc.index})
 		if yOf(plain) != tc.plain || yOf(strict) != tc.strict {
@@ -149,11 +149,9 @@ func TestStrictTapsTheElementItself(t *testing.T) {
 func TestStrictContainsChildIsTheTree(t *testing.T) {
 	source := screen(el("Other", `name="card"`, 100, el("Button", `label="Buy"`, 150)))
 	plain, strict := lookupBoth(t, source, flow.Selector{ContainsChild: &flow.Selector{Text: "Buy"}})
-	if yOf(plain) == "100" {
-		t.Fatal("setup: without the switch the lookup is by bounds")
-	}
-	if yOf(strict) != "100" {
-		t.Errorf("with the switch found y=%s, want the card that holds the button (y=100)", yOf(strict))
+	// Upstream reads containsChild from the tree too since 1.1.29.
+	if yOf(plain) != "100" || yOf(strict) != "100" {
+		t.Errorf("found y=%s without the switch and y=%s with it, want the card that holds the button (y=100)", yOf(plain), yOf(strict))
 	}
 
 	desc := screen(

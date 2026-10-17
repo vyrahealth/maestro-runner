@@ -82,6 +82,9 @@ func (a *Adapter) newElement(result ElementResult) *uiautomator2.Element {
 			Height: result.Bounds.Height,
 		},
 	)
+	if result.ShowingHintText != nil {
+		elem.SetShowingHint(*result.ShowingHintText)
+	}
 	a.wireElementActions(elem, result.ElementID)
 	elem.SetTextFunc(func() (string, error) {
 		return a.focusedFieldText(result.ElementID, result.Bounds)
@@ -230,6 +233,41 @@ func (a *Adapter) FindAndClickChecked(strategy, selector string, screenW, screen
 	return elem, clicked, result.BlockedBy, nil
 }
 
+// FindFirstAndClickChecked is FindAndClickChecked for the first of several
+// forms that matches: strategiesAndSelectors alternates strategy, selector.
+// The agent tries them in order on one read of the screen and returns which
+// one it tapped.
+func (a *Adapter) FindFirstAndClickChecked(strategiesAndSelectors []string, screenW, screenH int, hitTest bool) (*uiautomator2.Element, bool, string, int, error) {
+	if len(strategiesAndSelectors) == 0 || len(strategiesAndSelectors)%2 != 0 {
+		return nil, false, "", -1, fmt.Errorf("findFirstAndClick: pairs must alternate (strategy, selector)")
+	}
+	payload := make([]map[string]string, len(strategiesAndSelectors)/2)
+	for i := range payload {
+		payload[i] = map[string]string{
+			"strategy": strategiesAndSelectors[i*2],
+			"selector": strategiesAndSelectors[i*2+1],
+		}
+	}
+	params := map[string]interface{}{"strategies": payload}
+	if screenW > 0 && screenH > 0 {
+		params["screenWidth"] = screenW
+		params["screenHeight"] = screenH
+	}
+	if hitTest {
+		params["hitTest"] = true
+	}
+	resp, err := a.client.Call("Gesture.findFirstAndClick", params)
+	if err != nil {
+		return nil, false, "", -1, err
+	}
+	var result ElementResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return nil, false, "", -1, fmt.Errorf("parse findFirstAndClick result: %w", err)
+	}
+	clicked := result.Clicked == nil || *result.Clicked
+	return a.newElement(result), clicked, result.BlockedBy, result.MatchedIndex, nil
+}
+
 // --- Timeouts ---
 
 // SetImplicitWait sets the implicit wait timeout for element finding.
@@ -361,6 +399,16 @@ func (a *Adapter) SendKeyActions(text string) error {
 	return err
 }
 
+// SendKeyActionsWithDelay types text as key events with a pause of delayMs
+// after each character. An agent that predates delayMs types without pauses.
+func (a *Adapter) SendKeyActionsWithDelay(text string, delayMs int) error {
+	_, err := a.client.Call("Input.sendKeyActions", map[string]interface{}{
+		"text":    text,
+		"delayMs": delayMs,
+	})
+	return err
+}
+
 // AddMedia inserts a single media file into the device MediaStore via the
 // on-device agent (base64-encoded bytes over the RPC channel).
 func (a *Adapter) AddMedia(name, mime string, data []byte) error {
@@ -410,6 +458,23 @@ func (a *Adapter) Source() (string, error) {
 	return result.XML, nil
 }
 
+// Snapshot returns the XML of every window's full accessibility tree, with
+// hint text, in one read. waitForIdleMs is how long the agent first waits for
+// the app to go idle; 0 reads at once.
+func (a *Adapter) Snapshot(waitForIdleMs int) (string, error) {
+	resp, err := a.client.Call("UI.snapshot", map[string]interface{}{"waitForIdleMs": waitForIdleMs})
+	if err != nil {
+		return "", err
+	}
+
+	var result SourceResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return "", fmt.Errorf("parse snapshot result: %w", err)
+	}
+
+	return result.XML, nil
+}
+
 // GetOrientation returns the current device orientation.
 func (a *Adapter) GetOrientation() (string, error) {
 	resp, err := a.client.Call("Device.getOrientation", nil)
@@ -452,6 +517,16 @@ func (a *Adapter) GetClipboard() (string, error) {
 func (a *Adapter) SetClipboard(text string) error {
 	_, err := a.client.Call("Device.setClipboard", map[string]interface{}{
 		"text": text,
+	})
+	return err
+}
+
+// SetLocation moves the device to latitude,longitude through the agent's test
+// location providers; the agent keeps it there until the session ends.
+func (a *Adapter) SetLocation(latitude, longitude float64) error {
+	_, err := a.client.Call("Device.setLocation", map[string]interface{}{
+		"latitude":  latitude,
+		"longitude": longitude,
 	})
 	return err
 }

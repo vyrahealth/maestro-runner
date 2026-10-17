@@ -43,12 +43,17 @@ func TestMatchesID(t *testing.T) {
 		pattern, id string
 		want        bool
 	}{
-		{"button", "com.app:id/button", true},       // substring fallback
-		{"^com\\.app", "com.app:id/foo", true},      // regex
-		{"^com\\.app", "com.example:id/foo", false}, // regex no match
-		{"((", "com.app:id/((stuff", true},          // invalid regex → substring fallback
-		{"((", "no match here", false},              // invalid regex + no substring
-		{"\\d+", "foo123bar", true},                 // regex with digits
+		// Whole match, as Maestro's idMatches (#188): the id, or the part
+		// after the package prefix; never a substring.
+		{"button", "com.app:id/button", true},
+		{"button", "com.app:id/button_ok", false},
+		{"^com\\.app.*", "com.app:id/foo", true},      // regex
+		{"^com\\.app", "com.app:id/foo", false},       // regex, not a prefix match
+		{"^com\\.app.*", "com.example:id/foo", false}, // regex no match
+		{"((", "com.app:id/((", true},                 // invalid regex → literal, whole
+		{"((", "com.app:id/((stuff", false},           // invalid regex literal is whole too
+		{"\\d+", "foo123bar", false},                  // regex must cover the whole id
+		{"foo\\d+bar", "foo123bar", true},
 	}
 	for _, c := range cases {
 		if got := matchesID(c.pattern, c.id); got != c.want {
@@ -63,11 +68,17 @@ func TestMatchesText(t *testing.T) {
 		pattern, text, content, hint string
 		want                         bool
 	}{
-		{"literal text match", "Login", "Login Button", "", "", true},
-		{"literal case-insensitive", "LOGIN", "login button", "", "", true},
-		{"literal content-desc", "submit", "", "Submit form", "", true},
-		{"literal hint", "search", "", "", "Search...", true},
+		// Plain text matches a whole value, ignoring case, as Maestro does
+		// (#188); it used to be a substring match.
+		{"literal text match", "Login", "Login", "", "", true},
+		{"literal is not a substring", "Login", "Login Button", "", "", false},
+		{"literal case-insensitive", "LOGIN", "login", "", "", true},
+		{"literal content-desc", "submit form", "", "Submit form", "", true},
+		{"content-desc not a substring", "English", "", "Language: English", "", false},
+		{"literal hint", "search...", "", "", "Search...", true},
 		{"literal no match", "logout", "Login", "", "", false},
+		{"partial match written as regex", ".*Open.*", "Talk · Open", "", "", true},
+		{"literal fallback", "$7.50", "$7.50", "", "", true},
 		// Regex pattern (looksLikeRegex returns true for ^, $, \d, etc.)
 		{"regex match text", "^Login$", "Login", "", "", true},
 		{"regex no match", "^Login$", "Logout", "", "", false},

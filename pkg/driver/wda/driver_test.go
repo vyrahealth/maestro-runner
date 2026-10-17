@@ -366,8 +366,8 @@ func TestExecuteInputTextEmpty(t *testing.T) {
 	}
 	result := driver.Execute(step)
 
-	if result.Success {
-		t.Error("Expected error for empty text")
+	if !result.Success {
+		t.Errorf("Expected empty text to pass as a no-op, got %q", result.Message)
 	}
 }
 
@@ -1116,7 +1116,7 @@ func mockWDAServerWithScrollElements(foundAfterScrolls int) *httptest.Server {
 		path := r.URL.Path
 
 		// Track swipe/drag calls (used by scroll)
-		if strings.Contains(path, "/wda/dragfromtoforduration") && r.Method == "POST" {
+		if strings.Contains(path, "/actions") && r.Method == "POST" {
 			scrollCount++
 			jsonResponse(w, map[string]interface{}{"status": 0})
 			return
@@ -2095,9 +2095,9 @@ func TestInputTextEmptyText(t *testing.T) {
 	}
 
 	result := driver.inputText(step)
-	// Empty text should fail - WDA implementation rejects empty text
-	if result.Success {
-		t.Errorf("Expected failure for empty text, got success")
+	// Empty text types nothing and passes, as in Maestro.
+	if !result.Success {
+		t.Errorf("Expected empty text to pass as a no-op, got %q", result.Message)
 	}
 }
 
@@ -3009,7 +3009,7 @@ func TestSetOrientationError(t *testing.T) {
 func TestSwipeWithCoordinateError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.URL.Path, "/wda/dragfromtoforduration") {
+		if strings.Contains(r.URL.Path, "/actions") {
 			jsonResponse(w, map[string]interface{}{
 				"value": map[string]interface{}{
 					"error":   "swipe failed",
@@ -4688,9 +4688,7 @@ func TestParseResponseWDAErrorNoMessage(t *testing.T) {
 
 // TestTapOnPointWithPercentageWindowSizeError tests when screen size is not cached
 func TestTapOnPointWithPercentageWindowSizeError(t *testing.T) {
-	client := &Client{}
-	// No screen size in PlatformInfo
-	driver := NewDriver(client, &core.PlatformInfo{Platform: "ios"}, "")
+	driver := noSizeDriver(t)
 
 	result := driver.tapOnPointWithCoords("50%, 50%")
 
@@ -5197,7 +5195,7 @@ func TestScrollSwipeError(t *testing.T) {
 			})
 			return
 		}
-		if strings.Contains(r.URL.Path, "/dragfromtoforduration") {
+		if strings.Contains(r.URL.Path, "/actions") {
 			jsonResponse(w, map[string]interface{}{
 				"value": map[string]interface{}{"error": "swipe failed"},
 			})
@@ -5252,7 +5250,7 @@ func TestSwipeError(t *testing.T) {
 			})
 			return
 		}
-		if strings.Contains(r.URL.Path, "/dragfromtoforduration") {
+		if strings.Contains(r.URL.Path, "/actions") {
 			jsonResponse(w, map[string]interface{}{
 				"value": map[string]interface{}{"error": "drag failed"},
 			})
@@ -5453,7 +5451,7 @@ func TestScrollUntilVisibleMaxScrolls(t *testing.T) {
 			})
 			return
 		}
-		if strings.Contains(r.URL.Path, "/dragfromtoforduration") {
+		if strings.Contains(r.URL.Path, "/actions") {
 			scrollCount++
 			jsonResponse(w, map[string]interface{}{"status": 0})
 			return
@@ -5728,7 +5726,7 @@ func TestScrollUntilVisibleWithTimeoutMs(t *testing.T) {
 			})
 			return
 		}
-		if strings.Contains(r.URL.Path, "/dragfromtoforduration") {
+		if strings.Contains(r.URL.Path, "/actions") {
 			scrollCount++
 			jsonResponse(w, map[string]interface{}{"status": 0})
 			return
@@ -5884,7 +5882,7 @@ func TestSimpleSelectorWithIndex(t *testing.T) {
 		{"index 2 returns third", "2", 400},
 		{"index -1 returns last", "-1", 400},
 		{"index -2 returns second to last", "-2", 250},
-		{"index out of range defaults to first", "99", 100},
+		{"index out of range names no element (#188)", "99", -1},
 	}
 
 	for _, tt := range tests {
@@ -5915,6 +5913,12 @@ func TestSimpleSelectorWithIndex(t *testing.T) {
 				Index: tt.index,
 			}
 			info, err := driver.findElementByPageSourceOnce(sel)
+			if tt.expectedY < 0 {
+				if err == nil {
+					t.Errorf("index %s past the matches found an element at Y=%d, want none", tt.index, info.Bounds.Y)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("expected success, got error: %v", err)
 			}

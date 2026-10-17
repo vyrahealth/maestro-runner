@@ -93,13 +93,12 @@ func TestTimedSwipeIsMaestrosGesture(t *testing.T) {
 }
 
 // A swipe without a duration takes Maestro's default 400 ms with the switch
-// (YamlSwipe.kt:58). Without it, that swipe is the drag it has always been.
-// (TestSwipeCustomDuration pins the old mapping of a duration onto the drag's
-// hold.)
+// (YamlSwipe.kt:58). Without it, it is upstream's swipe: the same W3C
+// gesture, resting 100 ms.
 func TestTimedSwipeWithoutDurationTakesMaestrosDefault(t *testing.T) {
 	for _, c := range []struct {
 		env, paths string
-	}{{"1", "actions"}, {"", "dragfromtoforduration"}} {
+	}{{"1", "actions"}, {"", "actions"}} {
 		t.Setenv("MAESTRO_WDA_TIMED_SWIPE", c.env)
 		log := &gestureLog{}
 		server := swipeServer(t, log)
@@ -111,10 +110,12 @@ func TestTimedSwipeWithoutDurationTakesMaestrosDefault(t *testing.T) {
 		if strings.Join(log.paths, ",") != c.paths {
 			t.Fatalf("switch %q: gesture endpoints %v, want %s alone", c.env, log.paths, c.paths)
 		}
+		want := 100.0
 		if c.env != "" {
-			if got := swipeDuration(t, log.body); got != 400 {
-				t.Errorf("the swipe's duration is %v ms, want Maestro's 400", got)
-			}
+			want = 400 // Maestro's default
+		}
+		if got := swipeDuration(t, log.body); got != want {
+			t.Errorf("switch %q: the swipe's duration is %v ms, want %v", c.env, got, want)
 		}
 	}
 }

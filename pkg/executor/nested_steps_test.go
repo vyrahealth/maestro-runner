@@ -139,6 +139,48 @@ func TestPasteTextInsideRunFlowUsesCopiedText(t *testing.T) {
 	}
 }
 
+// pasteText after setClipboard types the text setClipboard set, as Maestro
+// does, at the top level and inside a runFlow. It used to read the device
+// clipboard, which Android 10+ returns empty to the UiAutomator2 server (#202).
+func TestPasteTextAfterSetClipboardTypesItsText(t *testing.T) {
+	setClip := func(text string) *flow.SetClipboardStep {
+		return &flow.SetClipboardStep{BaseStep: flow.BaseStep{StepType: flow.StepSetClipboard}, Text: text}
+	}
+	paste := func() *flow.PasteTextStep {
+		return &flow.PasteTextStep{BaseStep: flow.BaseStep{StepType: flow.StepPasteText}}
+	}
+	var seen []flow.Step
+
+	result := runOneFlow(t, realDriverRejects(&seen), flow.Flow{
+		SourcePath: "test.yaml",
+		Config:     flow.Config{Name: "setClipboard then pasteText"},
+		Steps: []flow.Step{
+			setClip("4893010215"),
+			paste(),
+			&flow.RunFlowStep{
+				BaseStep: flow.BaseStep{StepType: flow.StepRunFlow},
+				Steps:    []flow.Step{setClip("nested-42"), paste()},
+			},
+		},
+	})
+
+	if result.Status != report.StatusPassed {
+		t.Errorf("Status = %v, want passed", result.Status)
+	}
+	var typed []string
+	for _, s := range seen {
+		if in, ok := s.(*flow.InputTextStep); ok {
+			typed = append(typed, in.Text)
+		}
+		if _, ok := s.(*flow.PasteTextStep); ok {
+			t.Error("pasteText reached the driver instead of typing the setClipboard text")
+		}
+	}
+	if strings.Join(typed, ",") != "4893010215,nested-42" {
+		t.Errorf("typed %q, want each setClipboard's text", typed)
+	}
+}
+
 // A step inside repeat expands ${...} afresh on every pass. Expansion used to
 // rewrite the shared step, so the first pass's value was baked in and every
 // later pass typed it again (duckduckgo/Android's autofill suite).
@@ -204,5 +246,61 @@ func TestRetryReevaluatesRunFlowCondition(t *testing.T) {
 	}
 	if cond.Script != "${output.attempt > 0}" {
 		t.Errorf("condition rewritten in the flow: %q", cond.Script)
+	}
+}
+
+// A step inside a runFlow that times out shows what it waited for, as a
+// top-level step does, not Go's bare "context deadline exceeded".
+func TestNestedStepTimeoutReadsLikeTopLevel(t *testing.T) {
+	driver := &mockDriver{executeFunc: func(step flow.Step) *core.CommandResult {
+		if _, ok := step.(*flow.AssertVisibleStep); ok {
+			return &core.CommandResult{Success: false, Error: context.DeadlineExceeded,
+				Message: "Element 'quintePlusParieuse' not visible within 1m0s"}
+		}
+		return &core.CommandResult{Success: true}
+	}}
+	var nested []string
+	out := t.TempDir()
+	runner := New(driver, RunnerConfig{
+		OutputDir: out,
+		Artifacts: ArtifactNever,
+		Device:    report.Device{ID: "test", Platform: "ios"},
+		OnNestedStep: func(depth int, desc string, passed bool, durationMs int64, errMsg string) {
+			if !passed {
+				nested = append(nested, errMsg)
+			}
+		},
+	})
+	_, err := runner.Run(context.Background(), []flow.Flow{{
+		SourcePath: "test.yaml",
+		Config:     flow.Config{Name: "nested timeout"},
+		Steps: []flow.Step{&flow.RunFlowStep{
+			BaseStep: flow.BaseStep{StepType: flow.StepRunFlow},
+			Steps: []flow.Step{&flow.AssertVisibleStep{
+				BaseStep: flow.BaseStep{StepType: flow.StepAssertVisible},
+				Selector: flow.Selector{Text: "quintePlusParieuse"},
+			}},
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "Element 'quintePlusParieuse' not visible within 1m0s (cause: timed out)"
+	if len(nested) != 1 || nested[0] != want {
+		t.Errorf("nested console line = %q, want %q", nested, want)
+	}
+	matches, _ := filepath.Glob(filepath.Join(out, "flows", "*.json"))
+	found := false
+	for _, m := range matches {
+		data, _ := os.ReadFile(m)
+		if strings.Contains(string(data), want) {
+			found = true
+		}
+		if strings.Contains(string(data), "context deadline exceeded") {
+			t.Errorf("%s still says context deadline exceeded", filepath.Base(m))
+		}
+	}
+	if !found {
+		t.Errorf("no flow report carries %q", want)
 	}
 }

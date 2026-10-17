@@ -40,7 +40,7 @@ func TestBuildSelectors_SingleAttributeUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildSelectors failed: %v", err)
 	}
-	// Exact resourceId, then the substring fallback.
+	// Exact resourceId, then the whole-id match.
 	if len(idOnly) != 2 {
 		t.Errorf("expected 2 id strategies, got %d", len(idOnly))
 	}
@@ -54,7 +54,8 @@ func TestBuildSelectors_SingleAttributeUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildSelectors failed: %v", err)
 	}
-	// textContains, descriptionContains, then the case-insensitive pair.
+	// text and description equal to it, then both matching it whole ignoring
+	// case. The first pair used to be textContains/descriptionContains (#188).
 	if len(textOnly) != 4 {
 		t.Errorf("expected 4 text strategies, got %d", len(textOnly))
 	}
@@ -79,7 +80,7 @@ func TestBuildSelectorsForTap_CombinedKeepsClickableFirst(t *testing.T) {
 		t.Errorf("expected a clickable-first strategy, got: %s", strategies[0].Value)
 	}
 	if !strings.Contains(strategies[0].Value, "resourceId") ||
-		!strings.Contains(strategies[0].Value, "textContains") {
+		!strings.Contains(strategies[0].Value, `.text("7 misses")`) {
 		t.Errorf("clickable strategy must still carry both id and text, got: %s", strategies[0].Value)
 	}
 }

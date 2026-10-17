@@ -2012,7 +2012,8 @@ func TestOpenLinkError(t *testing.T) {
 func TestPasteTextError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.URL.Path, "/appium/device/get_clipboard") {
+		// Both the mobile: command and the legacy route fail.
+		if strings.Contains(r.URL.Path, "/appium/device/get_clipboard") || strings.HasSuffix(r.URL.Path, "/execute/sync") {
 			writeJSON(w, map[string]interface{}{
 				"value": map[string]interface{}{
 					"error":   "clipboard failed",
@@ -2543,9 +2544,9 @@ func TestSwipeWithSelectorAnchorsOnElement(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("Expected success, got: %s", result.Message)
 	}
-	// Element bounds x=100,y=200,w=300,h=80: `left` starts at 90% X inside
-	// the element (370, 240) and ends 10% past its left edge (70, 240).
-	for _, want := range []string{`"x":370`, `"y":240`, `"x":70`, `"duration":800`} {
+	// Element bounds x=100,y=200,w=300,h=80: as Maestro, `left` starts at the
+	// element's centre (250, 240) and ends at 10% of the 1080-wide screen (108, 240).
+	for _, want := range []string{`"x":250`, `"y":240`, `"x":108`, `"duration":800`} {
 		if !strings.Contains(actionsBody, want) {
 			t.Errorf("expected actions payload containing %s, got: %s", want, actionsBody)
 		}
@@ -2616,7 +2617,12 @@ func TestInputText_AndroidTypesIntoActiveElement(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
 		switch {
+		// Real servers route only GET /element/active (UiAutomator2 server
+		// AppiumServlet, Appium 3 core); a POST 404s.
 		case strings.HasSuffix(path, "/element/active") && r.Method == "POST":
+			w.WriteHeader(http.StatusNotFound)
+			writeJSON(w, map[string]interface{}{"value": map[string]interface{}{"error": "unknown method", "message": "POST not routed"}})
+		case strings.HasSuffix(path, "/element/active") && r.Method == "GET":
 			writeJSON(w, map[string]interface{}{
 				"value": map[string]interface{}{"element-6066-11e4-a52e-4f735466cecf": "focused-1"},
 			})

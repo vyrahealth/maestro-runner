@@ -123,21 +123,30 @@ func TestIOSPlaceholderOnlyTextStillFound(t *testing.T) {
 	}
 }
 
-// accessibility id is exact; the page-source matcher takes a literal id as a
-// substring. "username" must still reach "username-input".
-func TestIOSLiteralIDSubstringStillFound(t *testing.T) {
+// Ids match whole, as Maestro's idMatches (#188): "username" is not
+// "username-input", even when the native probe sees something containing it;
+// the page source decides. "username-input" itself is found.
+func TestIOSLiteralIDIsNotASubstring(t *testing.T) {
 	d, s := newNativeMissDriver(t, func(using, value string) (string, string) {
-		if using == "-ios predicate string" && value == `name CONTAINS "username"` {
+		if using == "-ios predicate string" && strings.Contains(strings.ToLower(value), `"username`) {
 			return "field-1", ""
 		}
 		return "", "no such element"
 	})
 
-	if _, err := d.findElementDirect(flow.Selector{ID: "username"}); err != nil {
-		t.Fatalf("id matched by substring was not found: %v", err)
+	if _, err := d.findElementDirect(flow.Selector{ID: "username"}); err == nil {
+		t.Fatal("id matched part of username-input")
 	}
 	if s.sources != 1 {
-		t.Errorf("page source fetched %d times, want 1 (the match is resolved there, as before)", s.sources)
+		t.Errorf("page source fetched %d times, want 1 (the match is resolved there)", s.sources)
+	}
+	if _, err := d.findElementDirect(flow.Selector{ID: "username-input"}); err != nil {
+		t.Fatalf("whole id was not found: %v", err)
+	}
+	// Ids ignore case, as in Maestro; the absence probe has to as well, or
+	// it reports the element missing without asking the page source.
+	if _, err := d.findElementDirect(flow.Selector{ID: "USERNAME-input"}); err != nil {
+		t.Fatalf("whole id, ignoring case, was not found: %v", err)
 	}
 }
 
@@ -176,16 +185,44 @@ func TestIOSRegexSelectorsStillUsePageSource(t *testing.T) {
 	}
 }
 
+// The absence probes must accept every element the page-source matcher does,
+// which now matches whole and ignoring case (#188): every word of the text in
+// one attribute (a value can break a line where the text has a space), and a
+// name containing the id in any case.
 func TestIOSContainsPredicatesMatchPageSourceMatcher(t *testing.T) {
-	if got, want := iosTextContainsPredicate(`Say "hi"`), `label CONTAINS[c] "Say \"hi\"" OR value CONTAINS[c] "Say \"hi\"" OR placeholderValue CONTAINS[c] "Say \"hi\""`; got != want {
+	if got, want := iosTextNeedlesPredicate(`Say "hi"`), `(label CONTAINS[c] "say" AND label CONTAINS[c] "\"hi\"") OR (value CONTAINS[c] "say" AND value CONTAINS[c] "\"hi\"") OR (placeholderValue CONTAINS[c] "say" AND placeholderValue CONTAINS[c] "\"hi\"")`; got != want {
 		t.Errorf("text predicate:\n got %s\nwant %s", got, want)
 	}
-	if got, want := iosIDContainsPredicate("username"), `name CONTAINS "username"`; got != want {
+	if got := iosTextNeedlesPredicate("a|b"); got != "" {
+		t.Errorf("a selector with no required words cannot prove absence, got %s", got)
+	}
+	if got, want := iosIDContainsPredicate("username"), `name CONTAINS[c] "username"`; got != want {
 		t.Errorf("id predicate: got %s, want %s", got, want)
 	}
 	for id, literal := range map[string]bool{"username-input": true, "login.button": false, "^login$": false} {
 		if got := iosIDIsLiteral(id); got != literal {
 			t.Errorf("iosIDIsLiteral(%q) = %v, want %v", id, got, literal)
 		}
+	}
+}
+
+// Plain text is looked up whole on the device; `text: Open` must not return
+// a "Talk · Open" row through a CONTAINS query (#188).
+func TestIOSTextQueryMatchesWhole(t *testing.T) {
+	d, s := newNativeMissDriver(t, nothingMatches)
+	_, _ = d.findElementDirect(flow.Selector{Text: "Open"})
+	_, _ = d.findElementForTapIOS(flow.Selector{Text: "Open"})
+	want := `-ios predicate string: label MATCHES[c] "(?s)Open" OR value MATCHES[c] "(?s)Open"`
+	found := false
+	for _, q := range s.queries {
+		if q == want {
+			found = true
+		}
+		if strings.Contains(q, `CONTAINS[c] "Open"`) {
+			t.Errorf("a query that can return an element matched part of a value: %s", q)
+		}
+	}
+	if !found {
+		t.Errorf("no whole-text query in %q", s.queries)
 	}
 }

@@ -115,3 +115,64 @@ func TestTapOnPointLongPressIsRelativeToTheElement(t *testing.T) {
 		t.Errorf("pressed (%v,%v), want (972,747)", x, y)
 	}
 }
+
+// scroll left/right swipe horizontally across the middle of the screen; they
+// used to be rejected, so horizontal carousels could not be scrolled.
+func TestScrollLeftRightSwipesHorizontally(t *testing.T) {
+	for dir, want := range map[string][4]float64{
+		"right": {720, 1170, 360, 1170}, // content from the right: finger right → left
+		"left":  {360, 1170, 720, 1170},
+		"down":  {540, 1560, 540, 780},
+	} {
+		d, body, _ := rowServer(t, "android")
+		if res := d.scroll(&flow.ScrollStep{Direction: dir}); !res.Success {
+			t.Fatalf("%s: %s", dir, res.Message)
+		}
+		acts := capturedActions(t, *body)
+		var last map[string]interface{}
+		for _, a := range acts {
+			if a["type"] == "pointerMove" {
+				last = a
+			}
+		}
+		first := acts[0]
+		got := [4]float64{first["x"].(float64), first["y"].(float64), last["x"].(float64), last["y"].(float64)}
+		if got != want {
+			t.Errorf("%s: swipe %v, want %v", dir, got, want)
+		}
+	}
+}
+
+// dragAndDrop's `point:` next to a selector is relative to the element, like
+// tapOn's; it used to start at the element's centre.
+func TestDragFromPointInsideTheElement(t *testing.T) {
+	d, _, _ := rowServer(t, "android")
+	x, y, _, err := d.resolveDragPoint(flow.Selector{ID: "alarm_row", Point: "90%,50%"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if x != 972 || y != 747 {
+		t.Errorf("drag point (%d,%d), want (972,747)", x, y)
+	}
+}
+
+// swipe distance: 0.2 travels 20% of the screen height; it was ignored.
+func TestSwipeHonoursDistance(t *testing.T) {
+	d, body, _ := rowServer(t, "android")
+	if res := d.swipe(&flow.SwipeStep{Direction: "UP", Distance: 0.2}); !res.Success {
+		t.Fatalf("swipe: %s", res.Message)
+	}
+	acts := capturedActions(t, *body)
+	var startY, endY float64
+	for _, a := range acts {
+		if a["type"] == "pointerMove" {
+			if startY == 0 {
+				startY = a["y"].(float64)
+			}
+			endY = a["y"].(float64)
+		}
+	}
+	if travel := startY - endY; travel != 468 { // 20% of 2340
+		t.Errorf("swiped %v px, want 468 (20%% of 2340)", travel)
+	}
+}

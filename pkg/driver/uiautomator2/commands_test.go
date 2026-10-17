@@ -551,8 +551,8 @@ func TestInputTextNoText(t *testing.T) {
 
 	result := driver.inputText(step)
 
-	if result.Success {
-		t.Error("expected failure when text is empty")
+	if !result.Success {
+		t.Errorf("expected empty text to pass as a no-op, got %q", result.Message)
 	}
 }
 
@@ -616,8 +616,8 @@ func TestKillAppSuccess(t *testing.T) {
 		t.Errorf("expected success, got error: %v", result.Error)
 	}
 
-	if len(mock.commands) != 1 || mock.commands[0] != "am force-stop com.example.app" {
-		t.Errorf("expected force-stop command, got %v", mock.commands)
+	if len(mock.commands) != 1 || mock.commands[0] != "am kill com.example.app" {
+		t.Errorf("expected am kill (as Maestro killApp), got %v", mock.commands)
 	}
 }
 
@@ -1064,14 +1064,93 @@ func TestSetLocationMissingCoordinates(t *testing.T) {
 }
 
 func TestSetLocationSuccess(t *testing.T) {
-	mock := &MockShellExecutor{response: "Success"}
+	mock := &MockShellExecutor{response: "Starting service: Intent { cmp=io.appium.settings/.LocationService }"}
+	provisioned := 0
 	driver := &Driver{device: mock}
-	step := &flow.SetLocationStep{Latitude: "37.7749", Longitude: "-122.4194"}
+	driver.SetLocationProvisioner(func() error { provisioned++; return nil })
 
-	result := driver.setLocation(step)
+	for _, p := range [][2]string{{"37.7749", "-122.4194"}, {"48.8584", "2.2945"}} {
+		if result := driver.setLocation(&flow.SetLocationStep{Latitude: p[0], Longitude: p[1]}); !result.Success {
+			t.Fatalf("setLocation %v: %v", p, result.Error)
+		}
+	}
+	if provisioned != 1 {
+		t.Errorf("location app provisioned %d times, want once", provisioned)
+	}
+	joined := strings.Join(mock.commands, "\n")
+	for _, want := range []string{
+		"pm grant io.appium.settings android.permission.ACCESS_FINE_LOCATION",
+		"appops set io.appium.settings android:mock_location allow",
+		"am start-foreground-service --user 0 -n io.appium.settings/.LocationService --es latitude 37.7749 --es longitude -122.4194",
+		"am start-foreground-service --user 0 -n io.appium.settings/.LocationService --es latitude 48.8584 --es longitude 2.2945",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing command %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Count(joined, "appops set") != 1 {
+		t.Errorf("mock location app op set more than once:\n%s", joined)
+	}
 
-	if !result.Success {
-		t.Errorf("expected success, got error: %v", result.Error)
+	mock.commands = nil
+	driver.StopMockLocation()
+	driver.StopMockLocation()
+	if len(mock.commands) != 1 || mock.commands[0] != "am stopservice io.appium.settings/.LocationService" {
+		t.Errorf("StopMockLocation sent %q, want one stopservice", mock.commands)
+	}
+}
+
+// Android 7 and older have no start-foreground-service: am says so and the
+// service is started with startservice instead.
+func TestSetLocationFallsBackToStartService(t *testing.T) {
+	mock := &androidSevenShell{}
+	driver := &Driver{device: mock}
+	if res := driver.setLocation(&flow.SetLocationStep{Latitude: "1.5", Longitude: "2.5"}); !res.Success {
+		t.Fatalf("setLocation on Android 7: %v", res.Error)
+	}
+	last := mock.commands[len(mock.commands)-1]
+	if !strings.HasPrefix(last, "am startservice --user 0 -n io.appium.settings/.LocationService") {
+		t.Errorf("last command %q, want the startservice fallback", last)
+	}
+}
+
+type androidSevenShell struct{ commands []string }
+
+func (s *androidSevenShell) Shell(cmd string) (string, error) {
+	s.commands = append(s.commands, cmd)
+	if strings.HasPrefix(cmd, "am start-foreground-service") {
+		return "Unknown command: start-foreground-service", nil
+	}
+	if strings.HasPrefix(cmd, "am startservice") {
+		return "Starting service: Intent { cmp=io.appium.settings/.LocationService }", nil
+	}
+	return "", nil
+}
+
+func TestSetLocationReportsFailures(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lat, lon  string
+		response  string
+		provision error
+	}{
+		"latitude out of range":  {lat: "91", lon: "0"},
+		"longitude not a number": {lat: "0", lon: "east"},
+		"service refused":        {lat: "1", lon: "2", response: "Error: Not allowed to start service Intent"},
+		"am lacks the command":   {lat: "1", lon: "2", response: "Unknown command: startservice"},
+		"app cannot install":     {lat: "1", lon: "2", provision: errors.New("no APK")},
+	} {
+		mock := &MockShellExecutor{response: tc.response}
+		driver := &Driver{device: mock}
+		driver.SetLocationProvisioner(func() error { return tc.provision })
+		if result := driver.setLocation(&flow.SetLocationStep{Latitude: tc.lat, Longitude: tc.lon}); result.Success {
+			t.Errorf("%s: expected failure", name)
+		}
+		driver.StopMockLocation()
+		for _, c := range mock.commands {
+			if strings.Contains(c, "stopservice") {
+				t.Errorf("%s: stopped a location that was never set", name)
+			}
+		}
 	}
 }
 
@@ -1190,29 +1269,6 @@ func TestToggleAirplaneModeFromOn(t *testing.T) {
 // ============================================================================
 // Travel Tests
 // ============================================================================
-
-func TestTravelNoDevice(t *testing.T) {
-	driver := &Driver{device: nil}
-	step := &flow.TravelStep{Points: []string{"37.7749, -122.4194", "37.8049, -122.4094"}}
-
-	result := driver.travel(step)
-
-	if result.Success {
-		t.Error("expected failure when device is nil")
-	}
-}
-
-func TestTravelNotEnoughPoints(t *testing.T) {
-	mock := &MockShellExecutor{}
-	driver := &Driver{device: mock}
-	step := &flow.TravelStep{Points: []string{"37.7749, -122.4194"}}
-
-	result := driver.travel(step)
-
-	if result.Success {
-		t.Error("expected failure when less than 2 points")
-	}
-}
 
 // ============================================================================
 // AssertNotVisible HTTP Mock Tests
@@ -1571,25 +1627,6 @@ func TestSetLocationShellError(t *testing.T) {
 
 	if result.Success {
 		t.Error("expected failure when shell command fails")
-	}
-}
-
-func TestSetLocationShellCommand(t *testing.T) {
-	mock := &MockShellExecutor{response: "Success"}
-	driver := &Driver{device: mock}
-	step := &flow.SetLocationStep{Latitude: "37.7749", Longitude: "-122.4194"}
-
-	result := driver.setLocation(step)
-
-	if !result.Success {
-		t.Errorf("expected success, got error: %v", result.Error)
-	}
-
-	if len(mock.commands) != 1 {
-		t.Fatalf("expected 1 command, got %d", len(mock.commands))
-	}
-	if !strings.Contains(mock.commands[0], "37.7749") || !strings.Contains(mock.commands[0], "-122.4194") {
-		t.Errorf("expected coordinates in command, got: %s", mock.commands[0])
 	}
 }
 
@@ -3246,84 +3283,6 @@ func TestSetWaitForIdleTimeoutServerError(t *testing.T) {
 // travel Additional Tests
 // ============================================================================
 
-func TestTravelSuccess(t *testing.T) {
-	shell := &MockShellExecutor{}
-	driver := &Driver{device: shell}
-
-	step := &flow.TravelStep{
-		Points: []string{"37.7749, -122.4194", "37.8049, -122.4094"},
-		Speed:  3600, // High speed to minimize delay (3600 km/h = 1 point/sec)
-	}
-	result := driver.travel(step)
-
-	if !result.Success {
-		t.Errorf("expected success, got error: %v", result.Error)
-	}
-	if !strings.Contains(result.Message, "2 points") {
-		t.Errorf("expected '2 points' in message, got: %s", result.Message)
-	}
-	// Should have issued 2 shell commands (one per point)
-	if len(shell.commands) != 2 {
-		t.Fatalf("expected 2 commands, got %d", len(shell.commands))
-	}
-	if !strings.Contains(shell.commands[0], "37.7749") {
-		t.Errorf("expected first point lat in command, got: %s", shell.commands[0])
-	}
-	if !strings.Contains(shell.commands[1], "37.8049") {
-		t.Errorf("expected second point lat in command, got: %s", shell.commands[1])
-	}
-}
-
-func TestTravelShellError(t *testing.T) {
-	shell := &MockShellExecutor{err: errors.New("shell failed")}
-	driver := &Driver{device: shell}
-
-	step := &flow.TravelStep{
-		Points: []string{"37.7749, -122.4194", "37.8049, -122.4094"},
-		Speed:  3600,
-	}
-	result := driver.travel(step)
-
-	if result.Success {
-		t.Error("expected failure when shell command fails")
-	}
-}
-
-func TestTravelDefaultSpeed(t *testing.T) {
-	// Verify that speed=0 defaults to 50 km/h internally.
-	// We can't easily test the actual wait (72s per point), but we verify
-	// the field is set correctly on the step before calling.
-	step := &flow.TravelStep{
-		Points: []string{"37.7749, -122.4194", "37.8049, -122.4094"},
-		Speed:  0,
-	}
-	if step.Speed != 0 {
-		t.Errorf("expected speed 0, got %f", step.Speed)
-	}
-	// The travel() function sets speed=50 internally when step.Speed<=0.
-	// This is tested indirectly by TestTravelSuccess which uses high speed.
-}
-
-func TestTravelMalformedPoints(t *testing.T) {
-	shell := &MockShellExecutor{}
-	driver := &Driver{device: shell}
-
-	step := &flow.TravelStep{
-		Points: []string{"malformed_point", "also_malformed"},
-		Speed:  3600,
-	}
-	result := driver.travel(step)
-
-	// Malformed points are silently skipped (continue), so success
-	if !result.Success {
-		t.Errorf("expected success (malformed points are skipped), got error: %v", result.Error)
-	}
-	// No shell commands should have been issued since no valid points
-	if len(shell.commands) != 0 {
-		t.Errorf("expected 0 commands for malformed points, got %d", len(shell.commands))
-	}
-}
-
 // ============================================================================
 // getAllPermissions Tests
 // ============================================================================
@@ -3624,8 +3583,8 @@ func TestInputTextKeyPressEmptyText(t *testing.T) {
 	}
 	result := driver.inputText(step)
 
-	if result.Success {
-		t.Error("expected failure for empty text even with keyPress=true")
+	if !result.Success {
+		t.Errorf("expected empty text with keyPress=true to pass as a no-op, got %q", result.Message)
 	}
 }
 

@@ -66,6 +66,10 @@ type RunnerConfig struct {
 	TypingFrequency    int  // Global WDA typing frequency in keys/sec (0 = WDA default)
 	ConditionTimeout   int  // Default timeout (ms) for when:/while: condition checks (0 = engine default)
 	Insecure           bool // Skip TLS verification for runScript http.* calls (--insecure)
+	// DisableAnimations switches the device's system animations off for the
+	// run and restores them at the end (--disable-animations, or Maestro's
+	// workspace platform option). A flow's own disableAnimations overrides it.
+	DisableAnimations bool
 	// StepDelay pauses between top-level steps (ms). Flow config overrides it.
 	// For pacing demos and apps whose animations outrun the assertions.
 	StepDelay int
@@ -104,6 +108,8 @@ type FlowResult struct {
 	StepsPassed  int
 	StepsFailed  int
 	StepsSkipped int
+	// Attempts is how many times the flow ran (more than 1 with --retries).
+	Attempts int
 	// SessionID identifies the worker (Appium session) that ran this flow.
 	// Empty for sequential single-device runs; set by ParallelRunner so cloud
 	// providers can filter results to the worker that produced them.
@@ -156,8 +162,22 @@ func (r *Runner) Run(ctx context.Context, flows []flow.Flow) (*RunResult, error)
 	// Mark run as started
 	indexWriter.Start()
 
+	if r.config.DisableAnimations {
+		setAnimationsDisabled(r.driver, true)
+		defer setAnimationsDisabled(r.driver, false)
+	}
+
+	retries := newFlowRetries(r.config, flowDetails)
+
 	// Execute flows
 	results := r.executeFlows(ctx, expandedFlows, flowDetails, indexWriter)
+	if retries != nil {
+		retries.run(ctx, results, indexWriter, func(indexes []int) {
+			for _, i := range indexes {
+				results[i] = r.executeFlow(ctx, expandedFlows[i], &flowDetails[i], indexWriter, i, len(expandedFlows))
+			}
+		})
+	}
 
 	// Mark run as complete
 	indexWriter.End()
@@ -396,4 +416,18 @@ func expandSuites(flows []flow.Flow) []flow.Flow {
 	}
 
 	return expanded
+}
+
+// setAnimationsDisabled switches the device's animations when the driver can.
+func setAnimationsDisabled(d core.Driver, disabled bool) {
+	c, ok := core.Unwrap(d).(core.AnimationController)
+	if !ok {
+		if disabled {
+			logger.Warn("disableAnimations: not supported by this driver; animations stay on")
+		}
+		return
+	}
+	if err := c.SetAnimationsDisabled(disabled); err != nil {
+		logger.Warn("disableAnimations: %v", err)
+	}
 }

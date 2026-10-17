@@ -145,6 +145,15 @@ func CreateAndroidDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		}
 	}
 
+	if cfg.ShareHierarchy {
+		stopShare := shareHierarchy(dev.Serial(), driver)
+		innerCleanup := cleanup
+		cleanup = func() {
+			stopShare()
+			innerCleanup()
+		}
+	}
+
 	return driver, cleanup, nil
 }
 
@@ -293,12 +302,20 @@ func createUIAutomator2Driver(cfg *RunConfig, dev *device.AndroidDevice, info de
 		AppBuild:     appBuild,
 	}
 	driver := uia2driver.New(client, platformInfo, dev)
+	driver.SetLocationProvisioner(func() error {
+		apksDir, err := getDriversDir("android")
+		if err != nil {
+			return err
+		}
+		return dev.InstallAppiumSettings(apksDir)
+	})
 	// Typing frequency is applied centrally by the executor (flow_runner) to
 	// every driver that supports it, honouring --typing-frequency and a flow's
 	// typingFrequency:. No per-driver wiring is needed here.
 
 	// Cleanup function (silent)
 	cleanup := func() {
+		driver.StopMockLocation()
 		if err := client.Close(); err != nil {
 			logger.Debug("failed to close client during cleanup: %v", err)
 		}
@@ -463,13 +480,19 @@ func createDeviceLabDriver(cfg *RunConfig, dev *device.AndroidDevice, info devic
 		}
 		return nil, nil, fmt.Errorf("create session: %w", err)
 	}
-	logger.Info("Session created: %s", session.SessionID)
+	logger.Info("Session created: %s (agent build %s)", session.SessionID, orUnknown(session.AgentBuild))
+	if strings.HasSuffix(session.AgentBuild, "-dirty") {
+		logger.Warn("the DeviceLab agent on the device was built from uncommitted source (%s)", session.AgentBuild)
+	}
 	printSetupSuccess("Session created")
 
-	// Set waitForIdle timeout
-	if err := adapter.SetAppiumSettings(map[string]interface{}{
-		"waitForIdleTimeout": cfg.WaitForIdleTimeout,
-	}); err != nil {
+	// Set waitForIdle timeout. MAESTRO_DEVICELAB_SETTLE_DIAG=1 also turns on
+	// the agent's settle diagnostics (logcat, tag DeviceLabBridge).
+	settings := map[string]interface{}{"waitForIdleTimeout": cfg.WaitForIdleTimeout}
+	if os.Getenv("MAESTRO_DEVICELAB_SETTLE_DIAG") != "" {
+		settings["settleDiagnostics"] = true
+	}
+	if err := adapter.SetAppiumSettings(settings); err != nil {
 		fmt.Printf("  %s⚠%s Warning: failed to set driver settings: %v\n", color(colorYellow), color(colorReset), err)
 	}
 
@@ -479,6 +502,35 @@ func createDeviceLabDriver(cfg *RunConfig, dev *device.AndroidDevice, info devic
 	if err := adapter.SetImplicitWait(100 * time.Millisecond); err != nil {
 		fmt.Printf("  %s⚠%s Warning: failed to set implicit wait: %v\n", color(colorYellow), color(colorReset), err)
 	}
+
+	// An agent that dies mid-run (its connection drops) is restarted, as the
+	// iOS agent is; before, every later step of every later flow failed.
+	wsClient.SetReviver(func() error {
+		logger.Warn("DeviceLab agent connection on %s dropped; restarting the agent", dev.Serial())
+		if err := dev.StopDeviceLabDriver(); err != nil {
+			logger.Warn("stop DeviceLab driver before restart: %v", err)
+		}
+		if err := dev.StartDeviceLabDriver(driverCfg); err != nil {
+			return fmt.Errorf("restart DeviceLab driver: %w", err)
+		}
+		if dev.DeviceLabDriverSocket() == "" {
+			wsClient.SetTCPPort(dev.DeviceLabDriverLocalPort())
+		}
+		if err := wsClient.Connect(); err != nil {
+			return fmt.Errorf("reconnect WebSocket: %w", err)
+		}
+		if _, err := adapter.CreateSession(); err != nil {
+			return fmt.Errorf("recreate session: %w", err)
+		}
+		if err := adapter.SetAppiumSettings(settings); err != nil {
+			logger.Warn("reapply driver settings after restart: %v", err)
+		}
+		if err := adapter.SetImplicitWait(100 * time.Millisecond); err != nil {
+			logger.Warn("reapply implicit wait after restart: %v", err)
+		}
+		logger.Info("DeviceLab agent on %s restarted", dev.Serial())
+		return nil
+	})
 
 	// 5. Query app version and build number
 	appVersion, appBuild := "", ""
@@ -554,4 +606,12 @@ func createDeviceLabDriver(cfg *RunConfig, dev *device.AndroidDevice, info devic
 	}
 
 	return driver, cleanup, nil
+}
+
+// orUnknown names a value an older component does not report.
+func orUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }

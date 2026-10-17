@@ -253,6 +253,19 @@ func (d *Driver) swipe(step *flow.SwipeStep) *core.CommandResult {
 		}
 	}
 
+	// distance: sets how far a screen swipe travels, as in the other drivers;
+	// it was ignored here, so every direction swipe used the fixed span below.
+	if step.Distance > 0 {
+		sx, sy, ex, ey, derr := core.DirectionSwipeScreenCoords(direction, w, h, step.Distance)
+		if derr != nil {
+			return errorResult(derr, fmt.Sprintf("Invalid swipe direction: %s", step.Direction))
+		}
+		if err := d.client.Swipe(sx, sy, ex, ey, duration); err != nil {
+			return errorResult(err, "Failed to swipe")
+		}
+		return successResult(fmt.Sprintf("Swiped %s %.0f%% of the screen", direction, step.Distance*100), nil)
+	}
+
 	// Swipe coordinates match Maestro behavior:
 	// UP:    50%,50% → 50%,10%
 	// DOWN:  50%,20% → 50%,90%
@@ -290,23 +303,29 @@ func (d *Driver) scroll(step *flow.ScrollStep) *core.CommandResult {
 		direction = "down"
 	}
 
+	// The direction is where the content comes from: scroll down reveals what
+	// is below, so the finger swipes up; scroll right reveals what is to the
+	// right, so it swipes right to left (as the WDA and uiautomator2 drivers).
 	w, h := d.client.ScreenSize()
-	centerX := w / 2
-	var startY, endY int
+	centerX, centerY := w/2, h/2
+	startX, endX := centerX, centerX
+	startY, endY := centerY, centerY
 
 	switch direction {
 	case "down":
-		startY = h * 2 / 3
-		endY = h / 3
+		startY, endY = h*2/3, h/3
 	case "up":
-		startY = h / 3
-		endY = h * 2 / 3
+		startY, endY = h/3, h*2/3
+	case "right":
+		startX, endX = w*2/3, w/3
+	case "left":
+		startX, endX = w/3, w*2/3
 	default:
 		return errorResult(fmt.Errorf("invalid scroll direction: %s", direction), "")
 	}
 
 	// Was hardcoded 500ms, so `speed:` was parsed and dropped (#165).
-	if err := d.client.Swipe(centerX, startY, centerX, endY, core.ScrollDurationOrDefault(step.Speed, 500)); err != nil {
+	if err := d.client.Swipe(startX, startY, endX, endY, core.ScrollDurationOrDefault(step.Speed, 500)); err != nil {
 		return errorResult(err, "Failed to scroll")
 	}
 
@@ -326,7 +345,12 @@ func (d *Driver) resolveDragPoint(sel flow.Selector, timeout time.Duration) (int
 	if err != nil {
 		return 0, 0, nil, fmt.Errorf("element not found: %s: %w", sel.Describe(), err)
 	}
-	x, y := info.Bounds.Center()
+	// With a selector, point is relative to the element, as for tapOn (#175)
+	// and in the other drivers; the centre is the default.
+	x, y, perr := core.PointInBounds(sel.Point, info.Bounds)
+	if perr != nil {
+		return 0, 0, nil, fmt.Errorf("invalid point %q: %w", sel.Point, perr)
+	}
 	return x, y, info, nil
 }
 
@@ -381,6 +405,11 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 	// Stop early when the surface stops moving — a target that is not in the
 	// list should not cost every scroll the step allows.
 	var progress core.ScrollProgress
+	// centerElement: a visible element keeps the scroll going until it is
+	// near the middle. shown is the last match that was already visible
+	// enough, accepted if the list ends or the scrolls run out first.
+	var centering core.Centering
+	var shown *core.ElementInfo
 
 	for i := 0; i < maxScrolls && time.Now().Before(deadline); i++ {
 		if err := d.parentContext().Err(); err != nil {
@@ -399,7 +428,14 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			if !boundsKnown {
 				return successResult("Element found", info)
 			}
-			if core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage) {
+			if decided, done := centering.Check(step.CenterElement, info.Bounds, direction, w, h); decided {
+				if done {
+					return successResult("Element centred", info)
+				}
+				if core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage) {
+					shown = info
+				}
+			} else if core.MeetsVisibility(info.Bounds, w, h, step.VisibilityPercentage) {
 				// Computed from a rect the hierarchy may already have clipped
 				// to the scroll container, where a sliver at the fold scores
 				// 100% (#164). A rect flush with the container's leading edge
@@ -420,6 +456,9 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 		}
 
 		if sig, ok := d.scrollSurfaceSignature(); ok && progress.Observe(sig) {
+			if shown != nil {
+				return successResult("Element visible (end of content before centring)", shown)
+			}
 			reason := fmt.Sprintf("scrolling %s made no progress after %d scrolls (end of content?)", direction, i)
 			if partiallyVisible {
 				return errorResult(fmt.Errorf("element found but never sufficiently visible after scrolling"), reason)
@@ -427,11 +466,17 @@ func (d *Driver) scrollUntilVisible(step *flow.ScrollUntilVisibleStep) *core.Com
 			return errorResult(fmt.Errorf("element not found after scrolling"), reason)
 		}
 
-		// Scroll
-		d.scroll(&flow.ScrollStep{Direction: direction, Speed: step.Speed})
+		// Scroll. A failed scroll ends the step with its reason; ignoring it
+		// used to turn an unsupported direction into "no progress".
+		if res := d.scroll(&flow.ScrollStep{Direction: direction, Speed: step.Speed}); !res.Success {
+			return res
+		}
 		time.Sleep(300 * time.Millisecond)
 	}
 
+	if shown != nil {
+		return successResult("Element visible (scrolls ran out before centring)", shown)
+	}
 	if partiallyVisible {
 		return errorResult(fmt.Errorf("element found but never sufficiently visible after scrolling"), "")
 	}
@@ -653,14 +698,29 @@ func (d *Driver) eraseText(step *flow.EraseTextStep) *core.CommandResult {
 	}
 	// GetActiveElement failed, fall through to delete key approach
 
-	// Fallback: Press delete key multiple times
-	// This is slower (N HTTP calls) but works in edge cases:
-	// - Can't find focused element
-	// - Element doesn't support Clear() or Text()
-	// - Password fields that don't expose text
-	// - Custom input components
+	// Fallback: delete keys, one per character. This is slower but works in
+	// the edge cases above (no readable text, no Clear, custom inputs).
+	if d.platform == "ios" {
+		// XCUITest has no press_keycode route, so the Android key code 404'd
+		// on every iteration and the step still reported success. WDA types
+		// "\b" as the delete key, as the WDA driver does.
+		deletes := strings.Repeat("\b", chars)
+		var err error
+		if activeElemID != "" {
+			err = d.client.ElementSendKeys(activeElemID, deletes)
+		} else {
+			err = d.client.SendKeys(deletes)
+		}
+		if err != nil {
+			return errorResult(err, "eraseText: could not send delete keys")
+		}
+		return successResult(fmt.Sprintf("Erased %d characters", chars), nil)
+	}
 	for i := 0; i < chars; i++ {
 		if err := d.client.PressKeyCode(67); err != nil { // Android KEYCODE_DEL
+			if i == 0 {
+				return errorResult(err, "eraseText: could not press delete")
+			}
 			logger.Warn("failed to press delete key on iteration %d: %v", i, err)
 		}
 	}
@@ -700,6 +760,16 @@ func (d *Driver) assertVisible(step *flow.AssertVisibleStep) *core.CommandResult
 	if d.platform != "ios" && info != nil && !info.Visible {
 		return errorResult(fmt.Errorf("element found but not visible"),
 			fmt.Sprintf("Element exists but is not visible: %s", step.Selector.Describe()))
+	}
+
+	// Either platform: an element less than 10% inside the viewport is not
+	// visible, whatever its attributes say. On iOS this is the only check, so
+	// a row below the fold used to pass (same rule as the WDA driver).
+	if info != nil {
+		if w, h := d.client.ScreenSize(); w > 0 && h > 0 && info.Bounds.VisiblePercentage(w, h) < 0.1 {
+			return errorResult(fmt.Errorf("element found but off screen"),
+				fmt.Sprintf("Element exists but is off screen: %s", step.Selector.Describe()))
+		}
 	}
 
 	return successResult(fmt.Sprintf("Element is visible: %s", step.Selector.Describe()), info)
@@ -756,6 +826,7 @@ func (d *Driver) countVisibleMatches(sel flow.Selector) (int, error) {
 		return 0, err
 	}
 	d.platform = platform
+	elements = d.onScreen(elements)
 	return countDisplayed(FilterBySelector(elements, sel, platform)), nil
 }
 
@@ -860,12 +931,13 @@ func (d *Driver) launchApp(step *flow.LaunchAppStep) *core.CommandResult {
 		if err := d.client.ClearAppData(appID); err != nil {
 			return errorResult(err, fmt.Sprintf("Failed to clear app state: %s", appID))
 		}
+	}
 
-		// Grant permissions after clearing state (pm clear resets permissions).
-		// Use flow-specified permissions if provided, otherwise grant all.
-		if d.client.Platform() == "android" {
-			d.grantPermissions(appID, step.Permissions)
-		}
+	// Apply permissions on every launch, as Maestro does (default all:allow)
+	// and the uiautomator2 driver does. They used to be applied only with
+	// clearState, so a flow's `permissions:` did nothing on a plain launch.
+	if d.client.Platform() == "android" {
+		d.grantPermissions(appID, step.Permissions)
 	}
 
 	if err := d.client.LaunchApp(appID); err != nil {
@@ -930,6 +1002,21 @@ func (d *Driver) setLocation(step *flow.SetLocationStep) *core.CommandResult {
 
 func (d *Driver) setOrientation(step *flow.SetOrientationStep) *core.CommandResult {
 	orientation := strings.ToLower(step.Orientation)
+
+	// /orientation takes only PORTRAIT and LANDSCAPE, so the extended values
+	// failed. On Android they go through /rotation, which the UiAutomator2
+	// server turns into the display rotation, the same rotations the
+	// uiautomator2 driver sets through user_rotation (1, 2, 3).
+	if d.platform != "ios" {
+		degrees := map[string]int{"landscape_left": 90, "upside_down": 180, "landscape_right": 270}
+		if z, ok := degrees[strings.ReplaceAll(orientation, "-", "_")]; ok {
+			if err := d.client.SetRotation(z); err != nil {
+				return errorResult(err, fmt.Sprintf("Failed to set orientation: %s", orientation))
+			}
+			return successResult(fmt.Sprintf("Set orientation to %s", orientation), nil)
+		}
+	}
+
 	if err := d.client.SetOrientation(orientation); err != nil {
 		return errorResult(err, fmt.Sprintf("Failed to set orientation: %s", orientation))
 	}
@@ -1021,16 +1108,28 @@ func (d *Driver) pressKey(step *flow.PressKeyStep) *core.CommandResult {
 }
 
 func (d *Driver) pressKeyAndroid(key string) *core.CommandResult {
+	// The same keys as the uiautomator2 driver. `delete` is KEYCODE_DEL (67,
+	// backspace) as there; it was 112, forward-delete, which removes nothing
+	// with the cursor at the end of a field.
 	keyMap := map[string]int{
 		"back":        4,
 		"home":        3,
+		"menu":        82,
 		"enter":       66,
 		"backspace":   67,
-		"delete":      112,
+		"delete":      67,
 		"tab":         61,
+		"space":       62,
 		"volume_up":   24,
 		"volume_down": 25,
 		"power":       26,
+		"camera":      27,
+		"search":      84,
+		"dpad_up":     19,
+		"dpad_down":   20,
+		"dpad_left":   21,
+		"dpad_right":  22,
+		"dpad_center": 23,
 	}
 
 	if keycode, ok := keyMap[key]; ok {
@@ -1208,6 +1307,21 @@ func (d *Driver) takeScreenshot(step *flow.TakeScreenshotStep) *core.CommandResu
 		return errorResult(err, fmt.Sprintf("Failed to take screenshot: %v", err))
 	}
 
+	// cropOn keeps only the element, as the other drivers do. Ignoring it made
+	// assertScreenshot compare the whole screen against a cropped baseline.
+	if step.CropOn != nil {
+		info, findErr := d.findElement(*step.CropOn, 0)
+		if findErr != nil || info == nil {
+			return errorResult(findErr, fmt.Sprintf("cropOn: element not found: %v", findErr))
+		}
+		sw, sh := d.client.ScreenSize()
+		cropped, cropErr := core.CropScreenshot(data, info.Bounds, sw, sh)
+		if cropErr != nil {
+			return errorResult(cropErr, fmt.Sprintf("cropOn: %v", cropErr))
+		}
+		data = cropped
+	}
+
 	return &core.CommandResult{
 		Success: true,
 		Message: "Screenshot captured",
@@ -1249,13 +1363,12 @@ func parsePercentageCoords(coord string) (float64, float64, error) {
 // permissions during install, and avoid using this step explicitly.
 func (d *Driver) grantPermissions(appID string, permissions map[string]string) {
 	if len(permissions) > 0 {
-		for perm := range permissions {
-			if _, err := d.client.ExecuteMobile("shell", map[string]interface{}{
-				"command": "pm",
-				"args":    []string{"grant", appID, perm},
-			}); err != nil {
-				logger.Warn("failed to grant permission %s to %s: %v", perm, appID, err)
-			}
+		// Same mapping as the setPermissions step: shortcuts (camera,
+		// location, …) expand to their Android names and deny revokes. The
+		// raw key used to go straight to `pm grant`, so a deny was granted and
+		// shortcuts named no real permission.
+		if res := d.setPermissions(&flow.SetPermissionsStep{AppID: appID, Permissions: permissions}); !res.Success {
+			logger.Warn("launchApp permissions for %s: %s", appID, res.Message)
 		}
 		return
 	}

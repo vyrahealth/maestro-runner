@@ -182,13 +182,14 @@ func TestSwipeCoordsForElement(t *testing.T) {
 	anchor := Bounds{X: 113, Y: 1401, Width: 856, Height: 77}
 	const screenW, screenH = 1080, 2340
 
-	t.Run("no point, no distance keeps anchor-sized travel", func(t *testing.T) {
-		_, startY, _, endY, err := SwipeCoordsForElement("up", anchor, screenW, screenH, 0, "")
+	t.Run("no point, no distance swipes from the centre to 10% of the screen, as Maestro", func(t *testing.T) {
+		startX, startY, endX, endY, err := SwipeCoordsForElement("up", anchor, screenW, screenH, 0, "")
 		if err != nil {
 			t.Fatalf("SwipeCoordsForElement() error = %v", err)
 		}
-		if travel := startY - endY; travel > 100 {
-			t.Errorf("travel = %d, want the anchor-sized default (~77px)", travel)
+		cx, cy := anchor.Center()
+		if startX != cx || startY != cy || endX != cx || endY != screenH/10 {
+			t.Errorf("got (%d,%d)->(%d,%d), want (%d,%d)->(%d,%d)", startX, startY, endX, endY, cx, cy, cx, screenH/10)
 		}
 	})
 
@@ -297,5 +298,45 @@ func TestPointInBounds(t *testing.T) {
 				t.Errorf("got (%d,%d), want (%d,%d)", x, y, tt.wantX, tt.wantY)
 			}
 		})
+	}
+}
+
+// Maestro's element swipe on both platforms: centre of the element to 10% / 90%
+// of the screen. A chat list whose bottom edge sits under a docked composer
+// used to start its swipe on the composer (#189); from the centre it starts on
+// the list.
+func TestSwipeCoordsToScreenEdge(t *testing.T) {
+	const w, h = 1080, 2400
+	list := Bounds{X: 0, Y: 300, Width: 1080, Height: 1900} // bottom edge at 2200
+	composer := Bounds{X: 0, Y: 2080, Width: 1080, Height: 200}
+	for _, tc := range []struct {
+		dir            string
+		sx, sy, ex, ey int
+	}{
+		{"up", 540, 1250, 540, 240},
+		{"down", 540, 1250, 540, 2160},
+		{"left", 540, 1250, 108, 1250},
+		{"right", 540, 1250, 972, 1250},
+	} {
+		sx, sy, ex, ey, err := SwipeCoordsToScreenEdge(tc.dir, list, w, h)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.dir, err)
+		}
+		if sx != tc.sx || sy != tc.sy || ex != tc.ex || ey != tc.ey {
+			t.Errorf("%s: got (%d,%d)->(%d,%d), want (%d,%d)->(%d,%d)", tc.dir, sx, sy, ex, ey, tc.sx, tc.sy, tc.ex, tc.ey)
+		}
+	}
+	_, sy, _, _, _ := SwipeCoordsToScreenEdge("up", list, w, h)
+	if sy >= composer.Y {
+		t.Errorf("swipe up starts at y=%d, on the composer (y>=%d)", sy, composer.Y)
+	}
+	if _, _, _, _, err := SwipeCoordsToScreenEdge("diagonal", list, w, h); err == nil {
+		t.Error("invalid direction: want an error")
+	}
+	// Without screen dimensions it keeps the in-bounds swipe.
+	sx, sy, ex, ey, _ := SwipeCoordsToScreenEdge("up", list, 0, 0)
+	wx, wy, wex, wey, _ := SwipeCoordsInBounds("up", list, 0, 0)
+	if sx != wx || sy != wy || ex != wex || ey != wey {
+		t.Errorf("no screen size: got (%d,%d)->(%d,%d), want the in-bounds swipe", sx, sy, ex, ey)
 	}
 }

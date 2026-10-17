@@ -50,7 +50,7 @@ func TestCreateIOSDriverAttachesToTheWDAOnTheDevicePort(t *testing.T) {
 	go func() { _ = srv.Serve(ln) }()
 	defer srv.Close()
 
-	driver, cleanup, err := CreateIOSDriver(&RunConfig{Devices: []string{attachUDID}, NoAppInstall: true, AppID: "ai.example.app"})
+	driver, cleanup, err := CreateIOSDriver(&RunConfig{Devices: []string{attachUDID}, Driver: "wda", NoAppInstall: true, AppID: "ai.example.app"})
 	if err != nil {
 		t.Fatalf("CreateIOSDriver: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestCreateIOSDriverAttachFailsWhenNoWDAAnswers(t *testing.T) {
 		_ = ln.Close() // nothing listens there now
 	}
 
-	_, _, err := CreateIOSDriver(&RunConfig{Devices: []string{attachUDID}, NoAppInstall: true, AppID: "ai.example.app"})
+	_, _, err := CreateIOSDriver(&RunConfig{Devices: []string{attachUDID}, Driver: "wda", NoAppInstall: true, AppID: "ai.example.app"})
 	if err == nil {
 		t.Fatal("CreateIOSDriver attached with no WDA answering")
 	}

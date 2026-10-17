@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -41,13 +42,18 @@ type iosDeviceInfo struct {
 // a device.
 var getIOSDeviceInfoFn = getIOSDeviceInfo
 
-// CreateIOSDriver creates an iOS driver using WebDriverAgent.
-// Exported for library use.
+// CreateIOSDriver creates the iOS driver cfg.Driver names. Exported for
+// library use.
 func CreateIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
-	// Phase 4 — devicelab driver branch. Mirrors --driver devicelab on Android.
-	// Routes to the XCUITest-based runner (pkg/driver/devicelab_ios) instead
-	// of WebDriverAgent. Simulator-only in Phase 4.
-	if strings.EqualFold(cfg.Driver, "devicelab") {
+	// The default is devicelab, the prebuilt devicelab-ios-agent
+	// (pkg/driver/devicelab_ios), on simulators and real iPhones.
+	// --driver wda selects WebDriverAgent. --driver devicelab-legacy is the
+	// previous runner built from source (pkg/driver/devicelab_ios_legacy),
+	// simulator-only.
+	switch iosDriverName(cfg.Driver) {
+	case "devicelab-legacy":
+		return createDevicelabLegacyIOSDriver(cfg)
+	case "devicelab":
 		return createDevicelabIOSDriver(cfg)
 	}
 
@@ -173,10 +179,12 @@ func CreateIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		appVersion, appBuild = readBundleVersionAndBuild(cfg.AppFile)
 	}
 
-	// 8. Get screen size
+	// 8. Get screen size (read again on first use if this read fails)
 	var screenW, screenH int
 	if w, h, err := client.WindowSize(); err == nil {
 		screenW, screenH = w, h
+	} else {
+		logger.Warn("WDA did not report the screen size at startup (read again when needed): %v", err)
 	}
 
 	platformInfo := &core.PlatformInfo{
@@ -697,6 +705,27 @@ func autoDetectIOSDevices(count int) ([]string, error) {
 	return devices, nil
 }
 
+// isIOSDeviceID reports whether id is an iOS simulator or a connected
+// iPhone, for a --device given without --platform. Only macOS has either.
+var isIOSDeviceID = func(id string) bool {
+	if runtime.GOOS != "darwin" || id == "" {
+		return false
+	}
+	if isIOSSimulator(id) {
+		return true
+	}
+	udids, err := listPhysicalIOSUDIDs()
+	if err != nil {
+		return false
+	}
+	for _, u := range udids {
+		if strings.EqualFold(u, id) {
+			return true
+		}
+	}
+	return false
+}
+
 // listPhysicalIOSUDIDs returns the UDIDs of every physical iOS device attached
 // over usbmux. Unlike findConnectedDevice it does not stop at the first one —
 // the `devices` command needs the whole list.
@@ -712,4 +741,15 @@ func listPhysicalIOSUDIDs() ([]string, error) {
 		}
 	}
 	return udids, nil
+}
+
+// iosDriverName returns the iOS driver a --driver value selects. Unset means
+// the iOS default, devicelab; "uiautomator2" is the Android driver and on iOS
+// is taken as unset too, as it always was.
+func iosDriverName(driver string) string {
+	d := strings.ToLower(driver)
+	if d == "" || d == "uiautomator2" {
+		return "devicelab"
+	}
+	return d
 }
