@@ -17,7 +17,7 @@ plugged into.
   when the fixes we need are released, and an upstream `main` commit when they are not;
   `<base>` names it the way `git describe --tags` does. `v1.1.27-vyra.1` sits on the `v1.1.27`
   release, `v1.1.27-57-gc985a19-vyra.1` to `vyra.12` on upstream `main` at `c985a19`, 57
-  commits later and not yet released, and `v1.1.29-vyra.1` (the current build) on the `v1.1.29`
+  commits later and not yet released, and `v1.1.29-vyra.1` and `vyra.2` (the current build) on the `v1.1.29`
   release. Tags are never moved.
 - **`vyra`** (the default branch) holds the current build's tree. The Vyra Health org keeps
   every default branch linear and changed only through pull requests, so `vyra` is never
@@ -43,7 +43,7 @@ driver is its own DeviceLab agent, so a run that wants them passes `--driver wda
 | `feat(wda): opt-in launch environment for every app launch` | `MAESTRO_WDA_LAUNCH_ENV='{"NAME":"value"}'` | Adds these variables to every launch of the app: the session's first launch and every `launchApp` after it (a flow's own `environment` wins). A Simulator can take such a variable from its launchd; a real device has no such place. Local StoreKit testing on a real iPhone needs the developer disk image's framework paths this way. |
 | `feat(wda): opt-in app whose screen is read while it is in front` | `MAESTRO_WDA_DEFAULT_ACTIVE_APP=<bundle id>` | Sets WebDriverAgent's `defaultActiveApplication`: while that app is in the foreground, lookups read its screen instead of the app under test's. The StoreKit payment sheet on iOS 27 is `com.apple.ServicesPaymentAngel`, a process of its own. Maestro reads whichever app is in the foreground. |
 | `feat(wda): opt-in auto-tap of permission prompts only` | `MAESTRO_WDA_PERMISSION_ALERTS_ONLY=1` | Drives WDA's alert monitor with `autoClickAlertSelector`: it taps a permission prompt's Allow or OK (or Don't Allow when denying) and nothing else. Without it WDA taps a matching button of any alert, in-app ones included, or the alert's last button. Maestro never taps an in-app alert. |
-| `feat(wda): opt-in attach to a WDA that is already running` | `MAESTRO_WDA_ATTACH=1` | Uses a WebDriverAgent something else started (go-ios's `runwda` on the machine the phone is plugged into, for one) and that `127.0.0.1:<port>` reaches: no WDA is built, started or stopped, and the run waits up to 30 s for its `/status`. The runner otherwise starts WDA only through `xcodebuild`, so without Xcode on the host this is the way to a physical iPhone. |
+| `feat(wda): opt-in attach to a WDA that is already running` | `MAESTRO_WDA_ATTACH=1` | Uses a WebDriverAgent something else started (go-ios's `runwda` on the machine the phone is plugged into, for one) and that `127.0.0.1:<port>` reaches: no WDA is built, started or stopped, the bound port is not read as "device in use" (with or without `--parallel`), and the run waits up to 30 s for its `/status`. The runner otherwise starts WDA only through `xcodebuild`, so without Xcode on the host this is the way to a physical iPhone. |
 | `fix(wda): clear a real device's app state without Xcode` | none | A `clearState` on a real device uninstalled and reinstalled the app through `xcrun devicectl`, which only a Mac has. Without devicectl it now uses go-ios's installation proxy and zip conduit over usbmuxd, neither of which needs the iOS 17+ tunnel. A Mac with Xcode is unchanged. |
 | `feat(wda): opt-in dismissal of a system alert that covers the app` | `MAESTRO_WDA_DISMISS_SYSTEM_ALERTS=1` | Looks once for an alert SpringBoard shows over the app, such as "FaceTime App Required", at the start of each flow and when a step fails to find its element, and at no other time. Lookups read only the app's view tree, so such an alert was invisible to the run and took every touch, in that flow and the flows after it. It is dismissed only with a button whose whole label is Cancel, Not Now, Close, Later, Dismiss, Remind Me Later or Ignore, and never when its text mentions trust, a password or passcode, an Apple ID or Apple Account, signing in, allowing, paying, buying, a purchase, subscribing, deleting, erasing, an update or an install, so permission prompts stay with the permission handling. The failed step then runs once more. A flow dismisses at most three; each is a console warning and a `systemAlerts` entry in the flow's report and on the step's command, and an alert left alone is named in the step's error. WDA's alert monitor cannot do this, as it would tap Cancel on the app's own dialogs too: for the look WDA reads SpringBoard alone (`defaultActiveApplication`, `respectSystemAlerts`), no alert is read unless WDA reports SpringBoard as the app it reads, and the session goes back to the app under test afterwards, even when the look fails. The tap is a click on the alert's button, never WDA's `/alert/dismiss`, which taps whatever alert is up when it arrives: the alert is read again just before it and must keep its title, one class chain query must find exactly one such button on an alert of that title, and the click fails as a stale element if the alert has gone by then. |
 | `feat(wda): opt-in correction of frames inside a view another process hosts` | `MAESTRO_WDA_HOSTED_FRAMES=1` | On iOS 27 XCUITest reports the elements of a view that another process hosts in that view's own coordinates. Apple Health's permission sheet is one: it sits 48 points down the screen and everything in it read 48 points too high, so every tap on it landed above its target, whether a page-source tap, a WDA rect tap or XCUITest's own element click. With the switch a page source's frames are corrected where such a space starts, at a child at (0,0) with its parent's size inside a parent that is not at the origin: that child and everything under it move by the parent's origin. Only lookups through the page source see it. A selector WDA answers with a query of its own (plain text, or an id whose regex matches only itself, such as `UIA.Health.Allow.Button`) still gets WDA's rect, so a flow reaches such a view with a regex text or an id with its dots escaped (`UIA\.Health\.Allow\.Button`). A table cell that is off screen reports its children's frames relative to the cell, and those are not corrected, so a flow scrolls the cell into view first. |
@@ -63,6 +63,7 @@ driver is its own DeviceLab agent, so a run that wants them passes `--driver wda
 | `fix(wda): the crash-loop latch ends with its flow, and ignores transport errors` | Four quick "app died" errors failed every later step of every later flow in the run, and dropped connections counted as the app dying. |
 | `fix(wda): a lookup looks at the screen once, whatever time is left` | Maestro always makes one attempt; the lookup checked its deadline first, so a condition with no budget left could be judged without a look. |
 | `refactor(wda): name the swipe clamp after Maestro's coerceIn` | A rename. |
+| `feat(telemetry): no usage event unless MAESTRO_RUNNER_TELEMETRY is set` | Since 1.1.29 upstream's `test` sends one anonymous usage event per run to devicelab by default. Vyra has no agreement with that endpoint, so the fork sends nothing unless `MAESTRO_RUNNER_TELEMETRY` is set; `DO_NOT_TRACK` and `MAESTRO_RUNNER_NO_TELEMETRY` still turn it off. |
 
 Upstream has these since 1.1.29, so the series no longer carries them: a script file run as
 written, launchApp stopping a running app first, a read or lookup sent again when its connection
@@ -115,7 +116,7 @@ From a checkout of a `v*-vyra.*` tag (Go 1.25 or later), so the binary names its
 
 ```bash
 M=github.com/devicelab-dev/maestro-runner/pkg/cli
-V=1.1.29+vyra.1  # the tag without its leading v, with + before "vyra"
+V=1.1.29+vyra.2  # the tag without its leading v, with + before "vyra"
 go build -trimpath -o bin/maestro-runner \
   -ldflags "-s -w -X $M.Version=$V -X $M.Commit=$(git rev-parse --short HEAD) -X $M.BuildDate=$(date -u +%F)" .
 ```
@@ -138,7 +139,7 @@ A new upstream base, a new patch, or both, start from the current build's tag:
 ```bash
 git fetch upstream --tags && git fetch origin --tags
 gh repo sync vyrahealth/maestro-runner --branch main    # main catches up with upstream
-git switch -c series/v1.1.30 v1.1.29-vyra.1
+git switch -c series/v1.1.30 v1.1.29-vyra.2
 git rebase --onto v1.1.30 v1.1.29     # v1.1.29: the base the series sits on now
 # add or drop patches here, one commit each
 # test it as Testing, above, says: not a bare go test ./...
