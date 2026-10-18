@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
 	"github.com/devicelab-dev/maestro-runner/pkg/flow"
@@ -77,5 +78,59 @@ func TestLaunchAppArgumentsStillStopTheApp(t *testing.T) {
 	got := strings.Join(launchWithSession(t, step), ",")
 	if got != "terminate,launch" {
 		t.Fatalf("lifecycle calls %q, want terminate,launch", got)
+	}
+}
+
+// launchFailing runs launchApp against a WDA whose launch answers "unknown to
+// FrontBoard" the first `unknown` times, and returns the launches it got.
+func launchFailing(t *testing.T, unknown int) (int, *core.CommandResult) {
+	t.Helper()
+	old := unknownAppWait
+	unknownAppWait = time.Millisecond
+	t.Cleanup(func() { unknownAppWait = old })
+	var mu sync.Mutex
+	launches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		defer mu.Unlock()
+		if strings.HasSuffix(r.URL.Path, "/wda/apps/launch") {
+			launches++
+			if launches <= unknown {
+				w.WriteHeader(http.StatusInternalServerError)
+				jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{"error": "unknown error",
+					"message": `The request to open "com.test.app" failed. Application "com.test.app" is unknown to FrontBoard.`}})
+				return
+			}
+		}
+		jsonResponse(w, map[string]interface{}{"value": nil})
+	}))
+	defer server.Close()
+	client := &Client{baseURL: server.URL, httpClient: http.DefaultClient, sessionID: "test-session"}
+	driver := &Driver{client: client, info: &core.PlatformInfo{Platform: "ios"}}
+	result := driver.launchApp(&flow.LaunchAppStep{AppID: "com.test.app"})
+	return launches, result
+}
+
+// Right after a reinstall iOS may not know the app yet: the launch is sent
+// again once, and the step passes.
+func TestLaunchAppAgainWhenIOSDoesNotKnowTheAppYet(t *testing.T) {
+	launches, result := launchFailing(t, 1)
+	if !result.Success {
+		t.Fatalf("launchApp failed: %s", result.Message)
+	}
+	if launches != 2 {
+		t.Errorf("%d launches, want 2", launches)
+	}
+}
+
+// An app that really is not there fails after the one extra launch.
+func TestLaunchAppStillFailsWhenTheAppIsNotThere(t *testing.T) {
+	launches, result := launchFailing(t, 99)
+	if result.Success {
+		t.Fatal("launchApp passed with the app unknown every time")
+	}
+	if launches != 2 {
+		t.Errorf("%d launches, want 2", launches)
 	}
 }

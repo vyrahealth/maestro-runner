@@ -261,3 +261,42 @@ func TestTimedScrollUntilVisibleScrollsLikeMaestro(t *testing.T) {
 		}
 	}
 }
+
+// Without the switch, scrollUntilVisible scrolls as upstream's v1.1.29 does:
+// the runner's scroll, from the middle (195, 422) to 10% or 90% of the screen
+// uncut (84.4, 759.6), resting 300 ms unless a `speed:` sets the rest. It must
+// not pick up the timed swipe's points or Maestro's 601 ms default.
+func TestScrollUntilVisibleWithoutTheSwitchIsUpstreamsScroll(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_TIMED_SWIPE", "")
+	cases := []struct {
+		direction string
+		speed     int
+		want      [4]float64
+		ms        float64
+	}{
+		{"down", 0, [4]float64{195, 422, 195, 84.4}, 300},
+		{"up", 0, [4]float64{195, 422, 195, 759.6}, 300},
+		{"right", 0, [4]float64{195, 422, 39, 422}, 300},
+		{"down", 40, [4]float64{195, 422, 195, 84.4}, 601},
+	}
+	for _, c := range cases {
+		log := &gestureLog{source: fmt.Sprintf(cardSource, 644), after: fmt.Sprintf(cardSource, 200)}
+		server := swipeServer(t, log)
+		result := createTestDriver(server).scrollUntilVisible(&flow.ScrollUntilVisibleStep{
+			Element: flow.Selector{Text: "Card"}, Direction: c.direction, Speed: c.speed,
+		})
+		server.Close()
+		if !result.Success {
+			t.Fatalf("%s at speed %d: step failed: %s", c.direction, c.speed, result.Message)
+		}
+		if strings.Join(log.paths, ",") != "actions" {
+			t.Fatalf("%s: gesture endpoints %v, want one W3C gesture", c.direction, log.paths)
+		}
+		if got := gesturePoints(t, log.body); got != c.want {
+			t.Errorf("%s: scroll %v, want upstream's %v", c.direction, got, c.want)
+		}
+		if got := swipeDuration(t, log.body); got != c.ms {
+			t.Errorf("%s at speed %d: rest %v ms, want upstream's %v", c.direction, c.speed, got, c.ms)
+		}
+	}
+}

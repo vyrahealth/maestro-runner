@@ -87,3 +87,28 @@ func TestCreateIOSDriverAttachFailsWhenNoWDAAnswers(t *testing.T) {
 		t.Fatalf("the error does not say the attach found no WDA on port %d: %v", port, err)
 	}
 }
+
+// --parallel checks every device before it starts any: with MAESTRO_WDA_ATTACH the attached WDA's
+// port is bound on purpose, so it is not "device in use" there either. Without the switch it is.
+func TestCheckDeviceAvailableAttachIgnoresTheBoundWDAPort(t *testing.T) {
+	port := wdadriver.PortFromUDID(attachUDID)
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Skipf("port %d is taken here: %v", port, err)
+	}
+	defer ln.Close()
+
+	t.Setenv("MAESTRO_WDA_EXTERNAL_FORWARD", "")
+	t.Setenv("MAESTRO_WDA_ATTACH", "")
+	if err := checkDeviceAvailable(attachUDID, "ios"); err == nil {
+		t.Fatalf("without MAESTRO_WDA_ATTACH a bound port %d is not reported as in use", port)
+	}
+
+	t.Setenv("MAESTRO_WDA_ATTACH", "1")
+	if err := checkDeviceAvailable(attachUDID, "ios"); err != nil {
+		t.Fatalf("with MAESTRO_WDA_ATTACH the attached WDA's port reads as in use: %v", err)
+	}
+	if err := validateDevicesAvailable([]string{attachUDID}, "ios"); err != nil {
+		t.Fatalf("with MAESTRO_WDA_ATTACH --parallel refuses the device: %v", err)
+	}
+}
