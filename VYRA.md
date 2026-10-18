@@ -63,6 +63,7 @@ driver is its own DeviceLab agent, so a run that wants them passes `--driver wda
 | `fix(wda): the crash-loop latch ends with its flow, and ignores transport errors` | Four quick "app died" errors failed every later step of every later flow in the run, and dropped connections counted as the app dying. |
 | `fix(wda): a lookup looks at the screen once, whatever time is left` | Maestro always makes one attempt; the lookup checked its deadline first, so a condition with no budget left could be judged without a look. |
 | `refactor(wda): name the swipe clamp after Maestro's coerceIn` | A rename. |
+| `feat(telemetry): no usage event unless MAESTRO_RUNNER_TELEMETRY is set` | Since 1.1.29 upstream's `test` sends one anonymous usage event per run to devicelab by default. Vyra has no agreement with that endpoint, so the fork sends nothing unless `MAESTRO_RUNNER_TELEMETRY` is set; `DO_NOT_TRACK` and `MAESTRO_RUNNER_NO_TELEMETRY` still turn it off. |
 
 Upstream has these since 1.1.29, so the series no longer carries them: a script file run as
 written, launchApp stopping a running app first, a read or lookup sent again when its connection
