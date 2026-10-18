@@ -21,6 +21,7 @@ type touchServer struct {
 	class     string
 	log       []string
 	actions   map[string]interface{}
+	failTouch bool // the actions request fails as a lost session does
 }
 
 func (f *touchServer) start(t *testing.T) *httptest.Server {
@@ -51,6 +52,11 @@ func (f *touchServer) start(t *testing.T) *httptest.Server {
 		case strings.HasSuffix(p, "/actions"):
 			f.log = append(f.log, "actions")
 			_ = json.NewDecoder(r.Body).Decode(&f.actions)
+			if f.failTouch {
+				w.WriteHeader(http.StatusNotFound)
+				jsonResponse(w, map[string]interface{}{"value": map[string]interface{}{"error": "invalid session id", "message": "Session does not exist"}})
+				return
+			}
 			jsonResponse(w, map[string]interface{}{"value": nil})
 		default:
 			jsonResponse(w, map[string]interface{}{"value": nil})
@@ -134,16 +140,36 @@ func TestCoordinateTapOnATextField(t *testing.T) {
 	}
 }
 
-// Without the switch the element is clicked, as before.
-func TestElementTapClicksWithoutTheSwitch(t *testing.T) {
+// Without the switch the element gets WDA's coordinate tap, upstream's
+// default since 1.1.29, and no click.
+func TestElementTapIsWDAsCoordinateTapWithoutTheSwitch(t *testing.T) {
 	t.Setenv("MAESTRO_WDA_COORDINATE_TAP", "")
 	f := &touchServer{rect: rectOf(100, 400, 80, 40), displayed: true}
 	d := createTestDriver(f.start(t))
 	if res := d.Execute(&flow.TapOnStep{Selector: flow.Selector{ID: "go"}}); !res.Success {
 		t.Fatalf("tap failed: %s", res.Message)
 	}
-	if got := strings.Join(f.log, ","); got != "click" {
-		t.Errorf("requests %s, want the click alone", got)
+	if got := strings.Join(f.log, ","); got != "tap" {
+		t.Errorf("requests %s, want WDA's coordinate tap alone", got)
+	}
+}
+
+// With the switch the touch is the only try, so when WDA refuses it the step
+// fails with WDA's own error (here a lost session), which the crash-loop latch
+// and the flow author both read, and nothing else is sent.
+func TestCoordinateTapFailsWithWDAsError(t *testing.T) {
+	t.Setenv("MAESTRO_WDA_COORDINATE_TAP", "1")
+	f := &touchServer{rect: rectOf(100, 400, 80, 40), displayed: true, failTouch: true}
+	d := createTestDriver(f.start(t))
+	res := d.Execute(&flow.TapOnStep{Selector: flow.Selector{ID: "go"}})
+	if res.Success {
+		t.Fatal("the tap passed with the touch refused")
+	}
+	if res.Error == nil || !strings.Contains(res.Error.Error(), "Session does not exist") {
+		t.Errorf("error = %v, want WDA's own", res.Error)
+	}
+	if got := strings.Join(f.log, ","); got != "actions" {
+		t.Errorf("requests %s, want the touch alone", got)
 	}
 }
 

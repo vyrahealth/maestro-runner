@@ -140,12 +140,37 @@ func SwipeCoordsFromBounds(direction string, b Bounds, screenW, screenH int, dis
 	}
 }
 
+// SwipeCoordsToScreenEdge is Maestro's element swipe, on Android and iOS alike:
+// from the element's centre to 10% of the screen (up, left) or 90% of it (down,
+// right). SwipeCoordsInBounds started near the element's edge instead, so on a
+// chat list whose bottom edge sat under a docked composer the swipe began on the
+// composer and the list never scrolled (#189). Without screen dimensions it
+// falls back to SwipeCoordsInBounds.
+func SwipeCoordsToScreenEdge(direction string, b Bounds, screenW, screenH int) (startX, startY, endX, endY int, err error) {
+	if screenW <= 0 || screenH <= 0 {
+		return SwipeCoordsInBounds(direction, b, screenW, screenH)
+	}
+	cx, cy := b.Center()
+	switch direction {
+	case "up":
+		return cx, cy, cx, screenH / 10, nil
+	case "down":
+		return cx, cy, cx, screenH * 9 / 10, nil
+	case "left":
+		return cx, cy, screenW / 10, cy, nil
+	case "right":
+		return cx, cy, screenW * 9 / 10, cy, nil
+	default:
+		return 0, 0, 0, 0, fmt.Errorf("invalid swipe direction: %q", direction)
+	}
+}
+
 // SwipeCoordsForElement resolves start/end coordinates for `swipe: from: <element>`,
 // applying both element-relative knobs in one place.
 //
 //   - point ("x%, y%", may be empty) moves where inside the element the swipe
-//     STARTS. Empty keeps the historic origin — an edge for the default travel,
-//     the centre once a distance is given.
+//     STARTS. Empty starts at the centre: to 10%/90% of the screen by default
+//     (Maestro's element swipe), or distance × the screen once one is given.
 //   - distance (0 = unset) switches travel from the element's own size to that
 //     fraction of the screen.
 //
@@ -161,7 +186,7 @@ func SwipeCoordsForElement(
 		if distance > 0 {
 			return SwipeCoordsFromBounds(direction, b, screenW, screenH, distance)
 		}
-		return SwipeCoordsInBounds(direction, b, screenW, screenH)
+		return SwipeCoordsToScreenEdge(direction, b, screenW, screenH)
 	}
 
 	dx, dy, perr := ParsePointCoords(point, b.Width, b.Height)

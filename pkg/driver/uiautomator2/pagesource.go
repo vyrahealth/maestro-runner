@@ -219,7 +219,79 @@ func FilterBySelector(elements []*ParsedElement, sel flow.Selector) []*ParsedEle
 		result = append(result, elem)
 	}
 
-	return result
+	result = preferExactID(result, sel.ID)
+	result = preferExactText(result, sel)
+	return preferExactCase(result, sel.Text, func(e *ParsedElement) []string { return regexTextsOf(e) })
+}
+
+// preferExactID keeps only the matches whose whole id matches the selector —
+// the full resource-id or the part after the last "/", as Maestro matches ids —
+// when there are any. The substring match otherwise lets a superset id win:
+// `omnibarTextInput|inputField` also hits the empty
+// `omnibarTextInputClickCatcher` overlay, and copyTextFrom copied nothing.
+// With no whole-id match the lenient set is kept.
+func preferExactID(elems []*ParsedElement, id string) []*ParsedElement {
+	if id == "" || len(elems) < 2 {
+		return elems
+	}
+	re, err := regexp.Compile(`(?i)\A(?:` + id + `)\z`)
+	if err != nil {
+		return elems
+	}
+	var exact []*ParsedElement
+	for _, e := range elems {
+		short := e.ResourceID[strings.LastIndex(e.ResourceID, "/")+1:]
+		if re.MatchString(e.ResourceID) || re.MatchString(short) {
+			exact = append(exact, e)
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	return elems
+}
+
+// preferExactText narrows survivors to those whose text matches the literal
+// pattern exactly, when any of them do.
+//
+// Added when literal text matched by contains, so `text: "0"` resolved to a
+// price field reading "7000.00" ahead of the switch whose text is exactly "0"
+// (#161). Text now matches whole, as in Maestro (#188), so "0" no longer
+// matches "7000.00" at all; this still puts an exact value ahead of one a
+// dotted or line-wrapped selector matches only as a regex.
+//
+// Applied AFTER the full selector has been satisfied, never instead of it. An
+// exact text match that skipped the rest of the selector would return an
+// element with the right text and the wrong id — the OR behaviour removed in
+// #157/#158/#160. Reported by @nt-ben-leblond (#161).
+func preferExactText(matches []*ParsedElement, sel flow.Selector) []*ParsedElement {
+	if sel.Text == "" || looksLikeRegex(sel.Text) || len(matches) < 2 {
+		return matches
+	}
+	var exact []*ParsedElement
+	for _, elem := range matches {
+		if equalsAny(sel.Text, elem.Text, elem.ContentDesc, elem.HintText) {
+			exact = append(exact, elem)
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	return matches
+}
+
+// equalsAny reports whether pattern equals any of the candidate strings,
+// ignoring case as Maestro's text matching does.
+func equalsAny(pattern string, candidates ...string) bool {
+	if pattern == "" {
+		return false
+	}
+	for _, c := range candidates {
+		if strings.EqualFold(c, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesSelector(elem *ParsedElement, sel flow.Selector) bool {
@@ -279,76 +351,22 @@ func withinTolerance(actual, expected, tolerance int) bool {
 	return diff <= tolerance
 }
 
-// matchesID checks if an ID pattern matches the given resource ID.
-// Always tries regex matching first; falls back to substring contains on compile error.
+// matchesID reports whether an id selector matches a resource id as Maestro's
+// idMatches does: a case-insensitive regex over the whole id, or over the part
+// after its package prefix. `id: login` is "com.app:id/login", not
+// "com.app:id/login_button" (#188); `id: Flatlist` finds "FlatList".
 func matchesID(pattern, id string) bool {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return strings.Contains(id, pattern)
-	}
-	return re.MatchString(id)
+	return core.MatchesIDMaestro(pattern, id)
 }
 
-// matchesText checks if pattern matches the element's text, content-desc, or hint.
-// If pattern looks like a regex (contains metacharacters), use regex matching.
-// Otherwise, use case-insensitive contains matching.
-// This matches Maestro's behavior: it checks text, hintText, and accessibilityText.
+// matchesText reports whether a text selector matches the element's text,
+// content-desc or hint, as Maestro's textMatches does: the selector is a
+// case-insensitive regex that must match a whole value, so "Open" is not
+// "Talk · Open" and "English" is not "Language: English" (#188); a partial
+// match is written `.*Open.*`. When several elements match, FilterBySelector
+// puts the ones matching in the pattern's own case first (#151).
 func matchesText(pattern, text, contentDesc, hintText string) bool {
-	// Check if pattern looks like a regex
-	if looksLikeRegex(pattern) {
-		// Case-sensitive, deliberately. Compiling with (?i) meant an anchored
-		// pattern could not distinguish what it was written to distinguish:
-		// `^SIGN OUT$` matched a "Sign out" row as readily as the "SIGN OUT"
-		// button, and whichever came first in the page source won (#151).
-		// Maestro matches regex selectors case-sensitively, and a flow written
-		// against it has to behave the same here.
-		//
-		// Plain text selectors are untouched — they are not regexes, and fall
-		// to the case-insensitive contains path below.
-		re, err := regexp.Compile(pattern)
-		if err != nil {
-			// Invalid regex - fall back to literal matching
-			return containsIgnoreCase(text, pattern) ||
-				containsIgnoreCase(contentDesc, pattern) ||
-				containsIgnoreCase(hintText, pattern)
-		}
-
-		// Match against text (with newline stripping like Maestro)
-		if text != "" {
-			strippedText := strings.ReplaceAll(text, "\n", " ")
-			if re.MatchString(text) || re.MatchString(strippedText) || pattern == text || pattern == strippedText {
-				return true
-			}
-		}
-
-		// Match against content-desc (accessibility text)
-		if contentDesc != "" {
-			strippedDesc := strings.ReplaceAll(contentDesc, "\n", " ")
-			if re.MatchString(contentDesc) || re.MatchString(strippedDesc) || pattern == contentDesc || pattern == strippedDesc {
-				return true
-			}
-		}
-
-		// Match against hint text
-		if hintText != "" {
-			strippedHint := strings.ReplaceAll(hintText, "\n", " ")
-			if re.MatchString(hintText) || re.MatchString(strippedHint) || pattern == hintText || pattern == strippedHint {
-				return true
-			}
-		}
-
-		return false
-	}
-
-	// Literal text - case-insensitive contains
-	return containsIgnoreCase(text, pattern) ||
-		containsIgnoreCase(contentDesc, pattern) ||
-		containsIgnoreCase(hintText, pattern)
-}
-
-// containsIgnoreCase checks if s contains substr (case-insensitive).
-func containsIgnoreCase(s, substr string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+	return core.MatchesTextMaestro(pattern, text, contentDesc, hintText)
 }
 
 // Position filter functions
@@ -423,11 +441,11 @@ func FilterRightOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedEl
 
 // FilterChildOf returns elements that are children of anchor.
 func FilterChildOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElement {
-	// Element must be fully inside anchor bounds
+	// Element must be a descendant of anchor in the element tree (not merely inside its bounds).
 	var result []*ParsedElement
 
 	for _, elem := range elements {
-		if isInside(elem.Bounds, anchor.Bounds) {
+		if isDescendantOf(elem, anchor) {
 			result = append(result, elem)
 		}
 	}
@@ -437,15 +455,39 @@ func FilterChildOf(elements []*ParsedElement, anchor *ParsedElement) []*ParsedEl
 
 // FilterContainsChild returns elements that contain anchor as child.
 func FilterContainsChild(elements []*ParsedElement, anchor *ParsedElement) []*ParsedElement {
+	// Element must be an ancestor of anchor in the element tree (not merely enclose its bounds).
 	var result []*ParsedElement
 
 	for _, elem := range elements {
-		if isInside(anchor.Bounds, elem.Bounds) {
+		if anchor.Parent == nil && len(anchor.Children) == 0 {
+			if isInside(anchor.Bounds, elem.Bounds) {
+				result = append(result, elem)
+			}
+			continue
+		}
+		if isDescendantOf(anchor, elem) {
 			result = append(result, elem)
 		}
 	}
 
 	return result
+}
+
+// isDescendantOf reports whether elem sits under anchor in the parsed element tree, which is what
+// Maestro's childOf means. A position check alone also matches elements that merely lie inside the
+// anchor's rectangle, such as list rows behind an overlay that covers them, and turns a failing
+// assertion into a pass. Anchors rebuilt from a relative selector carry no tree links; for those,
+// fall back to bounds containment.
+func isDescendantOf(elem, anchor *ParsedElement) bool {
+	if anchor.Parent == nil && len(anchor.Children) == 0 {
+		return isInside(elem.Bounds, anchor.Bounds)
+	}
+	for p := elem.Parent; p != nil; p = p.Parent {
+		if p == anchor {
+			return true
+		}
+	}
+	return false
 }
 
 // FilterInsideOf returns elements whose center point is inside anchor bounds.
@@ -572,7 +614,7 @@ func DeepestMatchingElement(elements []*ParsedElement) *ParsedElement {
 func SelectByIndex(candidates []*ParsedElement, index string) *ParsedElement {
 	if index != "" {
 		idx := 0
-		if i, err := strconv.Atoi(index); err == nil {
+		if i, err := core.ParseIndex(index); err == nil {
 			if i < 0 {
 				i = len(candidates) + i
 			}
@@ -675,4 +717,40 @@ func matchesErrorText(pattern, errorText string) bool {
 		return false
 	}
 	return matchesText(pattern, errorText, "", "")
+}
+
+// preferExactCase puts the elements a regex text selector matches in its own
+// case ahead of those it matches only when case is ignored, keeping order
+// otherwise. Plain text and single matches are returned unchanged.
+func preferExactCase(elems []*ParsedElement, pattern string, textsOf func(*ParsedElement) []string) []*ParsedElement {
+	if len(elems) < 2 || !looksLikeRegex(pattern) {
+		return elems
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return elems
+	}
+	var exact, rest []*ParsedElement
+	for _, e := range elems {
+		if anyMatches(re, textsOf(e)) {
+			exact = append(exact, e)
+		} else {
+			rest = append(rest, e)
+		}
+	}
+	return append(exact, rest...)
+}
+
+func anyMatches(re *regexp.Regexp, texts []string) bool {
+	for _, t := range texts {
+		if t != "" && (re.MatchString(t) || re.MatchString(strings.ReplaceAll(t, "\n", " "))) {
+			return true
+		}
+	}
+	return false
+}
+
+// regexTextsOf lists the attributes a text selector is matched against.
+func regexTextsOf(e *ParsedElement) []string {
+	return []string{e.Text, e.ContentDesc, e.HintText}
 }

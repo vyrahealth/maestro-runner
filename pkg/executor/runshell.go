@@ -95,8 +95,8 @@ func (fr *FlowRunner) shellEnv(stepEnv map[string]string) []string {
 	}
 
 	device := fr.config.Device
-	if device.ID != "" {
-		env = append(env, "MAESTRO_DEVICE_ID="+device.ID)
+	if id := fr.deviceID(); id != "" {
+		env = append(env, "MAESTRO_DEVICE_ID="+id)
 	}
 	if device.Platform != "" {
 		env = append(env, "MAESTRO_PLATFORM="+device.Platform)

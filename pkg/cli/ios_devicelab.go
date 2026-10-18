@@ -2,28 +2,23 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
-	dliosdriver "github.com/devicelab-dev/maestro-runner/pkg/driver/devicelab_ios"
+	dlios "github.com/devicelab-dev/maestro-runner/pkg/driver/devicelab_ios"
 	"github.com/devicelab-dev/maestro-runner/pkg/flutter"
 	"github.com/devicelab-dev/maestro-runner/pkg/logger"
 )
 
-// createDevicelabIOSDriver constructs an iOS driver backed by the
-// devicelab-ios-runner XCUITest server. Phase 4 supports simulator only.
-//
-// Lifecycle:
-//  1. Resolve a booted iOS simulator UDID
-//  2. Optionally install the AUT app (cfg.AppFile)
-//  3. Resolve the runner artifacts directory (env var or dev default)
-//  4. Launch the runner via devicelab_ios.Setup
-//  5. Query the runner for screen size to populate PlatformInfo
-//  6. Build and return the Driver + cleanup
+// createDevicelabIOSDriver constructs the default iOS driver (--driver devicelab):
+// the prebuilt devicelab-ios-agent (drivers/ios/devicelab-ios-agent/) on a
+// booted simulator. The agent stays up between runs; a later run re-attaches
+// to it instead of starting it again. A physical iPhone goes to
+// createDevicelabIOSDeviceDriver.
 func createDevicelabIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 	udid := getFirstDevice(cfg)
 	if udid == "" {
@@ -31,13 +26,20 @@ func createDevicelabIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		var err error
 		udid, err = findBootedSimulator()
 		if err != nil || udid == "" {
-			return nil, nil, fmt.Errorf("devicelab iOS driver requires a booted simulator (Phase 4 does not support real devices yet)")
+			// No simulator booted: a connected iPhone, as the WDA path does.
+			if dev, derr := findConnectedDevice(); derr == nil && dev != "" {
+				printSetupSuccess(fmt.Sprintf("Found device: %s", dev))
+				return createDevicelabIOSDeviceDriver(cfg, dev)
+			}
+			return nil, nil, fmt.Errorf("no iOS device found: boot a simulator or connect an iPhone (--driver devicelab, the iOS default)")
 		}
 		printSetupSuccess(fmt.Sprintf("Found simulator: %s", udid))
 	}
-
 	if !isIOSSimulator(udid) {
-		return nil, nil, fmt.Errorf("devicelab iOS driver only supports simulators in Phase 4; %s appears to be a physical device", udid)
+		return createDevicelabIOSDeviceDriver(cfg, udid)
+	}
+	if err := waitForSimulatorBoot(udid, simulatorBootWait); err != nil {
+		return nil, nil, err
 	}
 
 	if cfg.AppFile != "" && !cfg.NoAppInstall {
@@ -48,70 +50,34 @@ func createDevicelabIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		printSetupSuccess("App installed")
 	}
 
-	// $DEVICELAB_IOS_RUNNER_ARTIFACTS_DIR overrides the bundled-source path
-	// for local development (point at a derived-data dir built manually).
-	// Otherwise: build from the vendored source on first run, cache for
-	// subsequent runs (same UX as the WDA driver).
+	// Before the agent and the app start, so both launch with them.
+	dlios.ApplySimulatorPrefs(udid)
+
 	ctx := context.Background()
-	artifactsDir := os.Getenv("DEVICELAB_IOS_RUNNER_ARTIFACTS_DIR")
-	if artifactsDir == "" {
-		var err error
-		printSetupStep("Resolving devicelab iOS runner build...")
-		artifactsDir, err = dliosdriver.EnsureBuilt(ctx, udid)
-		if err != nil {
-			return nil, nil, fmt.Errorf("devicelab iOS runner: %w", err)
-		}
-		printSetupSuccess(fmt.Sprintf("Runner build: %s", filepath.Base(artifactsDir)))
-	} else if _, err := os.Stat(filepath.Join(artifactsDir, "Build/Products")); err != nil {
-		return nil, nil, fmt.Errorf("DEVICELAB_IOS_RUNNER_ARTIFACTS_DIR points at %s but no Build/Products dir is present", artifactsDir)
-	}
-
-	printSetupStep("Starting devicelab iOS runner...")
-	logger.Info("Launching devicelab-ios-runner from %s on simulator %s", artifactsDir, udid)
-	logger.Info("Runner log: %s", filepath.Join(artifactsDir, "logs", "runner.log"))
-
-	client, runner, err := dliosdriver.Setup(ctx, dliosdriver.SetupOptions{
-		ArtifactsDir:  artifactsDir,
-		SimulatorUDID: udid,
-		// CI macos-latest can take several minutes to spin up an XCTest
-		// runner via xcodebuild test-without-building (we've seen >250s
-		// on successful startups under load). 600s matches upstream
-		// maestro's MAESTRO_DRIVER_STARTUP_TIMEOUT default — sized for
-		// the slowest CI path. Local runs answer the uptime ping well
-		// before the timeout so they pay nothing for the larger budget.
-		ReadyTimeout: 600 * time.Second,
-	})
+	printSetupStep("Starting devicelab iOS agent...")
+	agent, client, err := dlios.StartAgent(ctx, dlios.AgentOptions{UDID: udid, ReadyTimeout: 600 * time.Second})
 	if err != nil {
-		return nil, nil, fmt.Errorf("runner setup failed: %w", err)
+		return nil, nil, fmt.Errorf("devicelab iOS agent: %w", err)
 	}
-	printSetupSuccess(fmt.Sprintf("Runner port: %d", runner.Port()))
+	printSetupSuccess(fmt.Sprintf("Agent ready on port %d (%s)", agent.Port(), agent.Mode()))
+	release := func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		agent.Release(stopCtx, client)
+	}
 
 	deviceInfo, err := getIOSDeviceInfo(udid)
 	if err != nil {
-		_ = dliosdriver.GracefulShutdown(ctx, client, runner)
+		release()
 		return nil, nil, fmt.Errorf("get device info: %w", err)
 	}
 
-	// Query the interaction frame from the runner — that gives the
-	// reference width/height of the host's canvas (no appBundleId, so the
-	// runner falls back to its own host app rather than trying to
-	// activate cfg.AppID which may be an unexpanded `${APP_ID}` template).
-	// Best-effort; PlatformInfo can ship with zeros if this fails.
-	var screenW, screenH int
-	if data, err := client.Call(ctx, dliosdriver.Command{
-		Command: dliosdriver.CmdInteractionFrame,
-	}); err == nil && data != nil {
-		if data.ReferenceWidth != nil {
-			screenW = int(*data.ReferenceWidth)
-		}
-		if data.ReferenceHeight != nil {
-			screenH = int(*data.ReferenceHeight)
-		}
+	// Screen size in points from the agent's own view of the display.
+	screenW, screenH := 0, 0
+	if resp, err := client.Call(ctx, "snapshot", &dlios.Args{MaxNodes: 1}); err == nil && resp.Data != nil {
+		screenW, screenH = int(resp.Data.ScreenW), int(resp.Data.ScreenH)
 	}
 
-	// Read the app's version and build number the same way the wda path does.
-	// cfg.AppID can still be an unexpanded ${APP_ID} template here, in which
-	// case the lookup simply finds nothing and the report says so.
 	appVersion, appBuild := "", ""
 	if cfg.AppID != "" {
 		appVersion, appBuild = getIOSAppVersionAndBuild(udid, cfg.AppID)
@@ -120,7 +86,7 @@ func createDevicelabIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		appVersion, appBuild = readBundleVersionAndBuild(cfg.AppFile)
 	}
 
-	platformInfo := &core.PlatformInfo{
+	info := &core.PlatformInfo{
 		Platform:     "ios",
 		OSVersion:    deviceInfo.OSVersion,
 		DeviceName:   deviceInfo.Name,
@@ -133,38 +99,99 @@ func createDevicelabIOSDriver(cfg *RunConfig) (core.Driver, func(), error) {
 		AppBuild:     appBuild,
 	}
 
-	drv := dliosdriver.NewDriver(client, platformInfo, udid, runner)
+	drv := dlios.NewDriver(client, info, udid)
 	if cfg.AppID != "" {
 		drv.SetAppID(cfg.AppID)
 	}
 	if cfg.TypingFrequency > 0 {
 		_ = drv.SetTypingFrequency(cfg.TypingFrequency)
 	}
-
 	cleanup := func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = dliosdriver.GracefulShutdown(shutdownCtx, client, runner)
+		drv.Close()
+		release()
 	}
 
-	// Wrap with the Flutter VM Service fallback, same as the WDA path — this
-	// driver is simulator-only, so the wrap is unconditional apart from the
-	// flag. Without it, Flutter elements missing from the accessibility tree
-	// were findable on WDA but not here, which read as a devicelab tap bug.
+	// The Flutter VM Service fallback, as on the WDA and legacy paths.
 	var driver core.Driver = drv
 	if !cfg.NoFlutterFallback {
 		fw := flutter.WrapIOS(drv, nil, udid, cfg.AppID)
 		driver = fw
-		origCleanup := cleanup
+		inner := cleanup
 		cleanup = func() {
 			if fd, ok := fw.(*flutter.FlutterDriver); ok {
 				fd.Close()
 			}
-			origCleanup()
+			inner()
 		}
 	}
-
-	// Silence unused-import warnings if logger doesn't appear elsewhere.
-	_ = strings.ToLower
 	return driver, cleanup, nil
+}
+
+// simulatorBootWait bounds the wait for a simulator that is still booting.
+// GitHub's macOS runners took 3-5 minutes to finish a boot.
+var simulatorBootWait = 15 * time.Minute
+
+// simctlBootstatus runs `simctl bootstatus` (no -b: a shut-down simulator is
+// not booted by it); a variable so tests can stand in for it.
+var simctlBootstatus = func(ctx context.Context, udid string) ([]byte, error) {
+	return exec.CommandContext(ctx, "xcrun", "simctl", "bootstatus", udid).CombinedOutput()
+}
+
+// waitForSimulatorBoot waits for a simulator to finish booting. `simctl boot`
+// returns, and simctl lists the simulator as Booted, minutes before the boot
+// has finished on a slow machine (GitHub: boot 7-14s, bootstatus another
+// 173s); a CI step that booted and moved on handed over a simulator where
+// installing the app hung. On a fully booted simulator bootstatus answers at
+// once ("already booted"); a shut-down one is left alone, as before.
+func waitForSimulatorBoot(udid string, timeout time.Duration) error {
+	if state := simulatorState(udid); state != "Booting" && state != "Booted" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	start := time.Now()
+	out, err := simctlBootstatus(ctx, udid)
+	if ctx.Err() != nil {
+		return fmt.Errorf("simulator %s did not finish booting within %s", udid, timeout)
+	}
+	if err != nil {
+		// Not worth failing the run over: the install or the agent start
+		// that follows reports a simulator that is really not usable.
+		logger.Warn("simctl bootstatus %s: %v: %s", udid, err, strings.TrimSpace(string(out)))
+		return nil
+	}
+	if waited := time.Since(start); waited >= time.Second {
+		printSetupSuccess(fmt.Sprintf("Simulator finished booting (waited %s)", waited.Round(time.Second)))
+	}
+	return nil
+}
+
+// simulatorState is the simulator's state as simctl reports it ("Booted",
+// "Booting", "Shutdown", ...), or "" when it is not listed.
+var simulatorState = func(udid string) string {
+	out, err := exec.Command("xcrun", "simctl", "list", "devices", "-j").Output()
+	if err != nil {
+		return ""
+	}
+	return parseSimulatorState(out, udid)
+}
+
+func parseSimulatorState(listJSON []byte, udid string) string {
+	var list struct {
+		Devices map[string][]struct {
+			UDID  string `json:"udid"`
+			State string `json:"state"`
+		} `json:"devices"`
+	}
+	if json.Unmarshal(listJSON, &list) != nil {
+		return ""
+	}
+	for _, devices := range list.Devices {
+		for _, d := range devices {
+			if d.UDID == udid {
+				return d.State
+			}
+		}
+	}
+	return ""
 }

@@ -259,8 +259,9 @@ func TestFilterContainsDescendants(t *testing.T) {
 func TestDeepestMatchingElement(t *testing.T) {
 	elements, _ := ParsePageSource(sampleHierarchy)
 
-	// Filter to get multiple matches
-	sel := flow.Selector{ID: "com.app"}
+	// Filter to get multiple matches. Ids match whole (#188), so the
+	// package prefix is written as a regex.
+	sel := flow.Selector{ID: "com.app.*"}
 	matches := FilterBySelector(elements, sel)
 
 	deepest := DeepestMatchingElement(matches)
@@ -338,9 +339,12 @@ func TestMatchesSelector(t *testing.T) {
 		sel  flow.Selector
 		want bool
 	}{
-		{"text match", flow.Selector{Text: "Login"}, true},
+		// Text matches a whole value, as in Maestro (#188).
+		{"text match", flow.Selector{Text: "login button"}, true},
+		{"text is not a substring", flow.Selector{Text: "Login"}, false},
 		{"text no match", flow.Selector{Text: "Signup"}, false},
-		{"text in content-desc", flow.Selector{Text: "Sign in"}, true},
+		{"text in content-desc", flow.Selector{Text: "Sign in to your account"}, true},
+		{"content-desc is not a substring", flow.Selector{Text: "Sign in"}, false},
 		{"id match", flow.Selector{ID: "login"}, true},
 		{"id no match", flow.Selector{ID: "signup"}, false},
 		{"size match", flow.Selector{Width: 200, Height: 80}, true},
@@ -383,13 +387,13 @@ func TestMatchesSelectorRegexID(t *testing.T) {
 			true,
 		},
 		{
-			"literal ID still works as contains",
+			"literal ID matches after the package prefix",
 			&ParsedElement{ResourceID: "com.app:id/login_btn"},
 			flow.Selector{ID: "login_btn"},
 			true,
 		},
 		{
-			"invalid regex falls back to contains",
+			"invalid regex is matched literally",
 			&ParsedElement{ResourceID: "com.app:id/test[invalid"},
 			flow.Selector{ID: "test[invalid"},
 			true,
@@ -413,12 +417,17 @@ func TestMatchesID(t *testing.T) {
 		id      string
 		want    bool
 	}{
-		{"literal contains", "login", "com.app:id/login_btn", true},
+		// Whole match against the id or the part after its package prefix,
+		// as Maestro's idMatches (#188); it used to be a substring match.
+		{"literal is not a substring", "login", "com.app:id/login_btn", false},
+		{"literal after prefix", "login_btn", "com.app:id/login_btn", true},
 		{"literal no match", "signup", "com.app:id/login_btn", false},
 		{"regex match", "login_\\d+", "com.app:id/login_123", true},
-		{"regex no match", "^login$", "com.app:id/login", false},
+		{"anchored regex after prefix", "^login$", "com.app:id/login", true},
+		{"anchored regex no match", "^login$", "com.app:id/login_btn", false},
 		{"wildcard match", "item_.*", "item_abc", true},
-		{"invalid regex fallback", "[invalid", "test[invalid", true},
+		{"invalid regex is literal", "[invalid", "[invalid", true},
+		{"invalid regex literal is whole", "[invalid", "test[invalid", false},
 	}
 
 	for _, tt := range tests {

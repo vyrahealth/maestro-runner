@@ -71,6 +71,8 @@ type Driver struct {
 	client UIA2Client
 	info   *core.PlatformInfo
 	device ShellExecutor // for ADB commands (launchApp, stopApp, clearState)
+	// Animation scales saved while disableAnimations is on
+	animations core.AndroidAnimations
 
 	// Parent context for element-finding operations (nil = context.Background())
 	ctx context.Context
@@ -94,6 +96,15 @@ type Driver struct {
 
 	// Selector validation dedup
 	warnedFields map[string]bool
+
+	// provisionLocation installs the location helper app when it is missing;
+	// set by the CLI, which knows where the bundled APKs are.
+	provisionLocation func() error
+	// locationReady: the helper app is installed and allowed to mock the
+	// location. locationSet: a mocked location is active and stopped at the
+	// end of the run.
+	locationReady bool
+	locationSet   bool
 }
 
 // New creates a new UIAutomator2 driver.
@@ -257,8 +268,6 @@ func (d *Driver) Execute(step flow.Step) *core.CommandResult {
 		result = d.assertDarkMode(s)
 	case *flow.AssertLightModeStep:
 		result = d.assertLightMode(s)
-	case *flow.TravelStep:
-		result = d.travel(s)
 
 	// Wait commands
 	case *flow.WaitUntilStep:
@@ -463,30 +472,21 @@ func (d *Driver) findElementForTapWithContext(ctx context.Context, sel flow.Sele
 }
 
 // buildClickableOnlyStrategies builds UiAutomator strategies that only match clickable elements.
+//
+// Every query matches the whole text or description, as Maestro does
+// (core.UiSelectorTextTiers): the value equal to the selector first, then the
+// selector as a regex in its own case (#151), then ignoring case. The
+// textContains / descriptionContains passes this used for plain text tapped a
+// clickable "Talk · Open" row for `tapOn: Open` (#188); a partial match is
+// written `.*Open.*`.
 func buildClickableOnlyStrategies(sel flow.Selector) ([]LocatorStrategy, error) {
 	var strategies []LocatorStrategy
-	stateFilters := buildStateFilters(sel)
-
-	if sel.Text != "" {
-		if looksLikeRegex(sel.Text) {
-			pattern := "(?s)" + escapeUIAutomatorString(sel.Text)
+	filters := ".clickable(true)" + buildStateFilters(sel)
+	for _, tier := range core.UiSelectorTextTiers(sel.Text, false) {
+		for _, body := range tier {
 			strategies = append(strategies, LocatorStrategy{
 				Strategy: uiautomator2.StrategyUIAutomator,
-				Value:    `new UiSelector().textMatches("` + pattern + `").clickable(true)` + stateFilters,
-			})
-			strategies = append(strategies, LocatorStrategy{
-				Strategy: uiautomator2.StrategyUIAutomator,
-				Value:    `new UiSelector().descriptionMatches("` + pattern + `").clickable(true)` + stateFilters,
-			})
-		} else {
-			escaped := escapeUIAutomatorString(sel.Text)
-			strategies = append(strategies, LocatorStrategy{
-				Strategy: uiautomator2.StrategyUIAutomator,
-				Value:    `new UiSelector().textContains("` + escaped + `").clickable(true)` + stateFilters,
-			})
-			strategies = append(strategies, LocatorStrategy{
-				Strategy: uiautomator2.StrategyUIAutomator,
-				Value:    `new UiSelector().descriptionContains("` + escaped + `").clickable(true)` + stateFilters,
+				Value:    `new UiSelector()` + body + filters,
 			})
 		}
 	}
@@ -883,6 +883,9 @@ func (d *Driver) resolveRelativeSelector(sel flow.Selector) (*core.ElementInfo, 
 		// (first) element to match Maestro's .firstOrNull() behavior.
 		selected = candidates[0]
 	} else {
+		if err := core.IndexError(len(candidates), sel.Index); err != nil {
+			return nil, err
+		}
 		selected = SelectByIndex(candidates, sel.Index)
 	}
 
@@ -979,6 +982,9 @@ func (d *Driver) findElementRelativeWithElements(sel flow.Selector, allElements 
 		// (first) element to match Maestro's .firstOrNull() behavior.
 		selected = candidates[0]
 	} else {
+		if err := core.IndexError(len(candidates), sel.Index); err != nil {
+			return nil, nil, err
+		}
 		selected = SelectByIndex(candidates, sel.Index)
 	}
 
@@ -1022,6 +1028,9 @@ func (d *Driver) findElementByPageSourceOnce(sel flow.Selector) (*uiautomator2.E
 		return nil, nil, fmt.Errorf("no elements match selector")
 	}
 
+	if err := core.IndexError(len(candidates), sel.Index); err != nil {
+		return nil, nil, err
+	}
 	selected := SelectByIndex(candidates, sel.Index)
 
 	// If element isn't clickable, try to find a clickable parent
@@ -1089,6 +1098,9 @@ func (d *Driver) findElementByPageSourceOnceInternal(sel flow.Selector) (*core.E
 		return nil, fmt.Errorf("no elements match selector")
 	}
 
+	if err := core.IndexError(len(candidates), sel.Index); err != nil {
+		return nil, err
+	}
 	selected := SelectByIndex(candidates, sel.Index)
 
 	// If element isn't clickable, try to find a clickable parent
@@ -1172,38 +1184,23 @@ func buildSelectorsWithOptions(sel flow.Selector, timeoutMs int, preferClickable
 		}
 	}
 
-	// Exact id first, substring second. The substring fallback is kept for
-	// users relying on it, and fires only after every exact-match strategy:
-	// UiAutomator's `resourceIdMatches(".*X.*")` triggers internal scrolling
-	// and could return an unrelated element it happened to land on.
-	var idTiers [][]string
-	if sel.ID != "" {
-		escaped := escapeUIAutomatorString(sel.ID)
-		idTiers = [][]string{
-			{`.resourceId("` + escaped + `")`},
-			{`.resourceIdMatches(".*` + escaped + `.*")`},
-		}
-	}
+	// Exact id first, then Maestro's whole match (ignoring case, with or
+	// without the package prefix), which fires only after the exact query:
+	// a resourceIdMatches that finds nothing rendered triggers UiAutomator's
+	// internal scrolling and could return an unrelated element it happened to
+	// land on. The match used to be `.*X.*`, so `id: login` found
+	// "login_button" (#188).
+	idTiers := core.UiSelectorIDTiers(sel.ID)
 
-	// Text: regex patterns go through textMatches, literals through
-	// textContains with a case-insensitive fallback — Android dialog buttons
-	// display "CANCEL" while the hierarchy says "Cancel".
-	var textTiers [][]string
-	if sel.Text != "" {
-		if looksLikeRegex(sel.Text) {
-			pattern := "(?s)" + escapeUIAutomatorString(sel.Text)
-			textTiers = [][]string{
-				{`.textMatches("` + pattern + `")`, `.descriptionMatches("` + pattern + `")`},
-			}
-		} else {
-			escaped := escapeUIAutomatorString(sel.Text)
-			ciPattern := `(?is).*\Q` + escaped + `\E.*`
-			textTiers = [][]string{
-				{`.textContains("` + escaped + `")`, `.descriptionContains("` + escaped + `")`},
-				{`.textMatches("` + ciPattern + `")`, `.descriptionMatches("` + ciPattern + `")`},
-			}
-		}
-	}
+	// Text: every query matches the whole text or description, as Maestro
+	// does — equal to the selector first, then as a regex in its own case,
+	// then ignoring case (core.UiSelectorTextTiers). The ignore-case pass finds
+	// "CANCEL" on a dialog button whose hierarchy says "Cancel" and "Let's get
+	// started!" for `(let's get started!|...)`; the own-case pass still
+	// prefers "SIGN OUT" over "Sign out" for `^SIGN OUT$` (#151). The
+	// textContains passes plain text used to get matched "Talk · Open" for
+	// "Open" (#188).
+	textTiers := core.UiSelectorTextTiers(sel.Text, false)
 
 	switch {
 	case len(idTiers) > 0 && len(textTiers) > 0:
@@ -1290,12 +1287,6 @@ func looksLikeRegex(text string) bool {
 	return false
 }
 
-// escapeUIAutomatorString escapes only the double quotes for UiAutomator string.
-// Used when the text is already a regex pattern.
-func escapeUIAutomatorString(s string) string {
-	return strings.ReplaceAll(s, `"`, `\"`)
-}
-
 // buildStateFilters returns UiSelector chain for state filters.
 // e.g., ".enabled(true).checked(false)"
 func buildStateFilters(sel flow.Selector) string {
@@ -1352,4 +1343,13 @@ func successResult(msg string, elem *core.ElementInfo) *core.CommandResult {
 
 func errorResult(err error, msg string) *core.CommandResult {
 	return core.ErrorResult(err, msg)
+}
+
+// SetAnimationsDisabled switches the device's animation scales off, or puts
+// back the ones saved when they were switched off (disableAnimations).
+func (d *Driver) SetAnimationsDisabled(disabled bool) error {
+	if d.device == nil {
+		return fmt.Errorf("disableAnimations needs device shell access")
+	}
+	return d.animations.Set(d.device, disabled)
 }

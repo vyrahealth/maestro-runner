@@ -121,7 +121,10 @@ func TestRunFlow_WhenUnsetVariableSkipsTheBranch(t *testing.T) {
 		return &flow.RunFlowStep{
 			BaseStep: flow.BaseStep{StepType: flow.StepRunFlow},
 			When:     &flow.Condition{Script: script},
-			Steps:    []flow.Step{tapText(tap, false)},
+			Steps: []flow.Step{&flow.TapOnStep{
+				BaseStep: flow.BaseStep{StepType: flow.StepTapOn},
+				Selector: flow.Selector{Text: tap},
+			}},
 		}
 	}
 	result := runOneFlow(t, driver, flow.Flow{

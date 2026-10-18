@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/devicelab-dev/maestro-runner/pkg/core"
@@ -114,11 +115,12 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 	logger.Info("[cdp:4-forward] ADB forward established: local=%s → device=%s", socketPath, cdpInfo.Socket)
 
 	// Step 5: CDP WebSocket connection via unix socket
-	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), cdpSetupTimeout)
 	defer connectCancel()
 
+	dialer := &unixDialer{socketPath: socketPath}
 	ws := &cdp.WebSocket{
-		Dialer: &unixDialer{socketPath: socketPath},
+		Dialer: dialer,
 	}
 	logger.Info("[cdp:5-websocket] connecting CDP WebSocket via unix socket: %s", socketPath)
 	if err := ws.Connect(connectCtx, "ws://localhost/devtools/browser", nil); err != nil {
@@ -128,6 +130,21 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 		return fmt.Errorf("failed to connect CDP WebSocket: %w", err)
 	}
 	logger.Info("[cdp:5-websocket] CDP WebSocket connected successfully")
+
+	// Steps 6 and 7 run under one more deadline on the socket itself: a
+	// DevTools end that took the WebSocket and then never answered held
+	// browser.Connect() for 11 minutes (React Navigation's debug build), and
+	// nothing after it had a bound either. A read that hits the deadline fails
+	// the CDP client, so every call waiting on it returns. It is lifted once
+	// the session is set up.
+	dialer.setDeadline(time.Now().Add(cdpSetupTimeout))
+	fail := func(format string, err error) error {
+		logger.Info(format, err)
+		dialer.close()
+		_ = m.forwarder.RemoveSocketForward(socketPath)
+		os.Remove(socketPath)
+		return err
+	}
 
 	// Step 6: Rod browser client + page acquisition (bounded by timeout)
 	logger.Info("[cdp:6-browser] creating Rod browser client")
@@ -145,23 +162,35 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 	// underlying CDP client is already started, so Connect itself is one round
 	// trip that fails fast when the socket is dead.
 	if err := browser.Connect(); err != nil {
-		logger.Info("[cdp:6-browser] Rod browser connection failed: %v", err)
-		_ = m.forwarder.RemoveSocketForward(socketPath)
-		os.Remove(socketPath)
-		return fmt.Errorf("failed to connect Rod browser: %w", err)
+		return fail("[cdp:6-browser] Rod browser connection failed: %v", fmt.Errorf("failed to connect Rod browser: %w", err))
 	}
 
-	pages, err := browser.Timeout(10 * time.Second).Pages()
+	pages, err := browser.Timeout(cdpSetupTimeout).Pages()
 	if err != nil || len(pages) == 0 {
 		logger.Info("[cdp:6-browser] no pages found in WebView (err=%v)", err)
 		browser.Close()
+		dialer.close()
 		_ = m.forwarder.RemoveSocketForward(socketPath)
 		os.Remove(socketPath)
 		return fmt.Errorf("no pages found in WebView")
 	}
 
-	page := pages.First()
-	pageInfo, _ := page.Info()
+	// An app with several WebViews (a tab or back-stack screen kept alive
+	// next to the one on screen) has a page for each, and the first is not
+	// necessarily the one on screen. A hidden first page made the visibility
+	// gate turn CDP off while the visible WebView went unused.
+	page := pages[visiblePageIndex(len(pages), func(i int) bool {
+		res, err := pages[i].Timeout(visibilityCheckTimeout).Eval(`() => document.visibilityState`)
+		return err == nil && res.Value.Str() == "visible"
+	})]
+	// The page calls are bounded per call (a Timeout copy of a page is safe;
+	// only the browser's copy loses its event observable, #149) as well as by
+	// the socket deadline.
+	pageInfo, err := page.Timeout(cdpSetupTimeout).Info()
+	if err != nil && cdpSessionDead(err) {
+		browser.Close()
+		return fail("[cdp:6-browser] reading the page failed: %v", fmt.Errorf("failed to read WebView page: %w", err))
+	}
 	pageURL := ""
 	if pageInfo != nil {
 		pageURL = pageInfo.URL
@@ -170,14 +199,23 @@ func (m *webViewManager) connectViaUnixSocket(cdpInfo *core.CDPInfo, cdpType str
 
 	// Step 7: JS helper injection + ready
 	logger.Info("[cdp:7-ready] injecting JS helper into WebView")
-	if _, err := page.EvalOnNewDocument(webViewJSHelper); err != nil {
+	if _, err := page.Timeout(cdpSetupTimeout).EvalOnNewDocument(webViewJSHelper); err != nil {
+		if cdpSessionDead(err) {
+			browser.Close()
+			return fail("[cdp:7-ready] injecting the JS helper failed: %v", fmt.Errorf("failed to set up WebView: %w", err))
+		}
 		logger.Warn("[cdp:7-ready] failed to inject JS helper for future navigations: %v", err)
 	}
 	m.helperBroken = false
-	if _, err := page.Evaluate(rod.Eval(webViewJSHelper)); err != nil {
+	if _, err := page.Timeout(cdpSetupTimeout).Evaluate(rod.Eval(webViewJSHelper)); err != nil {
+		if cdpSessionDead(err) {
+			browser.Close()
+			return fail("[cdp:7-ready] injecting the JS helper failed: %v", fmt.Errorf("failed to set up WebView: %w", err))
+		}
 		logger.Info("[cdp:7-ready] failed to inject JS helper into current page: %v — will not re-inject", err)
 		m.helperBroken = true
 	}
+	dialer.clearDeadline()
 
 	m.browser = browser
 	m.page = page
@@ -267,10 +305,12 @@ func (m *webViewManager) evalPage() (*rod.Page, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	ws := &cdp.WebSocket{Dialer: &unixDialer{socketPath: socketPath}}
+	evalDialer := &unixDialer{socketPath: socketPath}
+	ws := &cdp.WebSocket{Dialer: evalDialer}
 	if err := ws.Connect(ctx, "ws://localhost/devtools/browser", nil); err != nil {
 		return nil, fmt.Errorf("eval connection: %w", err)
 	}
+	evalDialer.clearDeadline()
 	browser := rod.New().Client(cdp.New().Start(ws)).NoDefaultDevice()
 	if err := browser.Connect(); err != nil {
 		return nil, fmt.Errorf("eval browser connect: %w", err)
@@ -925,8 +965,9 @@ func (m *webViewManager) connectBrowserViaHTTP(cdpInfo *core.CDPInfo, cdpType st
 	defer connectCancel()
 
 	pageWSPath := fmt.Sprintf("ws://localhost/devtools/page/%s", pageTarget.ID)
+	pageDialer := &unixDialer{socketPath: socketPath}
 	ws := &cdp.WebSocket{
-		Dialer: &unixDialer{socketPath: socketPath},
+		Dialer: pageDialer,
 	}
 	logger.Info("[cdp:6-websocket] connecting CDP WebSocket to page: %s", pageWSPath)
 	if err := ws.Connect(connectCtx, pageWSPath, nil); err != nil {
@@ -935,6 +976,7 @@ func (m *webViewManager) connectBrowserViaHTTP(cdpInfo *core.CDPInfo, cdpType st
 		os.Remove(socketPath)
 		return fmt.Errorf("failed to connect page WebSocket: %w", err)
 	}
+	pageDialer.clearDeadline()
 	logger.Info("[cdp:6-websocket] page WebSocket connected successfully")
 
 	// Step 7: Create Rod browser+page via wrapped CDP client
@@ -1160,6 +1202,21 @@ func (m *webViewManager) refreshPage() error {
 	}
 
 	return nil
+}
+
+// visiblePageIndex picks the WebView page to drive: the first that reports
+// itself visible, or the first page when none does (a WebView that answers
+// slowly is still better driven than skipped). A single page is not asked.
+func visiblePageIndex(n int, visible func(i int) bool) int {
+	if n <= 1 {
+		return 0
+	}
+	for i := 0; i < n; i++ {
+		if visible(i) {
+			return i
+		}
+	}
+	return 0
 }
 
 // visibilityCheckTimeout is a short timeout for the document.visibilityState check.
@@ -1726,11 +1783,99 @@ func cssEscapeID(s string) string {
 // unixDialer implements cdp.Dialer for Unix socket connections.
 type unixDialer struct {
 	socketPath string
+	conn       net.Conn // the last connection dialed, for clearDeadline
+	// limit is the setup deadline in Unix nanoseconds (0: none). A write
+	// never waits past it, nor past cdpWriteTimeout.
+	limit atomic.Int64
 }
 
+// cdpWriteTimeout bounds one write to a DevTools socket. Reads stay
+// unbounded, since the client waits on them for events; a write that cannot
+// go out within this is a socket nobody reads, which would otherwise hold the
+// step, and every later one, forever.
+var cdpWriteTimeout = 10 * time.Second
+
+// writeBoundConn gives every write its own deadline.
+type writeBoundConn struct {
+	net.Conn
+	d *unixDialer
+}
+
+func (c *writeBoundConn) Write(p []byte) (int, error) {
+	deadline := time.Now().Add(cdpWriteTimeout)
+	if l := c.d.limit.Load(); l != 0 && time.Unix(0, l).Before(deadline) {
+		deadline = time.Unix(0, l)
+	}
+	_ = c.Conn.SetWriteDeadline(deadline)
+	return c.Conn.Write(p)
+}
+
+// DialContext dials the forwarded socket and puts ctx's deadline on the
+// connection itself. The context bounds only the dial, which to a local adb
+// forward succeeds at once; the WebSocket handshake then read with no
+// deadline, and when the device side never answered, CDP connect blocked for
+// 11 minutes in the middle of a scrollUntilVisible (RNTester's
+// flatlist-viewability). clearDeadline lifts it once the socket is up.
 func (d *unixDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, "unix", d.socketPath)
+	conn, err := dialer.DialContext(ctx, "unix", d.socketPath)
+	if err != nil {
+		return nil, err
+	}
+	conn = &writeBoundConn{Conn: conn, d: d}
+	if deadline, ok := ctx.Deadline(); ok {
+		d.limit.Store(deadline.UnixNano())
+		_ = conn.SetDeadline(deadline)
+	}
+	d.conn = conn
+	return conn, nil
+}
+
+// clearDeadline removes the setup deadline from the connection, so a
+// long-lived CDP session is not cut off by it.
+func (d *unixDialer) clearDeadline() {
+	d.setDeadline(time.Time{})
+}
+
+// setDeadline puts a deadline on the dialed connection (zero lifts it).
+func (d *unixDialer) setDeadline(t time.Time) {
+	if t.IsZero() {
+		d.limit.Store(0)
+	} else {
+		d.limit.Store(t.UnixNano())
+	}
+	if d.conn != nil {
+		_ = d.conn.SetDeadline(t)
+	}
+}
+
+// close closes the dialed connection, which ends a CDP client reading it.
+func (d *unixDialer) close() {
+	if d.conn != nil {
+		_ = d.conn.Close()
+	}
+}
+
+// cdpSetupTimeout bounds each stage of setting up a WebView CDP session: the
+// WebSocket handshake, then everything up to the JS helper being injected. A
+// healthy local adb-forwarded socket answers in ~15ms; a dead one used to
+// hold a step for minutes. A connect that fails here is retried later with
+// the driver's backoff, and steps run on native automation meanwhile.
+var cdpSetupTimeout = 3 * time.Second
+
+// cdpSessionDead reports whether err means the CDP connection itself is gone
+// (the setup deadline closed it, or the peer did), as opposed to a page that
+// refused a call.
+func cdpSessionDead(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") || strings.Contains(msg, "i/o timeout")
 }
 
 // webViewNetworkTracker tracks in-flight network requests via CDP Network domain events.

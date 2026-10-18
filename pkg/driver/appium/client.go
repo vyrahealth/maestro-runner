@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,18 +156,27 @@ func (c *Client) Connect(capabilities map[string]interface{}) error {
 	if c.platform == "ios" {
 		// iOS XCUITest settings:
 		// - animationCoolOffTimeout: Don't wait for animations to finish (default 2s)
+		// - snapshotMaxDepth: WebDriverAgent defaults to 50, which clips deep
+		//   React Native trees, so elements inside a ScrollView drop out of
+		//   the page source; the WDA driver raises it to 100 (#171).
 		if err := c.SetSettings(map[string]interface{}{
 			"waitForIdleTimeout":      waitForIdleTimeout,
 			"animationCoolOffTimeout": 0,
+			"snapshotMaxDepth":        iosSnapshotMaxDepth(),
 		}); err != nil {
 			logger.Warn("failed to configure iOS XCUITest settings: %v", err)
 		}
 	} else {
 		// Android UiAutomator2 settings:
 		// - waitForSelectorTimeout: Don't add extra wait when finding elements (default 0)
+		// - enableMultiWindows: search and page source span every window, so
+		//   dialogs, permission prompts and popup menus (which live in their
+		//   own window) are found; the server default only reads the focused
+		//   one. The uiautomator2 driver sets it too (#93).
 		if err := c.SetSettings(map[string]interface{}{
 			"waitForIdleTimeout":     waitForIdleTimeout,
 			"waitForSelectorTimeout": 0,
+			"enableMultiWindows":     true,
 		}); err != nil {
 			logger.Warn("failed to configure Android UiAutomator2 settings: %v", err)
 		}
@@ -328,9 +339,11 @@ func (c *Client) FindElements(strategy, value string) ([]string, error) {
 	return ids, nil
 }
 
-// GetActiveElement returns the currently focused element.
+// GetActiveElement returns the currently focused element. W3C defines this as
+// GET; the UiAutomator2 server and Appium 3 core route only GET, so a POST
+// 404'd and every caller fell back as if nothing were focused.
 func (c *Client) GetActiveElement() (string, error) {
-	resp, err := c.post(c.sessionPath()+"/element/active", nil)
+	resp, err := c.get(c.sessionPath() + "/element/active")
 	if err != nil {
 		return "", err
 	}
@@ -688,6 +701,14 @@ func (c *Client) SetOrientation(orientation string) error {
 	return err
 }
 
+// SetRotation rotates the display to z degrees (0, 90, 180 or 270) via
+// POST /rotation. Unlike /orientation it reaches the landscape-left/right and
+// upside-down rotations; x and y are required by the protocol and ignored.
+func (c *Client) SetRotation(z int) error {
+	_, err := c.post(c.sessionPath()+"/rotation", map[string]interface{}{"x": 0, "y": 0, "z": z})
+	return err
+}
+
 // Location
 
 // SetLocation sets the device location.
@@ -704,26 +725,37 @@ func (c *Client) SetLocation(lat, lon float64) error {
 
 // Clipboard
 
-// GetClipboard returns clipboard text.
+// GetClipboard reads the device clipboard. `mobile: getClipboard` first: it is
+// what current UiAutomator2 and XCUITest drivers support. The legacy
+// /appium/device/get_clipboard route is the fallback for older Appium.
 func (c *Client) GetClipboard() (string, error) {
-	resp, err := c.post(c.sessionPath()+"/appium/device/get_clipboard", map[string]interface{}{
-		"contentType": "plaintext",
-	})
-	if err != nil {
-		return "", err
+	var encoded string
+	if v, err := c.ExecuteMobile("getClipboard", map[string]interface{}{"contentType": "plaintext"}); err == nil {
+		encoded, _ = v.(string)
+	} else {
+		resp, lerr := c.post(c.sessionPath()+"/appium/device/get_clipboard", map[string]interface{}{
+			"contentType": "plaintext",
+		})
+		if lerr != nil {
+			return "", lerr
+		}
+		encoded, _ = resp["value"].(string)
 	}
-	encoded, _ := resp["value"].(string)
 	decoded, _ := base64.StdEncoding.DecodeString(encoded)
 	return string(decoded), nil
 }
 
-// SetClipboard sets clipboard text.
+// SetClipboard sets the device clipboard. Appium 3's UiAutomator2 driver no
+// longer serves /appium/device/set_clipboard, so the step 404'd there;
+// `mobile: setClipboard` works on current drivers of both platforms, and the
+// legacy route remains the fallback for older Appium.
 func (c *Client) SetClipboard(text string) error {
 	encoded := base64.StdEncoding.EncodeToString([]byte(text))
-	_, err := c.post(c.sessionPath()+"/appium/device/set_clipboard", map[string]interface{}{
-		"content":     encoded,
-		"contentType": "plaintext",
-	})
+	args := map[string]interface{}{"content": encoded, "contentType": "plaintext"}
+	if _, err := c.ExecuteMobile("setClipboard", args); err == nil {
+		return nil
+	}
+	_, err := c.post(c.sessionPath()+"/appium/device/set_clipboard", args)
 	return err
 }
 
@@ -940,4 +972,17 @@ var uuidRegex = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4
 // isUUIDFormat returns true if s matches the UUID format used by iOS simulators.
 func isUUIDFormat(s string) bool {
 	return uuidRegex.MatchString(s)
+}
+
+// iosSnapshotMaxDepth is the accessibility-snapshot depth cap for XCUITest
+// sessions: 62 by default, as for the WDA driver (above 62, XCTest returns no
+// elements at all for a screen nested deeper than 62 levels, #171), and
+// overridable with MAESTRO_WDA_SNAPSHOT_MAX_DEPTH, the same knob WDA reads.
+func iosSnapshotMaxDepth() int {
+	if v := os.Getenv("MAESTRO_WDA_SNAPSHOT_MAX_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 62
 }

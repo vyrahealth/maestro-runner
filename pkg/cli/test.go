@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/devicelab-dev/maestro-runner/pkg/logger"
 	"github.com/devicelab-dev/maestro-runner/pkg/report"
 	"github.com/devicelab-dev/maestro-runner/pkg/simulator"
+	"github.com/devicelab-dev/maestro-runner/pkg/telemetry"
 	"github.com/devicelab-dev/maestro-runner/pkg/validator"
 	"github.com/urfave/cli/v2"
 )
@@ -78,10 +80,11 @@ Examples:
 		},
 
 		// Environment variables
-		&cli.StringSliceFlag{
+		&cli.GenericFlag{
 			Name:    "env",
 			Aliases: []string{"e"},
-			Usage:   "Environment variables (KEY=VALUE)",
+			Usage:   "Environment variable for the flows: KEY=VALUE, or KEY alone to pass KEY from the shell environment. Repeat for more; a value may contain commas and '='",
+			Value:   &envValues{},
 		},
 		&cli.StringFlag{
 			Name:    "env-file",
@@ -107,6 +110,10 @@ Examples:
 		&cli.BoolFlag{
 			Name:  "flatten",
 			Usage: "Don't create timestamp subfolder (requires --output)",
+		},
+		&cli.IntFlag{
+			Name:  "retries",
+			Usage: "Run flows that fail again, up to N more times, in the same run (the device agent stays up; the report keeps every attempt)",
 		},
 		&cli.BoolFlag{
 			Name:  "retry-failed",
@@ -143,6 +150,7 @@ Examples:
 		},
 		&cli.StringFlag{
 			Name:    "window-size",
+			Aliases: []string{"screen-size"},
 			Usage:   "Browser viewport as WxH, e.g. 390x844 (web only, default 1280x800). Lets one suite run against phone, tablet and desktop breakpoints.",
 			EnvVars: []string{"MAESTRO_WINDOW_SIZE"},
 		},
@@ -160,12 +168,14 @@ Examples:
 			EnvVars: []string{"MAESTRO_STEP_DELAY"},
 		},
 		&cli.IntFlag{
-			Name:  "condition-timeout",
-			Usage: "Default timeout in ms for when:/while: condition checks (default 1000). Override per condition with `timeout:`.",
-			// No Value: unset reads as 0, which the engine takes as its 1000 ms
-			// default and MAESTRO_PARITY_TIMEOUTS as "not configured".
-			DefaultText: "1000",
-			EnvVars:     []string{"MAESTRO_CONDITION_TIMEOUT"},
+			Name:    "condition-timeout",
+			Usage:   "Fixed timeout in ms for when:/while: condition checks. Unset: as Maestro, 7s less the time since the last step (at least 1s). Override per condition with `timeout:`.",
+			EnvVars: []string{"MAESTRO_CONDITION_TIMEOUT"},
+		},
+		&cli.BoolFlag{
+			Name:    "disable-animations",
+			Usage:   "Switch the device's system animations off for the run and restore them afterwards (Android). Same as Maestro's workspace `platform: android: disableAnimations: true`",
+			EnvVars: []string{"MAESTRO_DISABLE_ANIMATIONS"},
 		},
 		&cli.BoolFlag{
 			Name:    "insecure",
@@ -210,6 +220,41 @@ Examples:
 		// Emulator management flags (start-emulator, auto-start-emulator,
 		// shutdown-after, boot-timeout) are global flags defined in cli.go.
 
+		// Maestro's `test` options, so a command written for Maestro runs as
+		// it is.
+		&cli.StringFlag{
+			Name:  "format",
+			Usage: "As Maestro: junit or html also writes that report to --output <file> (default report.xml / report.html); the full reports then go to --test-output-dir (default ./reports)",
+		},
+		&cli.StringFlag{
+			Name:  "test-output-dir",
+			Usage: "As Maestro: directory for the reports and artifacts (the same as --output when --format is not given)",
+		},
+		&cli.StringFlag{
+			Name:  "debug-output",
+			Usage: "As Maestro: directory for the logs and artifacts; used for the reports when --test-output-dir is not given",
+		},
+		&cli.BoolFlag{
+			Name:  "flatten-debug-output",
+			Usage: "As Maestro: no timestamp subfolder (the same as --flatten)",
+		},
+		&cli.IntFlag{
+			Name:    "shard-split",
+			Aliases: []string{"shards", "s"},
+			Usage:   "As Maestro: split the flows across N devices (the same as --parallel)",
+		},
+		&cli.IntFlag{
+			Name:   "shard-all",
+			Usage:  "Maestro's run-every-flow-on-each-device mode; not supported (use --parallel to split flows)",
+			Hidden: true,
+		},
+		&cli.StringFlag{Name: "test-suite-name", Hidden: true},
+		&cli.BoolFlag{Name: "reinstall-driver", Hidden: true},
+		&cli.BoolFlag{Name: "no-reinstall-driver", Hidden: true},
+		&cli.BoolFlag{Name: "headless", Hidden: true},
+		&cli.BoolFlag{Name: "analyze", Hidden: true},
+		&cli.StringFlag{Name: "api-key", Hidden: true},
+		&cli.StringFlag{Name: "api-url", Hidden: true},
 	},
 	Action: runTest,
 }
@@ -275,9 +320,7 @@ func resolveDriverName(cfg *RunConfig, platform string) string {
 			driverName = "cdp"
 		}
 	case "ios":
-		if driverName == "" || driverName == "uiautomator2" {
-			driverName = "wda"
-		}
+		driverName = iosDriverName(driverName)
 	case "mock":
 		driverName = "mock"
 	default: // android or empty
@@ -514,7 +557,14 @@ type RunConfig struct {
 	// ReportBaseDir is the root the runner writes runs under (--output, or
 	// ./reports) — where --retry-failed looks for the previous run's report.
 	ReportBaseDir string
-	RetryFailed   bool // Narrow the selection to flows that failed in the previous run
+	// ReportFile is where Maestro's --format/--output asked for the report;
+	// the JUnit (.xml) or HTML report is copied there. Empty means none.
+	ReportFile  string
+	RetryFailed bool // Narrow the selection to flows that failed in the previous run
+	Retries     int  // Run failing flows again, up to this many more times, in the same run
+	// ShareHierarchy makes a test run answer `hierarchy` for its device
+	// (see hierarchy_share.go); off for the hierarchy command itself.
+	ShareHierarchy bool
 
 	// Parallelization
 	Parallel int // Number of devices to use (0 = single device mode)
@@ -552,7 +602,8 @@ type RunConfig struct {
 
 	// Driver settings
 	WaitForIdleTimeout int    // Wait for device idle in ms (0 = disabled, default 200)
-	ConditionTimeout   int    // Default timeout (ms) for when:/while: condition checks (0 = not set, so 1000)
+	ConditionTimeout   int    // Default timeout (ms) for when:/while: condition checks (default 1000)
+	DisableAnimations  bool   // Switch device animations off for the run (--disable-animations / workspace)
 	Insecure           bool   // Skip TLS verification for runScript http.* (--insecure)
 	StepDelay          int    // Pause between top-level steps in ms (0 = none)
 	TypingFrequency    int    // WDA typing frequency in keys/sec (0 = use WDA default of 60)
@@ -599,6 +650,14 @@ type RunConfig struct {
 	// Cloud provider (detected from AppiumURL, nil if not a cloud provider)
 	CloudProvider cloud.Provider
 	CloudMeta     map[string]string
+
+	// TelemetryFlags are the names (never values) of the flags this run was
+	// given, for the anonymous usage event (pkg/telemetry).
+	TelemetryFlags []string
+	// TelemetryFlowPaths are the top-level flow files found (before tag
+	// filtering), relative to the paths given, for the event's one-way
+	// project id.
+	TelemetryFlowPaths []string
 }
 
 func hyperlink(url, text string) string {
@@ -678,17 +737,38 @@ func runTest(c *cli.Context) error {
 	}
 
 	// Parse environment variables
-	env := parseEnvVars(getStringSlice("env"))
+	env := parseEnvVars(takeEnvValues(c))
+
+	if getInt("shard-all") > 0 {
+		return fmt.Errorf("--shard-all (every flow on each device) is not supported; use --parallel N to split the flows across N devices")
+	}
+
+	// Maestro's --format makes --output the report file; the reports
+	// directory then comes from --test-output-dir or --debug-output.
+	base, reportFile, err := resolveMaestroOutput(getString("format"), getString("output"),
+		getString("test-output-dir"), getString("debug-output"))
+	if err != nil {
+		return err
+	}
+	flatten := getBool("flatten") || getBool("flatten-debug-output")
+	if flatten && base == "" && !c.IsSet("flatten") {
+		flatten = false // Maestro allows --flatten-debug-output alone
+	}
 
 	// Resolve output directory
-	outputDir, err := resolveOutputDir(getString("output"), getBool("flatten"))
+	outputDir, err := resolveOutputDir(base, flatten)
 	if err != nil {
 		return err
 	}
 
+	parallel := getInt("parallel")
+	if parallel == 0 {
+		parallel = getInt("shard-split")
+	}
+
 	// The base directory (before any timestamp subfolder) is where
 	// --retry-failed looks for the previous run's report.
-	reportBaseDir := getString("output")
+	reportBaseDir := base
 	if reportBaseDir == "" {
 		reportBaseDir = "./reports"
 	}
@@ -761,8 +841,11 @@ func runTest(c *cli.Context) error {
 		ExcludeTags:        getStringSlice("exclude-tags"),
 		OutputDir:          outputDir,
 		ReportBaseDir:      reportBaseDir,
+		ReportFile:         reportFile,
 		RetryFailed:        getBool("retry-failed"),
-		Parallel:           getInt("parallel"),
+		Retries:            getInt("retries"),
+		ShareHierarchy:     true,
+		Parallel:           parallel,
 		Continuous:         getBool("continuous"),
 		Headed:             getBool("headed"),
 		Browser:            getString("browser"),
@@ -782,6 +865,7 @@ func runTest(c *cli.Context) error {
 		NewCommandTimeout:  getInt("new-command-timeout"),
 		WaitForIdleTimeout: getInt("wait-for-idle-timeout"),
 		ConditionTimeout:   getInt("condition-timeout"),
+		DisableAnimations:  getBool("disable-animations"),
 		Insecure:           getBool("insecure"),
 		StepDelay:          getInt("step-delay"),
 		TypingFrequency:    getInt("typing-frequency"),
@@ -803,6 +887,21 @@ func runTest(c *cli.Context) error {
 		RecordMode:         videoMode,
 	}
 
+	// A --device without --platform: Maestro takes the platform from the
+	// device, so `maestro --device <simulator> test …` (Expo's e2e harness)
+	// runs on iOS. Here it ran on Android and timed out waiting for a device
+	// with that id.
+	inferPlatformFromDevice(cfg)
+
+	// disableAnimations: the CLI flag, or Maestro's workspace platform option.
+	if !cfg.DisableAnimations && workspaceConfig != nil {
+		platform := cfg.Platform
+		if platform == "" {
+			platform = "android"
+		}
+		cfg.DisableAnimations = workspaceConfig.DisableAnimations(platform)
+	}
+
 	// Apply waitForIdleTimeout with priority:
 	// Flow config > CLI flag > Workspace config > Cap file > Default (5000ms)
 	// (Flow config is handled in flow_runner.go)
@@ -822,7 +921,68 @@ func runTest(c *cli.Context) error {
 		}
 	}
 
+	cfg.TelemetryFlags = setFlagNames(c)
 	return executeTest(cfg)
+}
+
+// inferPlatformFromDevice sets the platform to ios when none was given and
+// the first --device is an iOS simulator or iPhone.
+func inferPlatformFromDevice(cfg *RunConfig) {
+	if cfg.Platform == "" && len(cfg.Devices) > 0 && isIOSDeviceID(cfg.Devices[0]) {
+		cfg.Platform = "ios"
+		logger.Info("--device %s is an iOS device; running on iOS", cfg.Devices[0])
+	}
+}
+
+// resolveMaestroOutput maps Maestro's report options onto ours. Without
+// --format, --output is our reports directory, as before. With --format junit
+// or html, --output is the report file (default report.xml or report.html,
+// as Maestro writes), and the reports directory is --test-output-dir, else
+// --debug-output, else the default. It returns the reports directory ("" for
+// the default) and the report file ("" for none).
+func resolveMaestroOutput(format, output, testOutputDir, debugOutput string) (string, string, error) {
+	dir := testOutputDir
+	if dir == "" {
+		dir = debugOutput
+	}
+	switch strings.ToLower(format) {
+	case "", "noop":
+		if output != "" {
+			dir = output
+		}
+		return dir, "", nil
+	case "junit":
+		if output == "" {
+			output = "report.xml"
+		}
+		return dir, output, nil
+	case "html", "html-detailed":
+		if output == "" {
+			output = "report.html"
+		}
+		return dir, output, nil
+	default:
+		return "", "", fmt.Errorf("--format %q: use junit, html or noop", format)
+	}
+}
+
+// writeReportFile copies the generated report Maestro's --format asked for
+// to the --output file.
+func writeReportFile(cfg *RunConfig) error {
+	src := filepath.Join(cfg.OutputDir, "junit-report.xml")
+	if strings.HasSuffix(strings.ToLower(cfg.ReportFile), ".html") {
+		src = filepath.Join(cfg.OutputDir, "report.html")
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(cfg.ReportFile); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(cfg.ReportFile, data, 0o644)
 }
 
 // resolveOutputDir determines the output directory based on flags.
@@ -849,6 +1009,39 @@ func resolveOutputDir(output string, flatten bool) (string, error) {
 }
 
 func executeTest(cfg *RunConfig) error {
+	started := time.Now()
+	// The anonymous usage event (pkg/telemetry) goes out when the run ends,
+	// in the background, and is waited for at most its 2s timeout.
+	var telemetryDone chan struct{}
+	telemetryRun := func(outcome string, devices int) telemetry.Run {
+		return telemetry.Run{
+			Version: Version, Command: "test", FlagNames: cfg.TelemetryFlags,
+			Platform: telemetryPlatform(cfg), Driver: telemetryDriver(cfg), Cloud: cfg.CloudProvider != nil,
+			Devices: devices, FlowPaths: cfg.TelemetryFlowPaths, Outcome: outcome, Duration: time.Since(started),
+		}
+	}
+	// One event per run: whichever path claims telemetrySent first sends it
+	// (the end of the run, a failure, or Ctrl-C).
+	var telemetrySent atomic.Bool
+	sendTelemetry := func(outcome string, index *report.Index, devices int) {
+		if !telemetry.Enabled() || !telemetrySent.CompareAndSwap(false, true) {
+			return
+		}
+		ev := telemetry.Build(telemetryRun(outcome, devices), index, cfg.OutputDir)
+		telemetryDone = make(chan struct{})
+		go func() { defer close(telemetryDone); telemetry.Send(ev) }()
+	}
+	// Set once the run's own checks have passed (flows valid, flags and
+	// variables consistent): from then on a run that ends without reporting
+	// is sent as setup_failed (no flow ran) or crashed, and one stopped with
+	// Ctrl-C as interrupted. A user's configuration mistake sends nothing.
+	var telemetryArmed atomic.Bool
+	defer func() {
+		if telemetryDone != nil {
+			<-telemetryDone
+		}
+	}()
+
 	// 1. Create output directory
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
@@ -898,6 +1091,9 @@ func executeTest(cfg *RunConfig) error {
 		sig := <-sigCh
 		logger.Info("Received signal %v, cleaning up...", sig)
 		fmt.Fprintf(os.Stderr, "\nReceived %v, cleaning up...\n", sig)
+		if telemetryArmed.Load() && telemetry.Enabled() && telemetrySent.CompareAndSwap(false, true) {
+			telemetry.SendWithin(telemetry.Build(telemetryRun("interrupted", 0), nil, ""), time.Second)
+		}
 
 		// Clean up driver resources (socket, adb forward, session)
 		cleanupMu.Lock()
@@ -950,7 +1146,7 @@ func executeTest(cfg *RunConfig) error {
 		warnUnsupportedSelectors(flows, cfg.Platform)
 	}
 
-	// Pre-checks for iOS with direct WDA driver (not Appium).
+	// Pre-checks for iOS with a direct driver (DeviceLab or WDA, not Appium).
 	// Appium handles everything via capabilities — no --app-file or --team-id needed.
 	if strings.EqualFold(cfg.Platform, "ios") && cfg.Driver != "appium" {
 		// team-id is only required for real devices, not simulators.
@@ -1011,6 +1207,9 @@ func executeTest(cfg *RunConfig) error {
 	}
 	cfg.AppID = expandRunnerVars(cfg.AppID, cfg.Env)
 
+	telemetryArmed.Store(true)
+	defer sendTelemetry("setup_failed", nil, 0) // a no-op once an event went out
+
 	// 3.5. Handle device startup (emulator or simulator, if requested)
 	if err := handleDeviceStartup(cfg, emulatorMgr, simulatorMgr); err != nil {
 		logger.Error("Device startup failed: %v", err)
@@ -1035,6 +1234,16 @@ func executeTest(cfg *RunConfig) error {
 	result, err := executeFlowsWithMode(cfg, flows, needsParallel, deviceIDs)
 	if err != nil {
 		logger.Error("Flow execution failed: %v", err)
+		// crashed once a flow had started (the report shows it), otherwise
+		// the run never got going (driver or device setup): setup_failed.
+		// With --flatten the folder is reused, so a report.json older than
+		// this run is a previous run's and is ignored.
+		outcome := "setup_failed"
+		if index, ierr := report.ReadIndex(filepath.Join(cfg.OutputDir, "report.json")); ierr == nil &&
+			!index.StartTime.Before(started) && anyFlowStarted(index) {
+			outcome = "crashed"
+		}
+		sendTelemetry(outcome, nil, len(deviceIDs))
 		return err
 	}
 	logger.Info("Flow execution completed: %d passed, %d failed, %d skipped",
@@ -1077,6 +1286,14 @@ func executeTest(cfg *RunConfig) error {
 	if err := report.GenerateAllure(cfg.OutputDir); err != nil {
 		allureGenerated = false
 		fmt.Printf("  %s⚠%s Warning: failed to generate Allure report: %v\n", color(colorYellow), color(colorReset), err)
+	}
+
+	if cfg.ReportFile != "" {
+		if err := writeReportFile(cfg); err != nil {
+			fmt.Printf("  %s⚠%s Warning: failed to write %s: %v\n", color(colorYellow), color(colorReset), cfg.ReportFile, err)
+		} else {
+			fmt.Printf("  Report: %s\n", cfg.ReportFile)
+		}
 	}
 
 	// Report result to cloud provider (if detected)
@@ -1130,10 +1347,20 @@ func executeTest(cfg *RunConfig) error {
 		fmt.Printf("    Allure: %s\n", allurePath)
 	}
 
-	// 7. Print update notice if available
-	printUpdateNotice()
+	// 7. Anonymous usage event (counts only; see pkg/telemetry)
+	if index, err := report.ReadIndex(jsonPath); err == nil {
+		sendTelemetry("completed", index, max(1, len(deviceIDs)))
+	} else {
+		sendTelemetry("completed", nil, max(1, len(deviceIDs)))
+	}
 
-	// 8. Print footer
+	// 8. Print update notice if available
+	printUpdateNotice()
+	if telemetry.Enabled() && telemetry.DetectCI() == "none" {
+		fmt.Printf("\n  %s%s%s\n", color(colorDim), telemetry.Notice(), color(colorReset))
+	}
+
+	// 9. Print footer
 	printFooter()
 
 	// Exit with code 1 if any flows failed (summary already printed)
@@ -1142,6 +1369,24 @@ func executeTest(cfg *RunConfig) error {
 	}
 
 	return nil
+}
+
+// noFlowsMatchTagsError is Maestro's error for a tag filter that leaves no
+// flows, word for word: scripts look for "did not match any Flows" and treat
+// it as "nothing to run here" (react-native-enriched-html's run-tests.sh).
+func noFlowsMatchTagsError(include, exclude []string) error {
+	list := func(tags []string) string {
+		if len(tags) == 0 {
+			return "[]"
+		}
+		lines := make([]string, len(tags))
+		for i, t := range tags {
+			lines[i] = "- " + t
+		}
+		return strings.Join(lines, "\n")
+	}
+	return fmt.Errorf("Include / Exclude tags did not match any Flows:\n\nInclude Tags:\n%s\n\nExclude Tags:\n%s",
+		list(include), list(exclude))
 }
 
 // validateAndParseFlows validates and parses all flow files.
@@ -1154,6 +1399,7 @@ func validateAndParseFlows(cfg *RunConfig) ([]flow.Flow, error) {
 		result := v.Validate(path)
 		allTestCases = append(allTestCases, result.TestCases...)
 		allErrors = append(allErrors, result.Errors...)
+		cfg.TelemetryFlowPaths = append(cfg.TelemetryFlowPaths, result.FlowPaths...)
 	}
 
 	if len(allErrors) > 0 {
@@ -1165,6 +1411,9 @@ func validateAndParseFlows(cfg *RunConfig) ([]flow.Flow, error) {
 	}
 
 	if len(allTestCases) == 0 {
+		if len(cfg.IncludeTags) > 0 || len(cfg.ExcludeTags) > 0 {
+			return nil, noFlowsMatchTagsError(cfg.IncludeTags, cfg.ExcludeTags)
+		}
 		return nil, fmt.Errorf("no test flows found")
 	}
 
@@ -1521,6 +1770,7 @@ func executeSingleDevice(cfg *RunConfig, flows []flow.Flow) (*executor.RunResult
 	runner := executor.New(driver, executor.RunnerConfig{
 		OutputDir:          cfg.OutputDir,
 		Parallelism:        0,
+		Retries:            cfg.Retries,
 		Artifacts:          cfg.Artifacts,
 		UpdateScreenshots:  cfg.UpdateScreenshots,
 		Record:             cfg.Record,
@@ -1532,6 +1782,7 @@ func executeSingleDevice(cfg *RunConfig, flows []flow.Flow) (*executor.RunResult
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		DisableAnimations:  cfg.DisableAnimations,
 		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
@@ -1585,6 +1836,7 @@ func ExecuteFlowWithDriver(driver core.Driver, cfg *RunConfig, f flow.Flow) (*ex
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		DisableAnimations:  cfg.DisableAnimations,
 		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
@@ -1860,12 +2112,61 @@ func formatDuration(ms int64) string {
 func parseEnvVars(envs []string) map[string]string {
 	result := make(map[string]string)
 	for _, e := range envs {
+		// The first '=' separates: a name cannot contain one, a value can.
 		parts := strings.SplitN(e, "=", 2)
 		if len(parts) == 2 {
 			result[parts[0]] = parts[1]
+			continue
+		}
+		// KEY alone takes its value from the shell environment, as docker -e
+		// does, so values with spaces, commas or quotes need no quoting.
+		name := strings.TrimSpace(e)
+		if name == "" {
+			continue
+		}
+		if v, ok := os.LookupEnv(name); ok {
+			result[name] = v
+		} else {
+			logger.Warn("-e %s: not set in the environment, ignored", name)
 		}
 	}
 	return result
+}
+
+// envValues collects each -e as given. StringSliceFlag split every value at
+// commas, so -e REPLY="Thanks, going with Vue" reached the flow as
+// REPLY=Thanks (#189); tag lists keep their comma splitting.
+type envValues []string
+
+// envValuesCopy marks urfave's copy of the parsed value to the flag's other
+// name (-e and --env share one value): that copy is not another -e.
+const envValuesCopy = "\x00maestro-runner-env-values"
+
+func (e *envValues) Set(v string) error {
+	if v == envValuesCopy {
+		return nil
+	}
+	*e = append(*e, v)
+	return nil
+}
+func (e *envValues) String() string    { return strings.Join(*e, " ") }
+func (e *envValues) Serialize() string { return envValuesCopy }
+
+// takeEnvValues returns the -e values from the command or a parent, and
+// empties them: the flag value lives in the command definition, which
+// repeated runs in one process share.
+func takeEnvValues(c *cli.Context) []string {
+	for _, ctx := range c.Lineage() {
+		if ctx == nil {
+			continue
+		}
+		if v, ok := ctx.Generic("env").(*envValues); ok && v != nil && len(*v) > 0 {
+			out := append([]string(nil), *v...)
+			*v = nil
+			return out
+		}
+	}
+	return nil
 }
 
 // loadCapabilities loads Appium capabilities from a JSON file.
@@ -1904,6 +2205,7 @@ func executeAppiumSingleSession(cfg *RunConfig, flows []flow.Flow) (*executor.Ru
 	runner := executor.New(driver, executor.RunnerConfig{
 		OutputDir:          cfg.OutputDir,
 		Parallelism:        0,
+		Retries:            cfg.Retries,
 		Artifacts:          cfg.Artifacts,
 		UpdateScreenshots:  cfg.UpdateScreenshots,
 		Record:             cfg.Record,
@@ -1915,6 +2217,7 @@ func executeAppiumSingleSession(cfg *RunConfig, flows []flow.Flow) (*executor.Ru
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		DisableAnimations:  cfg.DisableAnimations,
 		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
@@ -2796,6 +3099,7 @@ func createParallelRunner(cfg *RunConfig, workers []executor.DeviceWorker, platf
 	runnerConfig := executor.RunnerConfig{
 		OutputDir:          cfg.OutputDir,
 		Parallelism:        0,
+		Retries:            cfg.Retries,
 		Artifacts:          cfg.Artifacts,
 		UpdateScreenshots:  cfg.UpdateScreenshots,
 		Record:             cfg.Record,
@@ -2807,6 +3111,7 @@ func createParallelRunner(cfg *RunConfig, workers []executor.DeviceWorker, platf
 		Env:                cfg.Env,
 		WaitForIdleTimeout: cfg.WaitForIdleTimeout,
 		ConditionTimeout:   cfg.ConditionTimeout,
+		DisableAnimations:  cfg.DisableAnimations,
 		Insecure:           cfg.Insecure,
 		StepDelay:          cfg.StepDelay,
 		TypingFrequency:    cfg.TypingFrequency,
@@ -2937,4 +3242,56 @@ func noIOSTargetMessage() string {
 	return "no iOS device found: nothing is booted and no device is connected\n" +
 		"Hint: boot a simulator (`xcrun simctl boot <udid>`), connect an iPhone, or pass --start-simulator <name>.\n" +
 		"      `maestro-runner devices` lists what this machine can see"
+}
+
+// telemetryPlatform is the run's platform for the usage event.
+func telemetryPlatform(cfg *RunConfig) string {
+	if cfg.Driver == "browser" || cfg.Platform == "web" {
+		return "web"
+	}
+	return cfg.Platform
+}
+
+// telemetryDriver is the run's driver name for the usage event.
+func telemetryDriver(cfg *RunConfig) string {
+	if telemetryPlatform(cfg) == "web" {
+		return "browser"
+	}
+	if cfg.Driver != "" {
+		return cfg.Driver
+	}
+	switch cfg.Platform {
+	case "android", "ios":
+		return "devicelab" // the default on both
+	}
+	return ""
+}
+
+// setFlagNames lists the flags this run was given, each once under its main
+// name (an alias like --udid for --device is not counted again).
+func setFlagNames(c *cli.Context) []string {
+	var defined []cli.Flag
+	if c.Command != nil {
+		defined = append(defined, c.Command.Flags...)
+	}
+	if c.App != nil {
+		defined = append(defined, c.App.Flags...)
+	}
+	var names []string
+	for _, f := range defined {
+		if n := f.Names(); len(n) > 0 && c.IsSet(n[0]) {
+			names = append(names, n[0])
+		}
+	}
+	return names
+}
+
+// anyFlowStarted reports whether a run's report shows a flow that began.
+func anyFlowStarted(index *report.Index) bool {
+	for _, f := range index.Flows {
+		if f.Status != report.StatusPending {
+			return true
+		}
+	}
+	return false
 }

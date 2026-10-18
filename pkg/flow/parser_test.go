@@ -2109,6 +2109,35 @@ func TestFlow_IsSuite(t *testing.T) {
 			},
 			expected: false, // Only 1 runFlow with file
 		},
+		{
+			name: "two runFlows with files and an inline one - not a suite",
+			flow: Flow{
+				Steps: []Step{
+					&RunFlowStep{BaseStep: BaseStep{StepType: StepRunFlow}, File: "open.yaml"},
+					&RunFlowStep{
+						BaseStep: BaseStep{StepType: StepRunFlow},
+						When:     &Condition{Visible: &Selector{Text: "Menu"}},
+						Steps:    []Step{&TapOnStep{BaseStep: BaseStep{StepType: StepTapOn}}},
+					},
+					&RunFlowStep{BaseStep: BaseStep{StepType: StepRunFlow}, File: "close.yaml"},
+				},
+			},
+			expected: false, // expanding would drop the inline commands
+		},
+		{
+			name: "two runFlows with files, one conditional - not a suite",
+			flow: Flow{
+				Steps: []Step{
+					&RunFlowStep{BaseStep: BaseStep{StepType: StepRunFlow}, File: "open.yaml"},
+					&RunFlowStep{
+						BaseStep: BaseStep{StepType: StepRunFlow},
+						File:     "reset.yaml",
+						When:     &Condition{Visible: &Selector{Text: "Menu"}},
+					},
+				},
+			},
+			expected: false, // expanding would run reset.yaml whatever the condition says
+		},
 	}
 
 	for _, tt := range tests {
@@ -2608,4 +2637,31 @@ func TestParse_WaitStep(t *testing.T) {
 			t.Error("expected a parse error for a negative duration")
 		}
 	})
+}
+
+// Maestro's swipe ignores keys it does not know, so `speed: fast` is not an
+// error there; here it is dropped and the swipe keeps its other fields. A
+// numeric speed still parses.
+func TestSwipeWordSpeedIgnored(t *testing.T) {
+	src := `appId: com.app
+---
+- swipe:
+    start: 50%, 70%
+    end: 50%, 20%
+    speed: fast
+- swipe:
+    direction: UP
+    speed: 80
+`
+	f, err := Parse([]byte(src), "t.yaml")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	s0 := f.Steps[0].(*SwipeStep)
+	if s0.Start != "50%, 70%" || s0.End != "50%, 20%" || s0.Speed != 0 {
+		t.Errorf("word speed: got start=%q end=%q speed=%d", s0.Start, s0.End, s0.Speed)
+	}
+	if s1 := f.Steps[1].(*SwipeStep); s1.Speed != 80 {
+		t.Errorf("numeric speed: got %d, want 80", s1.Speed)
+	}
 }

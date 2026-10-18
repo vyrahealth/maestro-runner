@@ -2,6 +2,7 @@
 package flow
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
@@ -122,6 +123,9 @@ type selectorRaw struct {
 func (s *Selector) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind == yaml.ScalarNode {
 		s.Text = node.Value
+		if node.Tag != "!!null" {
+			s.Text = emptyTextPattern(s.Text)
+		}
 		return nil
 	}
 
@@ -178,7 +182,33 @@ func (s *Selector) UnmarshalYAML(node *yaml.Node) error {
 		s.Text = raw.Element
 	}
 
+	if s.IsEmpty() && hasEmptyTextKey(node) {
+		s.Text = emptyTextPattern("")
+	}
+
 	return nil
+}
+
+// emptyTextPattern turns an explicitly empty text selector into one that
+// matches. Maestro compiles `text: ""` to an empty regex, which matches the
+// many elements with no text, so `assertVisible: ""` passes there; here an
+// empty Text would read as "no selector" and fail every time.
+func emptyTextPattern(text string) string {
+	if text == "" {
+		return ".*"
+	}
+	return text
+}
+
+// hasEmptyTextKey reports whether a selector map spells out `text: ""`.
+func hasEmptyTextKey(node *yaml.Node) bool {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		k, v := node.Content[i], node.Content[i+1]
+		if k.Value == "text" && v.Kind == yaml.ScalarNode && v.Value == "" && v.Tag != "!!null" {
+			return true
+		}
+	}
+	return false
 }
 
 // IsEmpty returns true if no selector properties are set.
@@ -219,15 +249,22 @@ func (s *Selector) HasRelativeSelector() bool {
 		s.InsideOf != nil
 }
 
-// HasNonZeroIndex returns true if the selector has an index that is not zero.
+// HasNonZeroIndex returns true if the selector has an index that is not zero
+// (or not a whole number).
 // Used to route element finding through page source (which returns all matches)
 // instead of native APIs (which return a single match).
 func (s *Selector) HasNonZeroIndex() bool {
 	if s.Index == "" {
 		return false
 	}
-	idx, err := strconv.Atoi(s.Index)
-	return err == nil && idx != 0
+	idx, err := strconv.Atoi(strings.TrimSpace(s.Index))
+	if err != nil {
+		// Not a whole number ("2.0", or "undefined" from an unset variable):
+		// take the path that reads the index, which accepts the one and
+		// reports the other, rather than a path that ignores it.
+		return true
+	}
+	return idx != 0
 }
 
 // EffectiveNth returns the integer index to use when picking among multiple
@@ -246,7 +283,16 @@ func (s *Selector) EffectiveNth() int {
 		return 0
 	}
 	idx, err := strconv.Atoi(strings.TrimSpace(s.Index))
-	if err != nil || idx < 0 {
+	if err != nil {
+		// "2.0" is 2, as in Maestro; anything else is 0 here and is reported
+		// by the driver before it looks (core.ParseIndex).
+		f, ferr := strconv.ParseFloat(strings.TrimSpace(s.Index), 64)
+		if ferr != nil || math.IsNaN(f) || math.IsInf(f, 0) || f > 1e9 || f < -1e9 {
+			return 0
+		}
+		idx = int(f)
+	}
+	if idx < 0 {
 		return 0
 	}
 	return idx

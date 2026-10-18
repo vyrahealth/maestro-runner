@@ -194,12 +194,12 @@ func TestSettleAroundAnElementTap(t *testing.T) {
 	if res := d.Execute(tapByID); !res.Success {
 		t.Fatalf("tap failed: %s", res.Message)
 	}
-	if got, want := f.steps(), "rect,screenshot,screenshot,click,screenshot,screenshot"; got != want {
+	if got, want := f.steps(), "rect,screenshot,screenshot,tap,screenshot,screenshot"; got != want {
 		t.Errorf("requests %s, want %s", got, want)
 	}
 }
 
-// Without it, nothing is added: the tap is the lookup and the click.
+// Without it, nothing is added: the tap is the lookup and the touch.
 func TestNoSettleWithoutTheSwitch(t *testing.T) {
 	t.Setenv("MAESTRO_WDA_SETTLE", "")
 	f := &screenWDA{}
@@ -207,7 +207,7 @@ func TestNoSettleWithoutTheSwitch(t *testing.T) {
 	if res := d.Execute(tapByID); !res.Success {
 		t.Fatalf("tap failed: %s", res.Message)
 	}
-	if got, want := f.steps(), "rect,click"; got != want {
+	if got, want := f.steps(), "rect,tap"; got != want {
 		t.Errorf("requests %s, want %s", got, want)
 	}
 }
@@ -222,8 +222,8 @@ func TestSettleAfterStepsThatChangeTheScreen(t *testing.T) {
 	}{
 		{"point tap", &flow.TapOnPointStep{X: 10, Y: 20}, "tap,screenshot,screenshot"},
 		// A swipe waits for a still screen before it too (IOSDriver.kt:269).
-		{"swipe", &flow.SwipeStep{Direction: "UP"}, "screenshot,screenshot,drag,screenshot,screenshot"},
-		{"scroll", &flow.ScrollStep{Direction: "DOWN"}, "screenshot,screenshot,drag,screenshot,screenshot"},
+		{"swipe", &flow.SwipeStep{Direction: "UP"}, "screenshot,screenshot,actions,screenshot,screenshot"},
+		{"scroll", &flow.ScrollStep{Direction: "DOWN"}, "screenshot,screenshot,actions,screenshot,screenshot"},
 		{"press key", &flow.PressKeyStep{Key: "Enter"}, "screenshot,screenshot"},
 		{"a read changes nothing", &flow.CopyTextFromStep{Selector: flow.Selector{ID: "go"}}, "rect"},
 	} {
@@ -253,13 +253,13 @@ func TestNoSettleAfterAFailedStep(t *testing.T) {
 	}
 }
 
-// The rect watch after a tap is the default's wait; with the switch the
-// screen settle after the tap has already done it.
-func TestSettleReplacesTheRectWatchAfterATap(t *testing.T) {
+// The settle before an action after a screen-moving step is the default's
+// wait; with the switch the screen settle after that step has already done it.
+func TestSettleReplacesTheDefaultSettleBeforeATap(t *testing.T) {
 	t.Setenv("MAESTRO_WDA_SETTLE", "1")
 	f := &screenWDA{}
 	d := createTestDriver(f.start(t))
-	d.lastTapID = "el1"
+	d.screenMayMove = true
 	d.Execute(&flow.TapOnPointStep{X: 10, Y: 20})
 	if got, want := f.steps(), "tap,screenshot,screenshot"; got != want {
 		t.Errorf("requests %s, want %s", got, want)
@@ -279,7 +279,7 @@ func TestElementTapAfterAScrollWaitsForTheElementToRest(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("tap failed: %s", res.Message)
 	}
-	if got, want := f.steps(), "rect,screenshot,screenshot,rect,rect,rect,click,screenshot,screenshot"; got != want {
+	if got, want := f.steps(), "rect,screenshot,screenshot,rect,rect,rect,tap,screenshot,screenshot"; got != want {
 		t.Errorf("requests %s, want %s", got, want)
 	}
 	if res.Element == nil || res.Element.Bounds.X != 130 {
@@ -297,7 +297,7 @@ func TestElementAtRestAfterAScrollCostsOneRead(t *testing.T) {
 	d := createTestDriver(f.start(t))
 	d.recentScroll = true
 	d.Execute(tapByID)
-	if got, want := f.steps(), "rect,screenshot,screenshot,rect,click,screenshot,screenshot"; got != want {
+	if got, want := f.steps(), "rect,screenshot,screenshot,rect,tap,screenshot,screenshot"; got != want {
 		t.Errorf("requests %s, want %s", got, want)
 	}
 }

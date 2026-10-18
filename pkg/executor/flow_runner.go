@@ -32,6 +32,9 @@ type FlowRunner struct {
 	stepsPassed  int
 	stepsFailed  int
 	stepsSkipped int
+
+	// Set when a runFlow's when: skipped it; markInteraction consumes it
+	runFlowSkipped bool
 	// Sub-command tracking for compound steps (runFlow, repeat, retry)
 	subCommands []report.Command
 	// nestedArtifactSeq numbers failure artifacts captured for nested steps
@@ -41,11 +44,6 @@ type FlowRunner struct {
 	waitForIdleTimeout int
 	// Active runFlow timeout label (e.g. "3s") for enriching sub-step errors
 	runFlowTimeout string
-	// When the last step that changed the device ended, and how many such
-	// steps have run, so a compound step can tell whether one ran inside it.
-	// They give MAESTRO_PARITY_TIMEOUTS its condition budget.
-	lastInteraction time.Time
-	interactions    int
 	// System alerts this flow dismissed, which stop at
 	// maxSystemAlertDismissals (system_alerts.go).
 	systemAlertDismissals int
@@ -69,12 +67,22 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Set parent context on driver so element-finding respects cancellation
 	fr.driver.SetContext(fr.ctx)
 
+	// A flow's disableAnimations overrides the run's setting for this flow.
+	if want := fr.flow.Config.DisableAnimations; want != nil && *want != fr.config.DisableAnimations {
+		setAnimationsDisabled(fr.driver, *want)
+		defer setAnimationsDisabled(fr.driver, fr.config.DisableAnimations)
+	}
+
 	// Import system environment variables
 	fr.script.ImportSystemEnv()
 
 	// Apply CLI environment variables (from -e flags)
 	// These take precedence over system env, but flow-level env takes precedence over these
-	fr.script.SetVariables(fr.config.Env)
+	fr.script.SetExternalVariables(fr.config.Env)
+
+	// DEVICE_UDID: the device this flow runs on. The flow's own env: can
+	// still override it.
+	fr.setDeviceVariables()
 
 	// Set flow directory for relative path resolution
 	if fr.flow.SourcePath != "" {
@@ -108,11 +116,6 @@ func (fr *FlowRunner) Run() FlowResult {
 	// Apply the global condition-check timeout for when:/while: checks. 0 keeps
 	// the engine's fast default; --condition-timeout / config overrides it (#110).
 	fr.script.SetConditionTimeout(fr.config.ConditionTimeout)
-	// MAESTRO_PARITY_TIMEOUTS: with no condition timeout configured, a
-	// when:/while: check waits as long as Maestro's would (conditionBudgetMs).
-	if fr.config.ConditionTimeout <= 0 && os.Getenv("MAESTRO_PARITY_TIMEOUTS") != "" {
-		fr.script.conditionBudget = fr.conditionBudgetMs
-	}
 	fr.script.SetInsecureHTTP(fr.config.Insecure)
 
 	// Apply waitForIdleTimeout with priority:
@@ -227,17 +230,13 @@ func (fr *FlowRunner) Run() FlowResult {
 
 	// onFlowComplete runs before the result is final, below. When a panic
 	// skips that, it still runs here, as Maestro runs it in a finally
-	// (Orchestra.kt:236-259).
+	// (Orchestra.kt:236-272).
 	flowCompleteRan := false
 	defer func() {
 		if !flowCompleteRan {
 			fr.runFlowCompleteHooks()
 		}
 	}()
-
-	// Maestro's condition budget runs from the start of the flow until the
-	// first step that changes the device (Orchestra.kt:197).
-	fr.lastInteraction = time.Now()
 
 	// Execute onFlowStart hooks
 	if len(fr.flow.Config.OnFlowStart) > 0 {
@@ -291,10 +290,16 @@ func (fr *FlowRunner) Run() FlowResult {
 
 		// Describe before executing: expansion rewrites the step in place, and
 		// the description is what the console shows.
-		desc := step.Describe()
+		describe, desc := fr.stepNames(step)
 
 		// Execute step
 		stepStatus, stepError, stepDuration := fr.executeStep(i, step)
+
+		// The report described the step before the run, with every ${NAME}
+		// as written; give it the flow values that are known now.
+		if describe != step.Describe() {
+			fr.flowWriter.CommandYAML(i, describe)
+		}
 
 		// Notify step complete
 		if fr.config.OnStepComplete != nil {
@@ -343,7 +348,7 @@ func (fr *FlowRunner) Run() FlowResult {
 	}
 
 	// onFlowComplete runs before the result is final. As in Maestro
-	// (Orchestra.kt:237-268), a failing hook fails a flow that had passed,
+	// (Orchestra.kt:236-272), a failing hook fails a flow that had passed,
 	// and a flow that had failed keeps its own error.
 	flowCompleteRan = true
 	if hookErr := fr.runFlowCompleteHooks(); hookErr != "" && flowStatus == report.StatusPassed {
@@ -576,6 +581,10 @@ func (fr *FlowRunner) dispatchStep(idx int, step flow.Step, artifacts *report.Co
 	case *flow.AssertScreenshotStep:
 		result = fr.executeAssertScreenshot(s, idx)
 
+	// SetClipboard - set it on the device and keep the text for pasteText
+	case *flow.SetClipboardStep:
+		result = fr.executeSetClipboard(s)
+
 	// PasteText - use in-memory copiedText first, clipboard as fallback
 	case *flow.PasteTextStep:
 		result = fr.executePasteText(s)
@@ -584,6 +593,11 @@ func (fr *FlowRunner) dispatchStep(idx int, step flow.Step, artifacts *report.Co
 	case *flow.TapOnStep, *flow.DoubleTapOnStep, *flow.LongPressOnStep:
 		opts, _ := extractTapOptions(step)
 		result = fr.executeTapWithOptions(step, opts)
+
+	// travel - walked here with setLocation, so every driver that can set
+	// the location can travel.
+	case *flow.TravelStep:
+		result = fr.executeTravel(s)
 
 	// Plain time delay - handled here, no driver involved. Honours run
 	// cancellation so Ctrl-C during a long wait stops the run promptly.
@@ -601,11 +615,9 @@ func (fr *FlowRunner) dispatchStep(idx int, step flow.Step, artifacts *report.Co
 // Returns status, error message, and duration in milliseconds.
 func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, string, int64) {
 	stepStart := time.Now()
+	defer fr.markInteraction(step)
 
-	// Described before expansion, as the report shows steps.
-	desc := step.Describe()
-
-	logger.Debug("Executing step %d: %s", idx, desc)
+	logger.Debug("Executing step %d: %s", idx, step.Describe())
 
 	// Mark step as started
 	fr.flowWriter.CommandStart(idx)
@@ -630,13 +642,16 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 		artifacts = fr.captureArtifacts(idx, "before", false)
 	}
 
+	// Named before expansion, as the report shows steps, so a value from
+	// outside the flow (-e, --env-file) never reaches the systemAlerts record.
+	desc, _ := fr.stepNames(step)
+
 	// Expand variables in a copy: the flow keeps the ${...} template for the
 	// next time this step runs (a count: rerun reuses the parsed flow).
 	step = cloneForRun(step)
 	fr.script.ExpandStep(step)
 
 	// Execute step - route to appropriate handler
-	interactionsBefore := fr.interactions
 	result := fr.dispatchStep(idx, step, &artifacts)
 	// A step that failed to find its element runs once more when a system
 	// alert covering the app was dismissed, and its error names one that was
@@ -645,7 +660,6 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 	result, alertNote, _ := fr.afterFailedLookup(step, desc, idx, result, func() *core.CommandResult {
 		return fr.dispatchStep(idx, step, &artifacts)
 	})
-	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	stepDuration := time.Since(stepStart).Milliseconds()
 
@@ -706,6 +720,8 @@ func (fr *FlowRunner) executeStep(idx int, step flow.Step) (report.Status, strin
 	if result.Element != nil {
 		element = commandResultToElement(result)
 	}
+
+	fr.flowWriter.CommandLogs(idx, fr.script.TakeConsoleLogs())
 
 	// Update report - use CommandEndWithSubs for compound steps
 	switch step.(type) {
@@ -1105,79 +1121,6 @@ func (fr *FlowRunner) collectStepsForPrepare() []flow.Step {
 	return out
 }
 
-// maestroOptionalLookupMs is Maestro's optional lookup timeout
-// (optionalLookupTimeoutMs, Orchestra.kt:137), which when: and while: wait on.
-const maestroOptionalLookupMs = 7000
-
-// conditionBudgetMs is how long a when:/while: visibility check may wait under
-// MAESTRO_PARITY_TIMEOUTS: Maestro's 7 s optional lookup, less the time since
-// the last step that changed the device (adjustedToLatestInteraction,
-// Orchestra.kt:1767-1770, used for conditions at 1058 and 1067). Maestro still
-// looks once when nothing is left, because its lookups loop do-while
-// (MaestroTimer.kt:33-46). So the floor is 1 ms: 0 would hand the driver its
-// own default instead.
-func (fr *FlowRunner) conditionBudgetMs() int {
-	left := maestroOptionalLookupMs - int(time.Since(fr.lastInteraction).Milliseconds())
-	if left < 1 {
-		return 1
-	}
-	return left
-}
-
-// changesDevice reports whether Maestro counts a passing step as one that
-// changed the device. Maestro's executeCommand returns false only for these
-// steps (Orchestra.kt:384-453) and true for every other, the ones it does not
-// list included. runFlow, repeat and retry go by the steps inside them.
-func changesDevice(step flow.Step) bool {
-	switch step.(type) {
-	case *flow.AssertVisibleStep, *flow.AssertNotVisibleStep, *flow.AssertTrueStep,
-		*flow.AssertConditionStep, *flow.WaitUntilStep, *flow.AssertScreenshotStep,
-		*flow.AssertNoDefectsWithAIStep, *flow.AssertWithAIStep, *flow.ExtractTextWithAIStep,
-		*flow.AssertDarkModeStep, *flow.AssertLightModeStep, *flow.CopyTextFromStep,
-		*flow.SetClipboardStep, *flow.SetPermissionsStep, *flow.ClearKeychainStep,
-		*flow.TakeScreenshotStep, *flow.StartRecordingStep, *flow.StopRecordingStep,
-		*flow.DefineVariablesStep:
-		return false
-	}
-	return true
-}
-
-// noteInteraction restarts the condition budget after a step that changed the
-// device, as Maestro does when executeCommand returns true (Orchestra.kt:448-451).
-// A failed step changes nothing: Maestro's command throws before that. A runFlow
-// or repeat counts when a step inside it did, since Maestro's subflow returns
-// whether any of its commands did (Orchestra.kt:1152). A retry counts when a
-// step of its passing attempt did, which executeRetry notes itself.
-func (fr *FlowRunner) noteInteraction(step flow.Step, passed bool, before int) {
-	if !passed {
-		return
-	}
-	switch step.(type) {
-	case *flow.RunFlowStep, *flow.RepeatStep:
-		if fr.interactions == before {
-			return
-		}
-	case *flow.RetryStep:
-		return
-	default:
-		if !changesDevice(step) {
-			return
-		}
-	}
-	fr.lastInteraction = time.Now()
-	fr.interactions++
-}
-
-// noteAttemptInteraction ends a retry's passing attempt, which changed the
-// device when a step of that attempt did (Maestro returns that attempt's
-// runSubFlow, Orchestra.kt:942).
-func (fr *FlowRunner) noteAttemptInteraction(attemptStart int) {
-	if fr.interactions > attemptStart {
-		fr.lastInteraction = time.Now()
-		fr.interactions++
-	}
-}
-
 // executeRepeat handles repeat step execution.
 func (fr *FlowRunner) executeRepeat(step *flow.RepeatStep) *core.CommandResult {
 	hasWhile := step.While.Visible != nil || step.While.NotVisible != nil || step.While.Script != ""
@@ -1317,7 +1260,6 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 			}
 		}
 
-		attemptStart := fr.interactions
 		success := true
 		for _, nestedStep := range step.Steps {
 			result := fr.executeNestedStep(nestedStep)
@@ -1329,7 +1271,6 @@ func (fr *FlowRunner) executeRetry(step *flow.RetryStep) *core.CommandResult {
 		}
 
 		if success {
-			fr.noteAttemptInteraction(attemptStart)
 			return &core.CommandResult{
 				Success: true,
 				Message: fmt.Sprintf("Retry succeeded on attempt %d", attempt),
@@ -1349,6 +1290,7 @@ func (fr *FlowRunner) executeRunFlow(step *flow.RunFlowStep) *core.CommandResult
 			if step.ElseFile != "" || len(step.ElseSteps) > 0 {
 				return fr.executeRunFlowElse(step)
 			}
+			fr.runFlowSkipped = true
 			return &core.CommandResult{
 				Success: true,
 				Message: "Skipped (when condition not met)",
@@ -1577,8 +1519,22 @@ func (fr *FlowRunner) enrichTimeoutError(result *core.CommandResult) *core.Comma
 	return &enriched
 }
 
-// executePasteText pastes the text copyTextFrom saved, as Maestro does, and
-// falls back to the device clipboard when nothing was copied in this flow.
+// executeSetClipboard sets the device clipboard and keeps the text for
+// pasteText, as Maestro's setClipboard does. pasteText then types the kept
+// text instead of reading the device clipboard, which Android 10+ does not
+// let a background app (the UiAutomator2 server) read: it comes back empty
+// (#202).
+func (fr *FlowRunner) executeSetClipboard(step *flow.SetClipboardStep) *core.CommandResult {
+	result := fr.driver.Execute(step)
+	if result.Success {
+		fr.script.SetCopiedText(step.Text)
+	}
+	return result
+}
+
+// executePasteText pastes the text copyTextFrom or setClipboard saved, as
+// Maestro does, and falls back to the device clipboard when nothing was
+// copied in this flow.
 func (fr *FlowRunner) executePasteText(step *flow.PasteTextStep) *core.CommandResult {
 	text := fr.script.GetCopiedText()
 	if text == "" {
@@ -1715,6 +1671,9 @@ func (fr *FlowRunner) dispatchNestedStep(step flow.Step) *core.CommandResult {
 	case *flow.RunShellStep:
 		fr.script.ExpandStep(step)
 		result = fr.executeRunShell(s)
+	case *flow.SetClipboardStep:
+		fr.script.ExpandStep(step)
+		result = fr.executeSetClipboard(s)
 	case *flow.PasteTextStep:
 		fr.script.ExpandStep(step)
 		result = fr.executePasteText(s)
@@ -1748,37 +1707,33 @@ func (fr *FlowRunner) dispatchNestedStep(step flow.Step) *core.CommandResult {
 func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 	step = cloneForRun(step)
 	start := time.Now()
+	defer fr.markInteraction(step)
 	var result *core.CommandResult
 	// Describe before expansion. Top-level commands are described when the
 	// report is built, so they showed `${PASSWORD}`; a sub-flow's steps were
 	// described here after ExpandStep had rewritten them, so the same step
 	// inside a runFlow showed the password itself.
-	desc := step.Describe()
+	describe, desc := fr.stepNames(step)
 
 	// For nested compound steps, we need to track their sub-commands separately
-	var nestedSubCommands []report.Command
+	var nestedSubCommands, parentSubCommands []report.Command
 	isCompoundStep := false
 	switch step.(type) {
 	case *flow.RepeatStep, *flow.RetryStep, *flow.RunFlowStep:
 		isCompoundStep = true
 		// Save parent's subCommands and start fresh for this nested compound step
-		parentSubCommands := fr.subCommands
+		parentSubCommands = fr.subCommands
 		fr.subCommands = nil
-		defer func() {
-			nestedSubCommands = fr.subCommands
-			fr.subCommands = parentSubCommands
-		}()
 	}
 
-	interactionsBefore := fr.interactions
 	result = fr.dispatchNestedStep(step)
 	// As in executeStep. The note goes on the error, which is what a nested
 	// step's report entry and console line show.
-	result, alertNote, dismissal := fr.afterFailedLookup(step, desc, -1, result, func() *core.CommandResult {
+	result, alertNote, dismissal := fr.afterFailedLookup(step, describe, -1, result, func() *core.CommandResult {
 		return fr.dispatchNestedStep(step)
 	})
+	unnoted := result
 	result = withSystemAlertNote(result, alertNote)
-	fr.noteInteraction(step, result.Success, interactionsBefore)
 
 	duration := time.Since(start).Milliseconds()
 
@@ -1800,9 +1755,21 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 	if fr.config.OnNestedStep != nil && fr.depth > 0 {
 		errMsg := ""
 		if !result.Success && result.Error != nil {
-			errMsg = result.Error.Error()
+			// The message and its cause, as for a top-level step: the raw
+			// error alone was often Go's "context deadline exceeded", which
+			// said nothing about what was waited for.
+			errMsg = commandResultToError(result).Message
 		}
 		fr.config.OnNestedStep(fr.depth, desc, result.Success, duration, errMsg)
+	}
+
+	// Back to the parent's list before recording this step in it. This was a
+	// defer, which ran after the append below: a runFlow, repeat or retry
+	// nested in another one was appended to its own list and then dropped,
+	// with its steps, from the report.
+	if isCompoundStep {
+		nestedSubCommands = fr.subCommands
+		fr.subCommands = parentSubCommands
 	}
 
 	// Add to parent's sub-commands for report
@@ -1817,7 +1784,7 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 		Index:     len(fr.subCommands),
 		Type:      string(step.Type()),
 		Label:     step.Label(),
-		YAML:      desc,
+		YAML:      describe,
 		Status:    status,
 		StartTime: &start,
 		EndTime:   &now,
@@ -1830,9 +1797,11 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 
 	// Add error info if failed
 	if !result.Success && result.Error != nil {
-		cmd.Error = &report.Error{
-			Type:    "execution",
-			Message: result.Error.Error(),
+		cmd.Error = commandResultToError(unnoted)
+		if cmd.Error == nil {
+			cmd.Error = commandResultToError(result)
+		} else {
+			cmd.Error.Message += alertNote
 		}
 	}
 
@@ -1840,18 +1809,19 @@ func (fr *FlowRunner) executeNestedStep(step flow.Step) *core.CommandResult {
 	if isCompoundStep {
 		cmd.SubCommands = nestedSubCommands
 	}
+	cmd.Logs = fr.script.TakeConsoleLogs()
 
 	// A failed nested step (inside runFlow / repeat / retry) now gets its own
 	// screenshot + hierarchy, the same post-mortem a failed top-level step has.
 	if !result.Success {
 		seq := fr.nestedArtifactSeq
 		fr.nestedArtifactSeq++
-		if data, err := fr.driver.Screenshot(); err == nil && len(data) > 0 {
+		if data, err := captureWithin("screenshot", artifactCaptureTimeout, fr.driver.Screenshot); err == nil && len(data) > 0 {
 			if path, saveErr := fr.flowWriter.SaveNestedScreenshot(seq, data); saveErr == nil {
 				cmd.Artifacts.ScreenshotAfter = path
 			}
 		}
-		if data, err := fr.driver.Hierarchy(); err == nil && len(data) > 0 {
+		if data, err := captureWithin("view hierarchy", artifactCaptureTimeout, fr.driver.Hierarchy); err == nil && len(data) > 0 {
 			if path, saveErr := fr.flowWriter.SaveNestedHierarchy(seq, data); saveErr == nil {
 				cmd.Artifacts.ViewHierarchy = path
 			}
@@ -1936,10 +1906,8 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, attempts int) *
 			}
 		}
 
-		attemptStart := fr.interactions
 		result := fr.executeSubFlow(subFlow)
 		if result.Success {
-			fr.noteAttemptInteraction(attemptStart)
 			return &core.CommandResult{
 				Success: true,
 				Message: fmt.Sprintf("Retry succeeded on attempt %d", attempt),
@@ -1956,11 +1924,40 @@ func (fr *FlowRunner) executeSubFlowWithRetry(subFlow flow.Flow, attempts int) *
 // callers pass captureHierarchy=true only for a failed step — not for every
 // passing step under `--artifacts always`, where it would cost extra device
 // round-trips for a dump nobody reads.
+// artifactCaptureTimeout bounds each screenshot or hierarchy read taken as
+// evidence around a step. A hung agent answers neither; each read then waited
+// out its driver's own timeouts (DeviceLab: 30s for the screenshot, 30s for
+// the snapshot and 30s for its fallback), on every failing step.
+var artifactCaptureTimeout = 10 * time.Second
+
+// captureWithin runs read, giving up after d. A read that has not answered is
+// left to finish in the background; its result is dropped.
+func captureWithin(what string, d time.Duration, read func() ([]byte, error)) ([]byte, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		data, err := read()
+		ch <- result{data, err}
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-timer.C:
+		logger.Warn("%s for the report did not answer within %v; skipped", what, d)
+		return nil, fmt.Errorf("%s: no answer within %v", what, d)
+	}
+}
+
 func (fr *FlowRunner) captureArtifacts(cmdIdx int, timing string, captureHierarchy bool) report.CommandArtifacts {
 	var artifacts report.CommandArtifacts
 
 	// Capture screenshot
-	if data, err := fr.driver.Screenshot(); err == nil && len(data) > 0 {
+	if data, err := captureWithin("screenshot", artifactCaptureTimeout, fr.driver.Screenshot); err == nil && len(data) > 0 {
 		path, saveErr := fr.flowWriter.SaveScreenshot(cmdIdx, timing, data)
 		if saveErr == nil {
 			if timing == "before" {
@@ -1972,7 +1969,7 @@ func (fr *FlowRunner) captureArtifacts(cmdIdx int, timing string, captureHierarc
 	}
 
 	if captureHierarchy {
-		if data, err := fr.driver.Hierarchy(); err == nil && len(data) > 0 {
+		if data, err := captureWithin("view hierarchy", artifactCaptureTimeout, fr.driver.Hierarchy); err == nil && len(data) > 0 {
 			path, saveErr := fr.flowWriter.SaveViewHierarchy(cmdIdx, data)
 			if saveErr == nil {
 				artifacts.ViewHierarchy = path
@@ -2058,4 +2055,67 @@ func (fr *FlowRunner) executeWait(step *flow.WaitStep) *core.CommandResult {
 			Error:   fr.ctx.Err(),
 		}
 	}
+}
+
+// markInteraction restarts the clock a when: check's budget is measured from,
+// after a step that may have changed the app, as Maestro does. Asserts,
+// waits, screenshots, variables, retry/repeat themselves (their steps count)
+// and a runFlow whose condition skipped it leave the clock alone: marking
+// them gave back-to-back checks for absent dialogs a fresh 7s each.
+func (fr *FlowRunner) markInteraction(step flow.Step) {
+	if _, ok := step.(*flow.RunFlowStep); ok && fr.runFlowSkipped {
+		fr.runFlowSkipped = false
+		return
+	}
+	switch step.(type) {
+	case *flow.AssertVisibleStep, *flow.AssertNotVisibleStep, *flow.AssertTrueStep,
+		*flow.AssertConditionStep, *flow.AssertWithAIStep, *flow.AssertNoDefectsWithAIStep,
+		*flow.ExtractTextWithAIStep, *flow.AssertDarkModeStep, *flow.AssertLightModeStep,
+		*flow.AssertNoJSErrorsStep, *flow.WaitUntilStep, *flow.WaitForDownloadStep,
+		*flow.WaitForRequestStep, *flow.TakeScreenshotStep, *flow.StartRecordingStep,
+		*flow.StopRecordingStep, *flow.DefineVariablesStep, *flow.RetryStep, *flow.RepeatStep:
+		return
+	}
+	fr.script.MarkInteraction()
+}
+
+// setDeviceVariables sets DEVICE_UDID to the serial (Android) or UDID (iOS)
+// of the device this flow runs on. Under --parallel each device keeps its own
+// value for the whole run, so a flow can hand the app a per-device id (#187):
+// `launchApp: {arguments: {deviceId: ${DEVICE_UDID}}}`. A DEVICE_UDID the user
+// set (shell environment or -e) is kept.
+func (fr *FlowRunner) setDeviceVariables() {
+	if id := fr.deviceID(); id != "" {
+		if _, set := fr.script.Variables()["DEVICE_UDID"]; !set {
+			fr.script.SetVariable("DEVICE_UDID", id)
+		}
+	}
+}
+
+// deviceID is the serial or UDID of the device this flow runs on: the
+// worker's own device under --parallel (DeviceInfo), else the run's device,
+// else what the driver reports.
+func (fr *FlowRunner) deviceID() string {
+	if fr.config.DeviceInfo != nil && fr.config.DeviceInfo.ID != "" {
+		return fr.config.DeviceInfo.ID
+	}
+	if fr.config.Device.ID != "" {
+		return fr.config.Device.ID
+	}
+	if info := fr.driver.GetPlatformInfo(); info != nil {
+		return info.DeviceID
+	}
+	return ""
+}
+
+// stepNames returns the step's description and its console line: its label
+// when the flow gives one, as the report and the summary show it, else its
+// description. Both fill in the ${NAME}s defined in the flow files, never
+// the ones given from outside (see ScriptEngine.DisplayText).
+func (fr *FlowRunner) stepNames(step flow.Step) (describe, title string) {
+	describe = fr.script.DisplayText(step.Describe())
+	if label := step.Label(); label != "" {
+		return describe, fr.script.DisplayText(label)
+	}
+	return describe, describe
 }

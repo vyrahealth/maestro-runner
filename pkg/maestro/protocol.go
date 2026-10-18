@@ -58,6 +58,9 @@ type ElementResult struct {
 	Enabled     bool         `json:"enabled"`
 	Clickable   bool         `json:"clickable"`
 	Selected    bool         `json:"selected"`
+	// ShowingHintText says whether the element's text is its hint, an empty
+	// field showing its placeholder. nil from an agent that does not send it.
+	ShowingHintText *bool `json:"showingHintText,omitempty"`
 
 	// Clicked reports whether findAndClick actually injected the tap. It is a
 	// pointer because absent and false mean different things: an agent built
@@ -69,6 +72,9 @@ type ElementResult struct {
 	// tap ("keyboard window", `android.widget.Button "OK"`). Empty when the tap
 	// was skipped on geometry alone, or not skipped at all.
 	BlockedBy string `json:"blockedBy"`
+
+	// MatchedIndex is which of findFirstAndClick's forms matched.
+	MatchedIndex int `json:"matchedIndex"`
 }
 
 // BoundsResult represents element bounds.
@@ -83,6 +89,9 @@ type BoundsResult struct {
 type SessionResult struct {
 	SessionID  string       `json:"sessionId"`
 	DeviceInfo DeviceResult `json:"deviceInfo"`
+	// AgentBuild is the commit the agent was built from, "-dirty" when built
+	// from uncommitted source; empty from an agent that predates it.
+	AgentBuild string `json:"agentBuild,omitempty"`
 }
 
 // DeviceResult is returned by Device.getInfo and Session.create.

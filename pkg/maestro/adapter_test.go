@@ -259,6 +259,24 @@ func TestAdapterSendKeyActions(t *testing.T) {
 	}
 }
 
+func TestAdapterSendKeyActionsWithDelay(t *testing.T) {
+	adapter, cleanup := adapterWithMock(t, func(req Request) interface{} {
+		if req.Method != "Input.sendKeyActions" {
+			t.Errorf("expected Input.sendKeyActions, got %s", req.Method)
+		}
+		params, _ := req.Params.(map[string]interface{})
+		if params["text"] != "hello" || params["delayMs"] != float64(80) {
+			t.Errorf("params = %v, want text hello and delayMs 80", req.Params)
+		}
+		return map[string]interface{}{}
+	})
+	defer cleanup()
+
+	if err := adapter.SendKeyActionsWithDelay("hello", 80); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestAdapterScreenshot(t *testing.T) {
 	adapter, cleanup := adapterWithMock(t, func(req Request) interface{} {
 		if req.Method != "UI.screenshot" {
@@ -505,5 +523,33 @@ func TestAdapterStatus(t *testing.T) {
 	}
 	if !ready {
 		t.Error("expected ready=true")
+	}
+}
+
+// The agent says whether a field's text is its hint; an older agent does not.
+func TestAdapterActiveElementShowingHint(t *testing.T) {
+	yes, no := true, false
+	for _, tc := range []struct {
+		name           string
+		sent           *bool
+		showing, known bool
+	}{
+		{"showing its hint", &yes, true, true},
+		{"holds text", &no, false, true},
+		{"not reported", nil, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter, cleanup := adapterWithMock(t, func(req Request) interface{} {
+				return ElementResult{ElementID: "a1", Text: "Email", ShowingHintText: tc.sent}
+			})
+			defer cleanup()
+			elem, err := adapter.ActiveElement()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if showing, known := elem.ShowingHint(); showing != tc.showing || known != tc.known {
+				t.Errorf("ShowingHint() = %v, %v; want %v, %v", showing, known, tc.showing, tc.known)
+			}
+		})
 	}
 }
