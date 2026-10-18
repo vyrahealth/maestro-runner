@@ -613,9 +613,11 @@ func TestNestedStep_ErrorNamesAnAlertLeftAlone(t *testing.T) {
 	sub := run.detail.Commands[0].SubCommands
 	if len(sub) != 2 || sub[1].Error == nil || !strings.HasSuffix(sub[1].Error.Message, note) {
 		t.Errorf("sub-commands = %+v, want the assertVisible's error to end with %q", sub, note)
+	} else if n := strings.Count(sub[1].Error.Message, note); n != 1 {
+		t.Errorf("assertVisible's error = %q, names the alert %d times, want once", sub[1].Error.Message, n)
 	}
-	if !strings.Contains(run.result.Error, note) {
-		t.Errorf("flow error = %q, want the note carried up", run.result.Error)
+	if n := strings.Count(run.result.Error, note); n != 1 {
+		t.Errorf("flow error = %q, names the alert %d times, want it carried up once", run.result.Error, n)
 	}
 }
 

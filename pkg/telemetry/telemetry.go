@@ -3,7 +3,10 @@
 // The event holds counts, versions and fixed-list values only: no machine or
 // user id, no flow or file names, selectors, app ids, URLs, environment
 // values or error messages. Nothing is written on the user's machine.
-// DO_NOT_TRACK or MAESTRO_RUNNER_NO_TELEMETRY turn it off; with
+// In Vyra's fork it is off unless MAESTRO_RUNNER_TELEMETRY is set: the event
+// goes to a third party, and a run from a Vyra machine sends nothing unless
+// someone decides it should. DO_NOT_TRACK or MAESTRO_RUNNER_NO_TELEMETRY
+// still turn it off; with
 // MAESTRO_RUNNER_TELEMETRY_DEBUG the event is printed instead of sent. See
 // docs: https://open.devicelab.dev/maestro-runner/docs/telemetry
 //
@@ -66,10 +69,12 @@ type Event struct {
 	DurationS          int            `json:"duration_s"`
 }
 
-// Enabled reports whether telemetry may be sent: not when DO_NOT_TRACK or
-// MAESTRO_RUNNER_NO_TELEMETRY is set (to anything but "0" or "false").
+// Enabled reports whether telemetry may be sent: only when
+// MAESTRO_RUNNER_TELEMETRY is set, and not when DO_NOT_TRACK or
+// MAESTRO_RUNNER_NO_TELEMETRY is (each to anything but "0" or "false").
+// Upstream sends by default; Vyra's fork does not.
 func Enabled() bool {
-	return !envSet("DO_NOT_TRACK") && !envSet("MAESTRO_RUNNER_NO_TELEMETRY")
+	return envSet("MAESTRO_RUNNER_TELEMETRY") && !envSet("DO_NOT_TRACK") && !envSet("MAESTRO_RUNNER_NO_TELEMETRY")
 }
 
 func envSet(name string) bool {
