@@ -1474,11 +1474,31 @@ func (d *Driver) launchApp(step *flow.LaunchAppStep) *core.CommandResult {
 	}
 
 	// Launch the app (with or without args)
-	if err := d.client.LaunchAppWithArgs(bundleID, launchArgs, launchEnv); err != nil {
+	if err := d.launchKnownApp(bundleID, launchArgs, launchEnv); err != nil {
 		return errorResult(err, fmt.Sprintf("Failed to launch app: %s", bundleID))
 	}
 
 	return successResult(fmt.Sprintf("Launched app: %s", bundleID), nil)
+}
+
+// unknownAppWait is how long launchKnownApp waits before it launches again.
+// A variable so tests can shorten it.
+var unknownAppWait = 2 * time.Second
+
+// launchKnownApp launches the app, and once more after a short wait when iOS
+// says it does not know the app yet. Right after a clearState reinstall the
+// install has finished but FrontBoard has not registered the app, so the first
+// launch fails ("Application ... is unknown to FrontBoard"); on the E2E iPhone
+// that was 1 to 3 launches a night, each costing its flow a retry. An app that
+// really is not installed fails the second launch too, so the step still fails.
+func (d *Driver) launchKnownApp(bundleID string, args []string, env map[string]string) error {
+	err := d.client.LaunchAppWithArgs(bundleID, args, env)
+	if err == nil || !strings.Contains(err.Error(), "unknown to FrontBoard") {
+		return err
+	}
+	logger.Info("[wda] iOS does not know %s yet; launching again in %v", bundleID, unknownAppWait)
+	time.Sleep(unknownAppWait)
+	return d.client.LaunchAppWithArgs(bundleID, args, env)
 }
 
 func (d *Driver) stopApp(step *flow.StopAppStep) *core.CommandResult {
