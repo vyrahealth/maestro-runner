@@ -17,7 +17,7 @@ import (
 // clearEnv unsets the opt-out, debug and CI variables for one test.
 func clearEnv(t *testing.T) {
 	for _, k := range []string{
-		"DO_NOT_TRACK", "MAESTRO_RUNNER_NO_TELEMETRY", "MAESTRO_RUNNER_TELEMETRY_DEBUG",
+		"DO_NOT_TRACK", "MAESTRO_RUNNER_NO_TELEMETRY", "MAESTRO_RUNNER_TELEMETRY", "MAESTRO_RUNNER_TELEMETRY_DEBUG",
 		"MAESTRO_RUNNER_TELEMETRY_URL", "CI", "GITHUB_ACTIONS", "GITLAB_CI", "BITRISE_IO", "CIRCLECI", "BUILDKITE",
 		"JENKINS_URL", "TF_BUILD", "TRAVIS", "CODEBUILD_BUILD_ID", "TEAMCITY_VERSION", "EAS_BUILD", "CM_BUILD_ID"} {
 		if v, ok := os.LookupEnv(k); ok {
@@ -27,10 +27,25 @@ func clearEnv(t *testing.T) {
 	}
 }
 
+// In Vyra's fork telemetry is off until MAESTRO_RUNNER_TELEMETRY opts in.
+func TestEnabledOnlyWhenOptedIn(t *testing.T) {
+	clearEnv(t)
+	if Enabled() {
+		t.Fatal("telemetry on with nothing set: the fork sends nothing by default")
+	}
+	for _, v := range []string{"0", "false"} {
+		t.Setenv("MAESTRO_RUNNER_TELEMETRY", v)
+		if Enabled() {
+			t.Errorf("MAESTRO_RUNNER_TELEMETRY=%s turned telemetry on", v)
+		}
+	}
+}
+
 func TestEnabledHonoursOptOuts(t *testing.T) {
 	clearEnv(t)
+	t.Setenv("MAESTRO_RUNNER_TELEMETRY", "1")
 	if !Enabled() {
-		t.Fatal("telemetry off with no opt-out set")
+		t.Fatal("telemetry off when opted in with no opt-out set")
 	}
 	for _, c := range []struct {
 		env, val string
